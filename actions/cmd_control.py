@@ -3,18 +3,16 @@ import json
 import subprocess
 import sys
 import platform
-import time
 import os
 from pathlib import Path
 
-_OS = platform.system()  # "Windows" | "Darwin" | "Linux"
-
-def _get_base_dir() -> Path:
+def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
     return Path(__file__).resolve().parent.parent
 
-_BASE         = _get_base_dir()
+
+_BASE         = _base_dir()
 _CONFIG_PATH  = _BASE / "config" / "api_keys.json"
 
 def _load_config() -> dict:
@@ -24,10 +22,8 @@ def _load_config() -> dict:
         return {}
 
 def _get_os() -> str:
-    return _load_config().get("os_system", _OS.lower()).lower()
+    return _load_config().get("os_system", platform.system().lower()).lower()
 
-
-# ── Safety: blocked commands ──────────────────────────────────────────
 _BLOCKED_SUBSTRINGS = [
     "format ", "del /", "rmdir /s", "rd /s",
     "rm -rf /", "rm -rf /*", ":(){ :|:& };:",
@@ -39,10 +35,8 @@ _BLOCKED_SUBSTRINGS = [
 ]
 
 _BLOCKED_EXACT = {
-    # Windows
     "format c:", "format d:",
     "del /s /q c:\\", "del /s /q c:/",
-    # Linux/macOS
     "rm -rf /", "rm -rf /*", "rm -rf ~",
     "chmod -r 777 /",
     "> /dev/sda",
@@ -50,7 +44,6 @@ _BLOCKED_EXACT = {
 
 
 def _is_dangerous(command: str) -> str | None:
-    """Return a reason string if the command is dangerous, else None."""
     cmd_lower = command.strip().lower()
 
     if cmd_lower in _BLOCKED_EXACT:
@@ -63,14 +56,11 @@ def _is_dangerous(command: str) -> str | None:
     return None
 
 
-# ── Command execution ─────────────────────────────────────────────────
-
-def _run_command(command: str, timeout: int = 30, shell: bool = True) -> str:
-    """Execute a system command and return the output."""
+def _run_command(command: str, timeout: int = 30) -> str:
     try:
         result = subprocess.run(
             command,
-            shell=shell,
+            shell=True,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -95,7 +85,6 @@ def _run_command(command: str, timeout: int = 30, shell: bool = True) -> str:
 
 
 def _run_in_dir(command: str, working_dir: str, timeout: int = 30) -> str:
-    """Execute a command in a specific working directory."""
     if not os.path.isdir(working_dir):
         return f"Directory not found: {working_dir}"
     try:
@@ -125,7 +114,6 @@ def _run_in_dir(command: str, working_dir: str, timeout: int = 30) -> str:
 
 
 def _run_piped(command: str, timeout: int = 30) -> str:
-    """Execute a piped / multi-command string (supports |, &&, ;, etc.)."""
     try:
         if _get_os() == "windows":
             cmd = ["cmd", "/c", command]
@@ -156,7 +144,6 @@ def _run_piped(command: str, timeout: int = 30) -> str:
 
 
 def _run_background(command: str) -> str:
-    """Launch a command in the background (non-blocking)."""
     try:
         if _get_os() == "windows":
             subprocess.Popen(
@@ -181,7 +168,6 @@ def _run_background(command: str) -> str:
 
 
 def _list_processes(filter_name: str = "") -> str:
-    """List running processes, optionally filtered by name."""
     try:
         if _get_os() == "windows":
             cmd = 'tasklist /fo csv /nh'
@@ -193,8 +179,8 @@ def _list_processes(filter_name: str = "") -> str:
                 result = subprocess.run(
                     ["ps", "aux"], capture_output=True, text=True, timeout=10
                 )
-                lines = result.stdout.splitlines()
-                header = lines[0] if lines else ""
+                lines   = result.stdout.splitlines()
+                header  = lines[0] if lines else ""
                 filtered = [header] + [l for l in lines[1:] if filter_name.lower() in l.lower()]
                 result_stdout = "\n".join(filtered[:30])
                 if len(filtered) > 30:
@@ -206,7 +192,7 @@ def _list_processes(filter_name: str = "") -> str:
                 )
 
         output = result.stdout.strip() if result.stdout else "No processes found."
-        lines = output.splitlines()
+        lines  = output.splitlines()
         if len(lines) > 30:
             output = "\n".join(lines[:30]) + f"\n... and {len(lines) - 30} more."
         return output
@@ -216,9 +202,7 @@ def _list_processes(filter_name: str = "") -> str:
 
 
 def _kill_process(pid_or_name: str) -> str:
-    """Kill a process by PID or name."""
     try:
-        # Try as PID first
         try:
             pid = int(pid_or_name)
             if _get_os() == "windows":
@@ -237,7 +221,6 @@ def _kill_process(pid_or_name: str) -> str:
         except ValueError:
             pass
 
-        # Kill by name
         name = pid_or_name
         if _get_os() == "windows":
             result = subprocess.run(
@@ -258,7 +241,6 @@ def _kill_process(pid_or_name: str) -> str:
 
 
 def _network_info() -> str:
-    """Get basic network information."""
     try:
         if _get_os() == "windows":
             result = subprocess.run(
@@ -276,7 +258,6 @@ def _network_info() -> str:
 
 
 def _disk_usage() -> str:
-    """Get disk usage information."""
     try:
         if _get_os() == "windows":
             result = subprocess.run(
@@ -295,7 +276,6 @@ def _disk_usage() -> str:
 
 
 def _system_info() -> str:
-    """Get system information."""
     info = []
     info.append(f"OS: {platform.system()} {platform.release()} ({platform.machine()})")
     info.append(f"Hostname: {platform.node()}")
@@ -316,20 +296,17 @@ def _system_info() -> str:
                     capture_output=True, text=True, timeout=5
                 )
                 info.append(result.stdout.strip())
-            # Uptime
             if os.path.exists("/proc/uptime"):
                 with open("/proc/uptime") as f:
                     uptime_secs = float(f.read().split()[0])
                     hours = int(uptime_secs // 3600)
-                    mins = int((uptime_secs % 3600) // 60)
+                    mins  = int((uptime_secs % 3600) // 60)
                     info.append(f"Uptime: {hours}h {mins}m")
     except Exception:
         pass
 
     return "\n".join(info)
 
-
-# ── Main dispatch ──────────────────────────────────────────────────────
 
 def cmd_control(
     parameters: dict = None,
@@ -338,9 +315,9 @@ def cmd_control(
     session_memory=None,
 ) -> str:
     """
-    Execute and manage terminal / CMD commands on the system.
+    Dispatch table for terminal / CMD command execution.
 
-    parameters keys:
+    parameters keys (all optional unless noted):
       action        : (required) one of the actions listed below
       command       : the command string to execute
       working_dir   : directory to run the command in (for run_in_dir)
@@ -349,15 +326,15 @@ def cmd_control(
       process       : PID or process name (for kill_process)
 
     Actions:
-      run           — execute a single command and return output
-      run_in_dir    — execute a command in a specific working directory
-      run_piped     — execute piped / chained commands (|, &&, ;)
-      run_background— start a command in the background (non-blocking)
-      list_processes— list running processes (optional filter)
-      kill_process  — kill a process by PID or name
-      network_info  — show network configuration
-      disk_usage    — show disk space information
-      system_info   — show system/OS information
+      run            — execute a single command and return output
+      run_in_dir     — execute a command in a specific working directory
+      run_piped      — execute piped / chained commands (|, &&, ;)
+      run_background — start a command in the background (non-blocking)
+      list_processes — list running processes (optional filter)
+      kill_process   — kill a process by PID or name
+      network_info   — show network configuration
+      disk_usage     — show disk space information
+      system_info    — show system/OS information
     """
     params  = parameters or {}
     action  = params.get("action", "").lower().strip()
@@ -369,10 +346,10 @@ def cmd_control(
     if player:
         player.write_log(f"[CMD] {action}: {command[:50]}")
 
-    print(f"[CMD Control] Action: {action} | Command: {command[:80]}")
+    print(f"[CmdControl] ▶ {action}  {params}")
 
     try:
-        # ── run ────────────────────────────────────
+
         if action == "run":
             if not command:
                 return "No command provided."
@@ -382,7 +359,6 @@ def cmd_control(
             timeout = min(int(params.get("timeout", 30)), 120)
             return _run_command(command, timeout=timeout)
 
-        # ── run_in_dir ─────────────────────────────
         if action == "run_in_dir":
             if not command:
                 return "No command provided."
@@ -395,7 +371,6 @@ def cmd_control(
             timeout = min(int(params.get("timeout", 30)), 120)
             return _run_in_dir(command, working_dir, timeout=timeout)
 
-        # ── run_piped ──────────────────────────────
         if action == "run_piped":
             if not command:
                 return "No command provided."
@@ -405,7 +380,6 @@ def cmd_control(
             timeout = min(int(params.get("timeout", 30)), 120)
             return _run_piped(command, timeout=timeout)
 
-        # ── run_background ─────────────────────────
         if action == "run_background":
             if not command:
                 return "No command provided."
@@ -414,32 +388,27 @@ def cmd_control(
                 return f"SAFETY: {danger}"
             return _run_background(command)
 
-        # ── list_processes ─────────────────────────
         if action == "list_processes":
             filter_name = params.get("filter", params.get("process", "")).strip()
             return _list_processes(filter_name)
 
-        # ── kill_process ───────────────────────────
         if action == "kill_process":
             proc = params.get("process", params.get("pid", "")).strip()
             if not proc:
                 return "No process name or PID specified."
             return _kill_process(proc)
 
-        # ── network_info ───────────────────────────
         if action == "network_info":
             return _network_info()
 
-        # ── disk_usage ─────────────────────────────
         if action == "disk_usage":
             return _disk_usage()
 
-        # ── system_info ────────────────────────────
         if action == "system_info":
             return _system_info()
 
         return f"Unknown action: '{action}'"
 
     except Exception as e:
-        print(f"[CMD Control] Error: {e}")
+        print(f"[CmdControl] ❌ {action}: {e}")
         return f"cmd_control '{action}' failed: {e}"
