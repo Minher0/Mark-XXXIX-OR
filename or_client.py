@@ -34,37 +34,37 @@ def _load_api_key() -> str:
         raise RuntimeError(f"Failed to load OpenRouter API key: {e}")
 
 TEXT_MODELS: list[str] = [
-    "nvidia/nemotron-3-super-120b-a12b:free",
-    "nousresearch/hermes-3-llama-3.1-405b:free",
-    "minimax/minimax-m2.5:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "qwen/qwen3-next-80b-a3b-instruct:free",
-    "qwen/qwen3-coder:free",
-    "google/gemma-4-31b-it:free",
-    "google/gemma-4-26b-a4b-it:free",
-    "google/gemma-3-27b-it:free",
-    "arcee-ai/trinity-large-preview:free",
-    "z-ai/glm-4.5-air:free",
-    "nvidia/nemotron-3-nano-30b-a3b:free",
+    # ── Primary (large, capable) ──
+    "qwen/qwen3-coder:free",                           # 1M ctx, 480B params
+    "nvidia/nemotron-3-ultra-550b-a55b:free",           # 1M ctx, largest free
+    "nvidia/nemotron-3-super-120b-a12b:free",           # 1M ctx
+    "openai/gpt-oss-120b:free",                         # 131K ctx
+    "nousresearch/hermes-3-llama-3.1-405b:free",        # 131K ctx
+    "qwen/qwen3-next-80b-a3b-instruct:free",            # 262K ctx
+    "meta-llama/llama-3.3-70b-instruct:free",           # 131K ctx
+    "openrouter/owl-alpha",                              # 1M ctx, agentic
+    # ── Secondary (smaller, faster) ──
+    "google/gemma-4-31b-it:free",                       # 262K ctx
+    "google/gemma-4-26b-a4b-it:free",                   # 262K ctx
+    "nex-agi/nex-n2-pro:free",                          # 262K ctx
+    "poolside/laguna-m.1:free",                          # 262K ctx
+    "nvidia/nemotron-3-nano-30b-a3b:free",              # 256K ctx
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",# 256K ctx, reasoning
     "cognitivecomputations/dolphin-mistral-24b-venice-edition:free",
-    "google/gemma-3-12b-it:free",
-    "nvidia/nemotron-nano-12b-v2-vl:free",
     "nvidia/nemotron-nano-9b-v2:free",
-    "google/gemma-3-4b-it:free",
-    "google/gemma-3n-e4b-it:free",
+    "openai/gpt-oss-20b:free",
     "meta-llama/llama-3.2-3b-instruct:free",
-    "google/gemma-3n-e2b-it:free",
-    "liquid/lfm-2.5-1.2b-instruct:free",
+    "poolside/laguna-xs.2:free",
     "liquid/lfm-2.5-1.2b-thinking:free",
+    "liquid/lfm-2.5-1.2b-instruct:free",
 ]
 
 VISION_MODELS: list[str] = [
-    "nvidia/nemotron-nano-12b-v2-vl:free",
-    "nvidia/llama-nemotron-embed-vl-1b-v2:free",
     "google/gemma-4-31b-it:free",
     "google/gemma-4-26b-a4b-it:free",
-    "google/gemma-3n-e4b-it:free",
-    "google/gemma-3n-e2b-it:free",
+    "nex-agi/nex-n2-pro:free",
+    "nvidia/nemotron-nano-12b-v2-vl:free",
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
     "meta-llama/llama-3.3-70b-instruct:free",
     "nvidia/nemotron-3-super-120b-a12b:free",
 ]
@@ -72,9 +72,9 @@ VISION_MODELS: list[str] = [
 API_URL               = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MAX_TOKENS    = 4096
 DEFAULT_TEMPERATURE   = 0.7
-REQUEST_TIMEOUT       = 60   # seconds per request
+REQUEST_TIMEOUT       = 30   # seconds per request
 MAX_RETRIES_PER_MODEL = 2    # attempts before moving to next model
-RETRY_DELAY           = 2    # seconds between retries
+RETRY_DELAY           = 1    # seconds between retries
 RATE_LIMIT_COOLDOWN   = 60   # seconds before retrying a rate-limited model
 
 _rate_limited: dict[str, float] = {}

@@ -5,6 +5,9 @@ import time
 import subprocess
 import platform
 import shutil
+import sys
+import os
+from pathlib import Path
 
 try:
     import psutil
@@ -80,7 +83,77 @@ def _is_running(app_name: str) -> bool:
     return False
 
 
+_WINDOWS_APP_PATHS = {
+    "chrome":     r"Google\Chrome\Application\chrome.exe",
+    "firefox":    r"Mozilla Firefox\firefox.exe",
+    "spotify":    r"Spotify\Spotify.exe",
+    "vscode":     r"Microsoft VS Code\Code.exe",
+    "discord":    r"Discord\Discord.exe",
+    "telegram":   r"Telegram Desktop\Telegram.exe",
+    "whatsapp":   r"WhatsApp\WhatsApp.exe",
+    "notepad":    r"Windows NT\Accessories\wordpad.exe",
+    "brave":      r"BraveSoftware\Brave-Browser\Application\brave.exe",
+    "edge":       r"Microsoft\Edge\Application\msedge.exe",
+}
+
+
+def _find_windows_exe(app_name: str) -> str | None:
+    key = app_name.lower().replace(".exe", "").strip()
+    rel_path = _WINDOWS_APP_PATHS.get(key)
+    if not rel_path:
+        for k, v in _WINDOWS_APP_PATHS.items():
+            if k in key or key in k:
+                rel_path = v
+                break
+    if not rel_path:
+        return None
+    candidates = [
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / rel_path,
+        Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / rel_path,
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / rel_path,
+        Path.home() / "AppData" / "Local" / rel_path,
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    return None
+
+
 def _launch_windows(app_name: str) -> bool:
+    """Launch app on Windows using CMD start command as primary method."""
+    # ── PRIMARY: CMD start command ──
+    # This opens the app via Windows' built-in start command, which uses
+    # the real default browser/program — NOT Chrome for Testing.
+    try:
+        cmd_str = f'start "" "{app_name}"'
+        subprocess.Popen(
+            cmd_str,
+            shell=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(1.5)
+        print(f"[open_app] ✅ CMD start: {app_name}")
+        return True
+    except Exception as e:
+        print(f"[open_app] ⚠️ Windows CMD start failed: {e}")
+
+    # ── FALLBACK 1: Direct exe path ──
+    try:
+        exe = _find_windows_exe(app_name)
+        if exe:
+            subprocess.Popen(
+                [exe],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            time.sleep(1.5)
+            print(f"[open_app] ✅ Direct exe: {exe}")
+            return True
+    except Exception as e:
+        print(f"[open_app] ⚠️ Windows direct exe launch failed: {e}")
+
+    # ── FALLBACK 2: pyautogui ──
     try:
         import pyautogui
         pyautogui.PAUSE = 0.1
@@ -90,9 +163,10 @@ def _launch_windows(app_name: str) -> bool:
         time.sleep(0.8)
         pyautogui.press("enter")
         time.sleep(3.0)
+        print(f"[open_app] ✅ pyautogui: {app_name}")
         return True
     except Exception as e:
-        print(f"[open_app] ⚠️ Windows launch failed: {e}")
+        print(f"[open_app] ⚠️ Windows pyautogui fallback failed: {e}")
         return False
 
 def _launch_macos(app_name: str) -> bool:
@@ -174,6 +248,34 @@ def open_app(
 
     if not app_name:
         return "Please specify which application to open, sir."
+
+    app_lower = app_name.lower()
+    memory_keywords = ["memory", "mémoire", "memoire", "long term", "long-term", "longterm", "long terme", "long-terme"]
+    if any(kw in app_lower for kw in memory_keywords):
+        base = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent.parent
+        memory_file = base / "memory" / "long_term.json"
+        if not memory_file.exists():
+            return "Memory file not found: memory/long_term.json"
+        try:
+            if platform.system() == "Windows":
+                cmd_str = f'start "" "{memory_file}"'
+                subprocess.Popen(
+                    cmd_str,
+                    shell=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            elif platform.system() == "Darwin":
+                subprocess.Popen(["open", str(memory_file)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                subprocess.Popen(["xdg-open", str(memory_file)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(1.0)
+            print(f"[open_app] 🧠 Opened memory file via CMD: {memory_file}")
+            if player:
+                player.write_log("[open_app] memory/long_term.json")
+            return "Opened long-term memory file, sir."
+        except Exception as e:
+            return f"Failed to open memory file: {e}"
 
     system   = platform.system()
     launcher = _OS_LAUNCHERS.get(system)

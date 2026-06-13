@@ -309,6 +309,83 @@ def _system_info() -> str:
 
 
 
+def _open_file(file_path: str) -> str:
+    """Open any file with the OS default program via CMD."""
+    p = Path(file_path)
+    if not p.exists():
+        return f"File not found: {file_path}"
+    if p.is_dir():
+        return f"'{file_path}' is a directory, not a file. Use explorer to open directories."
+    try:
+        os_name = _get_os()
+        if os_name == "windows":
+            quoted = f'"{file_path}"' if " " in str(file_path) and not str(file_path).startswith('"') else str(file_path)
+            subprocess.Popen(
+                f'start "" {quoted}',
+                shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        elif os_name == "darwin":
+            subprocess.Popen(["open", str(file_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.Popen(["xdg-open", str(file_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return f"Opened: {p.name}"
+    except Exception as e:
+        return f"Failed to open file: {e}"
+
+
+def _open_project_file(file_path: str) -> str:
+    """Open a file from the Jarvis project directory with the default program."""
+    target = _BASE / file_path.lstrip("/").lstrip("\\")
+    if not str(target.resolve()).startswith(str(_BASE.resolve())):
+        return "Access denied: path outside project directory."
+    if not target.exists():
+        return f"File not found: {file_path}"
+    if target.is_dir():
+        return f"'{file_path}' is a directory, not a file."
+    try:
+        os_name = _get_os()
+        if os_name == "windows":
+            quoted = f'"{target}"' if " " in str(target) and not str(target).startswith('"') else str(target)
+            subprocess.Popen(
+                f'start "" {quoted}',
+                shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        elif os_name == "darwin":
+            subprocess.Popen(["open", str(target)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.Popen(["xdg-open", str(target)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return f"Opened: {target.name}"
+    except Exception as e:
+        return f"Failed to open file: {e}"
+
+
+def _open_memory() -> str:
+    """Open the long-term memory file directly with the default program."""
+    memory_file = _BASE / "memory" / "long_term.json"
+    if not memory_file.exists():
+        return "Memory file not found: memory/long_term.json"
+    try:
+        os_name = _get_os()
+        if os_name == "windows":
+            subprocess.Popen(
+                f'start "" "{memory_file}"',
+                shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        elif os_name == "darwin":
+            subprocess.Popen(["open", str(memory_file)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.Popen(["xdg-open", str(memory_file)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return "Opened: long_term.json"
+    except Exception as e:
+        return f"Failed to open memory file: {e}"
+
+
 def _self_read(file_path: str) -> str:
     """Read a file from the Jarvis project directory."""
     target = _BASE / file_path.lstrip("/").lstrip("\\")
@@ -405,7 +482,7 @@ def cmd_control(
       timeout       : execution timeout in seconds (default: 30, max: 120)
       filter        : process name filter (for list_processes)
       process       : PID or process name (for kill_process)
-      path          : file/directory path relative to project root (for self_*)
+      path          : file/directory path (for self_*, open_file, open_project_file)
       content       : file content to write/append (for self_write/self_append)
 
     Actions:
@@ -418,6 +495,9 @@ def cmd_control(
       network_info   — show network configuration
       disk_usage     — show disk space information
       system_info    — show system/OS information
+      open_file      — open any file with the system default program via CMD
+      open_project_file — open a file from the Jarvis project with default program
+      open_memory    — open the long-term memory file (memory/long_term.json)
       self_read      — read a file from the Jarvis project
       self_write     — write/overwrite a file in the Jarvis project
       self_append    — append content to a file in the Jarvis project
@@ -493,6 +573,22 @@ def cmd_control(
 
         if action == "system_info":
             return _system_info()
+
+
+        if action == "open_file":
+            file_path = params.get("path", "").strip()
+            if not file_path:
+                return "No file path provided for open_file."
+            return _open_file(file_path)
+
+        if action == "open_project_file":
+            file_path = params.get("path", "").strip()
+            if not file_path:
+                return "No file path provided. Use path relative to project root, e.g. 'memory/long_term.json'"
+            return _open_project_file(file_path)
+
+        if action == "open_memory":
+            return _open_memory()
 
 
         if action == "self_read":

@@ -216,21 +216,27 @@ TOOL_DECLARATIONS = [
     {
         "name": "browser_control",
         "description": (
-            "Controls the web browser. Use for: opening websites, searching the web, "
-            "clicking elements, filling forms, scrolling, any web-based task."
+            "Controls the web browser. Uses CMD/system default browser for opening URLs (NOT Chrome for Testing). "
+            "Use action:open_url to open a URL in the real default browser. "
+            "Use action:search to search the web in the real default browser. "
+            "Use Playwright actions (click, type, scroll, etc.) ONLY for interactive web automation. "
+            "CRITICAL: For simply opening a website or URL, ALWAYS use action:open_url — NEVER use Playwright. "
+            "CRITICAL: For searching the web, ALWAYS use action:search — NEVER use Playwright."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | press | close"},
-                "url":         {"type": "STRING", "description": "URL for go_to action"},
-                "query":       {"type": "STRING", "description": "Search query for search action"},
+                "action":      {"type": "STRING", "description": "open_url | go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | press | close"},
+                "url":         {"type": "STRING", "description": "URL for open_url/go_to"},
+                "query":       {"type": "STRING", "description": "Search query"},
+                "engine":      {"type": "STRING", "description": "google | bing | duckduckgo (default: google)"},
                 "selector":    {"type": "STRING", "description": "CSS selector for click/type"},
                 "text":        {"type": "STRING", "description": "Text to click or type"},
                 "description": {"type": "STRING", "description": "Element description for smart_click/smart_type"},
                 "direction":   {"type": "STRING", "description": "up or down for scroll"},
+                "amount":      {"type": "INTEGER", "description": "Scroll amount in pixels (default: 500)"},
                 "key":         {"type": "STRING", "description": "Key name for press action"},
-                "incognito":   {"type": "BOOLEAN", "description": "Open in private/incognito mode"},
+                "fields":      {"type": "OBJECT", "description": "{selector: value} dict for fill_form"},
             },
             "required": ["action"]
         }
@@ -344,24 +350,26 @@ TOOL_DECLARATIONS = [
     {
         "name": "cmd_control",
         "description": (
-            "Executes terminal/CMD commands AND can modify the Jarvis's own source code. "
+            "Executes terminal/CMD commands, opens files, opens memory, AND can modify Jarvis's own source code. "
             "Use for: running shell commands, piped commands, background processes, "
             "listing/killing processes, network info, disk usage, system info, "
+            "opening files (open_file, open_project_file), opening the long-term memory file (open_memory), "
             "AND reading/writing/appending the Jarvis's own Python files (self_read, self_write, self_append, self_list). "
             "Has built-in safety checks against dangerous commands. "
             "Use this when the user asks to run a terminal command, CMD command, "
-            "shell command, modify Jarvis's code, add features, fix bugs in itself."
+            "open a file, open their memory, modify Jarvis's code, add features, fix bugs in itself. "
+            "CRITICAL: Always use action:open_memory when user asks to open their memory/long-term memory."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "run | run_in_dir | run_piped | run_background | list_processes | kill_process | network_info | disk_usage | system_info | self_read | self_write | self_append | self_list"},
+                "action":      {"type": "STRING", "description": "run | run_in_dir | run_piped | run_background | list_processes | kill_process | network_info | disk_usage | system_info | open_file | open_project_file | open_memory | self_read | self_write | self_append | self_list"},
                 "command":     {"type": "STRING", "description": "The command string to execute"},
                 "working_dir": {"type": "STRING", "description": "Working directory for run_in_dir"},
                 "timeout":     {"type": "INTEGER", "description": "Execution timeout in seconds (default: 30, max: 120)"},
                 "filter":      {"type": "STRING", "description": "Process name filter for list_processes"},
                 "process":     {"type": "STRING", "description": "PID or process name for kill_process"},
-                "path":        {"type": "STRING", "description": "File/dir path relative to project root (for self_*)"},
+                "path":        {"type": "STRING", "description": "File path for open_file, open_project_file, and self_* actions"},
                 "content":     {"type": "STRING", "description": "File content to write/append (for self_write/self_append)"},
             },
             "required": ["action"]
@@ -602,9 +610,31 @@ class JarvisLive:
             ),
         )
 
+    def _intercept_memory_open(self, name: str, args: dict) -> dict:
+        """Redirect any memory-opening request to cmd_control open_memory."""
+        if name == "cmd_control" and args.get("action", "").lower() == "open_memory":
+            return args  # Already correct
+
+        # Catch open_app trying to open memory
+        if name == "open_app":
+            app_name = args.get("app_name", "").lower()
+            memory_keywords = ["memory", "mémoire", "memoire", "long term",
+                               "long-term", "longterm", "long terme", "long-terme"]
+            if any(kw in app_name for kw in memory_keywords):
+                print("[JARVIS] 🔄 Intercepted memory request from open_app → cmd_control open_memory")
+                args = {"action": "open_memory"}
+                return args
+
+        return args
+
     async def _execute_tool(self, fc) -> types.FunctionResponse:
         name = fc.name
         args = dict(fc.args or {})
+
+        # Intercept memory-opening requests
+        args = self._intercept_memory_open(name, args)
+        if args.get("action") == "open_memory" and name != "cmd_control":
+            name = "cmd_control"
 
         print(f"[JARVIS] 🔧 {name}  {args}")
         self.ui.set_state("THINKING")
@@ -866,6 +896,9 @@ class JarvisLive:
             http_options={"api_version": "v1beta"}
         )
 
+        reconnect_delay = 3  # Start with 3s, increase on repeated failures
+        max_delay = 30
+
         while True:
             try:
                 print("[JARVIS] 🔌 Connecting...")
@@ -884,6 +917,7 @@ class JarvisLive:
                     print("[JARVIS] ✅ Connected.")
                     self.ui.set_state("LISTENING")
                     self.ui.write_log("SYS: JARVIS online.")
+                    reconnect_delay = 3  # Reset on successful connection
 
                     tg.create_task(self._send_realtime())
                     tg.create_task(self._listen_audio())
@@ -891,13 +925,24 @@ class JarvisLive:
                     tg.create_task(self._play_audio())
                     
             except Exception as e:
+                err_str = str(e)
                 print(f"[JARVIS] ⚠️ {e}")
                 traceback.print_exc()
 
+                # Log specific error type for debugging
+                if "1011" in err_str:
+                    print("[JARVIS] 🔴 Gemini API 1011 internal error — server-side issue, retrying...")
+                elif "429" in err_str:
+                    print("[JARVIS] 🔴 Rate limited by Gemini API")
+                elif "quota" in err_str.lower():
+                    print("[JARVIS] 🔴 Quota exceeded")
+
             self.set_speaking(False)
+            self.session = None
             self.ui.set_state("THINKING")
-            print("[JARVIS] 🔄 Reconnecting in 3s...")
-            await asyncio.sleep(3)
+            print(f"[JARVIS] 🔄 Reconnecting in {reconnect_delay}s...")
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 1.5, max_delay)  # Exponential backoff
 
 def main():
     ui = JarvisUI("face.png")

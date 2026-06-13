@@ -4,6 +4,8 @@ import concurrent.futures
 import platform
 import shutil
 import subprocess
+import time
+import os
 from pathlib import Path
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
@@ -408,6 +410,43 @@ class _BrowserThread:
         return "Browser closed."
 
 
+# ── CMD-based URL opening (uses system default browser) ─────────────────────
+
+def _open_url_cmd(url: str) -> str:
+    """Open a URL in the system default browser via CMD. No Chrome for Testing."""
+    if not url:
+        return "No URL provided."
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    try:
+        system = platform.system()
+        if system == "Windows":
+            subprocess.Popen(
+                f'start "" "{url}"',
+                shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        elif system == "Darwin":
+            subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return f"Opened: {url}"
+    except Exception as e:
+        return f"Failed to open URL: {e}"
+
+
+def _open_search_cmd(query: str, engine: str = "google") -> str:
+    """Search via CMD by building a search URL and opening it in the default browser."""
+    engines = {
+        "google":     f"https://www.google.com/search?q={query.replace(' ', '+')}",
+        "bing":       f"https://www.bing.com/search?q={query.replace(' ', '+')}",
+        "duckduckgo": f"https://duckduckgo.com/?q={query.replace(' ', '+')}",
+    }
+    url = engines.get(engine.lower(), engines["google"])
+    return _open_url_cmd(url)
+
+
 # ── Singleton browser thread ─────────────────────────────────────────────────
 
 _bt         = _BrowserThread()
@@ -432,13 +471,13 @@ def browser_control(
     session_memory=None
 ) -> str:
     """
-    Browser controller — auto-detects and uses system default browser.
-    Always reuses the existing browser window/page; never opens incognito.
+    Browser controller — uses CMD/system default browser for opening URLs,
+    and Playwright for interactive browser actions (click, type, scroll, etc.).
 
     parameters:
-        action      : go_to | search | click | type | scroll | fill_form |
+        action      : open_url | go_to | search | click | type | scroll | fill_form |
                       smart_click | smart_type | get_text | press | close
-        url         : URL for go_to
+        url         : URL for open_url/go_to
         query       : search query
         engine      : google | bing | duckduckgo (default: google)
         selector    : CSS selector for click/type
@@ -456,10 +495,34 @@ def browser_control(
     result = "Unknown action."
 
     try:
+        if action == "open_url":
+            url = parameters.get("url", "")
+            if not url:
+                return "No URL provided for open_url."
+            result = _open_url_cmd(url)
+            print(f"[Browser] {result[:80]}")
+            if player:
+                player.write_log(f"[browser] {result[:60]}")
+            return result
+
         if action == "go_to":
-            result = _bt.run(_bt._go_to(parameters.get("url", "")))
+            url = parameters.get("url", "")
+            if url:
+                result = _open_url_cmd(url)
+                print(f"[Browser] {result[:80]}")
+                if player:
+                    player.write_log(f"[browser] {result[:60]}")
+                return result
+            result = _bt.run(_bt._go_to(url))
 
         elif action == "search":
+            query = parameters.get("query", "")
+            if query:
+                result = _open_search_cmd(query, parameters.get("engine", "google"))
+                print(f"[Browser] {result[:80]}")
+                if player:
+                    player.write_log(f"[browser] {result[:60]}")
+                return result
             result = _bt.run(_bt._search(
                 parameters.get("query", ""),
                 parameters.get("engine", "google"),
