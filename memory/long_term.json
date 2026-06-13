@@ -1,17 +1,7 @@
 {
   "identity": {},
-  "preferences": {
-    "auto_launch": {
-      "value": "enabled",
-      "updated": "2026-06-13"
-    }
-  },
-  "projects": {
-    "startup_script_path": {
-      "value": "C:\\Users\\arthu\\Documents\\Mark-XXXIX-OR-main\\launch.bat",
-      "updated": "2026-06-13"
-    }
-  },
+  "preferences": {},
+  "projects": {},
   "relationships": {},
   "wishes": {},
   "notes": {}
