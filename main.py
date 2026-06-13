@@ -30,6 +30,7 @@ from actions.code_helper       import code_helper
 from actions.dev_agent         import dev_agent
 from actions.web_search        import web_search as web_search_action
 from actions.computer_control  import computer_control
+from actions.cmd_control       import cmd_control
 from actions.game_updater      import game_updater
 
 
@@ -336,6 +337,29 @@ TOOL_DECLARATIONS = [
                 "field":       {"type": "STRING",  "description": "Field for user_data: name|email|city"},
                 "clear_first": {"type": "BOOLEAN", "description": "Clear field before typing (default: true)"},
                 "path":        {"type": "STRING",  "description": "Save path for screenshot"},
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "cmd_control",
+        "description": (
+            "Executes terminal/CMD commands on the system. Use for: running shell commands, "
+            "piped commands, background processes, listing/killing processes, "
+            "network info, disk usage, system info. "
+            "Has built-in safety checks against dangerous commands. "
+            "Use this when the user asks to run a terminal command, CMD command, "
+            "shell command, or any direct system command."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action":      {"type": "STRING", "description": "run | run_in_dir | run_piped | run_background | list_processes | kill_process | network_info | disk_usage | system_info"},
+                "command":     {"type": "STRING", "description": "The command string to execute"},
+                "working_dir": {"type": "STRING", "description": "Working directory for run_in_dir"},
+                "timeout":     {"type": "INTEGER", "description": "Execution timeout in seconds (default: 30, max: 120)"},
+                "filter":      {"type": "STRING", "description": "Process name filter for list_processes"},
+                "process":     {"type": "STRING", "description": "PID or process name for kill_process"},
             },
             "required": ["action"]
         }
@@ -674,6 +698,10 @@ class JarvisLive:
 
             elif name == "computer_control":
                 r = await loop.run_in_executor(None, lambda: computer_control(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "cmd_control":
+                r = await loop.run_in_executor(None, lambda: cmd_control(parameters=args, player=self.ui))
                 result = r or "Done."
 
             elif name == "game_updater":

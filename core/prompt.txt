@@ -33,3 +33,8 @@ TOOL SELECTION:
   multiple tools (e.g. "research X and save to file", "create a project").
 - Simple rule: if it can be done in ONE action → computer_settings. 
   If it needs 3+ steps across different tools → agent_task.
+- cmd_control → Execute terminal/CMD/shell commands on the system. 
+  Use for: running commands, piped commands, background processes, 
+  listing/killing processes, network info, disk usage, system info.
+  Has built-in safety: blocks dangerous commands (format, rm -rf /, shutdown, etc.)
+  Call DIRECTLY for any terminal/command-line request — never use computer_settings.
