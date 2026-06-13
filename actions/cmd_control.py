@@ -308,6 +308,87 @@ def _system_info() -> str:
     return "\n".join(info)
 
 
+
+def _self_read(file_path: str) -> str:
+    """Read a file from the Jarvis project directory."""
+    target = _BASE / file_path.lstrip("/").lstrip("\\")
+    if not str(target.resolve()).startswith(str(_BASE.resolve())):
+        return "Access denied: path outside project directory."
+    if not target.exists():
+        return f"File not found: {file_path}"
+    if target.is_dir():
+        items = sorted(target.iterdir())
+        lines = []
+        for item in items:
+            if item.name.startswith(".") or item.suffix == ".pyc":
+                continue
+            if item.is_dir():
+                lines.append(f"  {item.name}/")
+            else:
+                lines.append(f"  {item.name}")
+        return f"Directory {file_path} ({len(lines)} items):\n" + "\n".join(lines) if lines else f"Empty directory: {file_path}"
+    try:
+        return target.read_text(encoding="utf-8")
+    except Exception as e:
+        return f"Could not read file: {e}"
+
+
+def _self_write(file_path: str, content: str) -> str:
+    """Write content to a file in the Jarvis project directory."""
+    target = _BASE / file_path.lstrip("/").lstrip("\\")
+    if not str(target.resolve()).startswith(str(_BASE.resolve())):
+        return "Access denied: path outside project directory."
+    if "__pycache__" in str(target):
+        return "Cannot write to __pycache__ directories."
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return f"Written {len(content)} chars to {file_path}"
+    except Exception as e:
+        return f"Could not write file: {e}"
+
+
+def _self_append(file_path: str, content: str) -> str:
+    """Append content to a file in the Jarvis project directory."""
+    target = _BASE / file_path.lstrip("/").lstrip("\\")
+    if not str(target.resolve()).startswith(str(_BASE.resolve())):
+        return "Access denied: path outside project directory."
+    if not target.exists():
+        return f"File not found: {file_path}. Use self_write to create new files."
+    try:
+        existing = target.read_text(encoding="utf-8")
+        if not existing.endswith("\n"):
+            content = "\n" + content
+        target.write_text(existing + content, encoding="utf-8")
+        return f"Appended {len(content)} chars to {file_path}"
+    except Exception as e:
+        return f"Could not append to file: {e}"
+
+
+def _self_list(dir_path: str = "") -> str:
+    """List the Jarvis project structure."""
+    target = _BASE / dir_path.lstrip("/").lstrip("\\") if dir_path else _BASE
+    if not str(target.resolve()).startswith(str(_BASE.resolve())):
+        return "Access denied: path outside project directory."
+    if not target.exists() or not target.is_dir():
+        return f"Directory not found: {dir_path}"
+    lines = []
+    for item in sorted(target.iterdir()):
+        if item.name.startswith(".") or item.suffix == ".pyc":
+            continue
+        if item.is_dir():
+            try:
+                count = len([f for f in item.iterdir() if not f.name.startswith(".") and f.suffix != ".pyc"])
+            except PermissionError:
+                count = "?"
+            lines.append(f"  {item.name}/ ({count} items)")
+        else:
+            size = item.stat().st_size
+            size_str = f"{size / 1024:.1f} KB" if size < 1024 * 1024 else f"{size / 1024 / 1024:.1f} MB"
+            lines.append(f"  {item.name} ({size_str})")
+    prefix = dir_path or "project root"
+    return f"{prefix} ({len(lines)} items):\n" + "\n".join(lines) if lines else f"Empty directory: {prefix}"
+
 def cmd_control(
     parameters: dict = None,
     response=None,
@@ -324,6 +405,8 @@ def cmd_control(
       timeout       : execution timeout in seconds (default: 30, max: 120)
       filter        : process name filter (for list_processes)
       process       : PID or process name (for kill_process)
+      path          : file/directory path relative to project root (for self_*)
+      content       : file content to write/append (for self_write/self_append)
 
     Actions:
       run            — execute a single command and return output
@@ -335,6 +418,10 @@ def cmd_control(
       network_info   — show network configuration
       disk_usage     — show disk space information
       system_info    — show system/OS information
+      self_read      — read a file from the Jarvis project
+      self_write     — write/overwrite a file in the Jarvis project
+      self_append    — append content to a file in the Jarvis project
+      self_list      — list the Jarvis project directory structure
     """
     params  = parameters or {}
     action  = params.get("action", "").lower().strip()
@@ -406,6 +493,37 @@ def cmd_control(
 
         if action == "system_info":
             return _system_info()
+
+
+        if action == "self_read":
+            file_path = params.get("path", "").strip()
+            if not file_path:
+                return "No file path provided. Use path relative to project root, e.g. 'actions/cmd_control.py'"
+            return _self_read(file_path)
+
+        if action == "self_write":
+            file_path = params.get("path", "").strip()
+            content   = params.get("content", "")
+            if not file_path:
+                return "No file path provided."
+            if not content:
+                return "No content provided to write."
+            print(f"[CmdControl] ✏️ self_write: {file_path} ({len(content)} chars)")
+            return _self_write(file_path, content)
+
+        if action == "self_append":
+            file_path = params.get("path", "").strip()
+            content   = params.get("content", "")
+            if not file_path:
+                return "No file path provided."
+            if not content:
+                return "No content provided to append."
+            print(f"[CmdControl] ✏️ self_append: {file_path}")
+            return _self_append(file_path, content)
+
+        if action == "self_list":
+            dir_path = params.get("path", "").strip()
+            return _self_list(dir_path)
 
         return f"Unknown action: '{action}'"
 

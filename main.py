@@ -344,22 +344,25 @@ TOOL_DECLARATIONS = [
     {
         "name": "cmd_control",
         "description": (
-            "Executes terminal/CMD commands on the system. Use for: running shell commands, "
-            "piped commands, background processes, listing/killing processes, "
-            "network info, disk usage, system info. "
+            "Executes terminal/CMD commands AND can modify the Jarvis's own source code. "
+            "Use for: running shell commands, piped commands, background processes, "
+            "listing/killing processes, network info, disk usage, system info, "
+            "AND reading/writing/appending the Jarvis's own Python files (self_read, self_write, self_append, self_list). "
             "Has built-in safety checks against dangerous commands. "
             "Use this when the user asks to run a terminal command, CMD command, "
-            "shell command, or any direct system command."
+            "shell command, modify Jarvis's code, add features, fix bugs in itself."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "run | run_in_dir | run_piped | run_background | list_processes | kill_process | network_info | disk_usage | system_info"},
+                "action":      {"type": "STRING", "description": "run | run_in_dir | run_piped | run_background | list_processes | kill_process | network_info | disk_usage | system_info | self_read | self_write | self_append | self_list"},
                 "command":     {"type": "STRING", "description": "The command string to execute"},
                 "working_dir": {"type": "STRING", "description": "Working directory for run_in_dir"},
                 "timeout":     {"type": "INTEGER", "description": "Execution timeout in seconds (default: 30, max: 120)"},
                 "filter":      {"type": "STRING", "description": "Process name filter for list_processes"},
                 "process":     {"type": "STRING", "description": "PID or process name for kill_process"},
+                "path":        {"type": "STRING", "description": "File/dir path relative to project root (for self_*)"},
+                "content":     {"type": "STRING", "description": "File content to write/append (for self_write/self_append)"},
             },
             "required": ["action"]
         }

@@ -33,8 +33,11 @@ TOOL SELECTION:
   multiple tools (e.g. "research X and save to file", "create a project").
 - Simple rule: if it can be done in ONE action → computer_settings. 
   If it needs 3+ steps across different tools → agent_task.
-- cmd_control → Execute terminal/CMD/shell commands on the system. 
+- cmd_control → Execute terminal/CMD commands AND modify Jarvis's own source code.
   Use for: running commands, piped commands, background processes, 
   listing/killing processes, network info, disk usage, system info.
+  Also: self_read (read own files), self_write (overwrite own files), 
+  self_append (add code to own files), self_list (list project structure).
+  Use self_* actions when user asks to modify Jarvis, add features, fix bugs in itself.
   Has built-in safety: blocks dangerous commands (format, rm -rf /, shutdown, etc.)
-  Call DIRECTLY for any terminal/command-line request — never use computer_settings.
+  Call DIRECTLY for any terminal/command-line or self-modification request.
