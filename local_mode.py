@@ -320,7 +320,16 @@ class JarvisLocal:
 
         # 1. System prompt
         self.system_prompt = self._load_system_prompt()
-        # Always add language instruction if a specific language is set
+        # Add conciseness instruction for voice mode
+        self.system_prompt += (
+            "\n\nVOICE MODE RULES: "
+            "Keep responses SHORT and CONCISE. "
+            "Maximum 2-3 sentences unless the user asks for detail. "
+            "No unnecessary explanations or disclaimers. "
+            "Be direct, like a sharp assistant. "
+            "Do not repeat what the user said."
+        )
+        # Add language instruction if a specific language is set
         if self.lang != "auto" and self.lang in LANG_CONFIG:
             self._lang_name = {"fr": "French", "en": "English", "de": "German", "es": "Spanish",
                          "it": "Italian", "pt": "Portuguese", "tr": "Turkish", "zh": "Chinese",
@@ -433,9 +442,18 @@ class JarvisLocal:
             if self.lang != "auto" and self.lang in LANG_CONFIG:
                 whisper_lang = LANG_CONFIG[self.lang][0]
 
+            # initial_prompt helps Whisper understand French much better
+            # by giving it context about the expected vocabulary/language
+            initial_prompt = None
+            if whisper_lang == "fr":
+                initial_prompt = "Bonjour, je vous écoute. Comment puis-je vous aider ?"
+            elif whisper_lang == "en":
+                initial_prompt = "Hello, how can I help you today?"
+
             segments, info = self.whisper_model.transcribe(
                 audio, language=whisper_lang, beam_size=5, vad_filter=True,
                 condition_on_previous_text=True,
+                initial_prompt=initial_prompt,
             )
             text = " ".join(s.text.strip() for s in segments).strip()
 
