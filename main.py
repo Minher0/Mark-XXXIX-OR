@@ -970,7 +970,8 @@ def main():
                         help="Ollama model for local mode (default: qwen2.5:7b)")
     args = parser.parse_args()
 
-    ui = JarvisUI("face.png")
+    is_local = not args.cloud
+    ui = JarvisUI("face.png", local_mode=is_local)
 
     def runner():
         if args.cloud:

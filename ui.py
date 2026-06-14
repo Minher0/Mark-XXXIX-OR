@@ -1013,8 +1013,9 @@ class MainWindow(QMainWindow):
     _log_sig   = pyqtSignal(str)
     _state_sig = pyqtSignal(str)
 
-    def __init__(self, face_path: str):
+    def __init__(self, face_path: str, local_mode: bool = False):
         super().__init__()
+        self._local_mode = local_mode
         self.setWindowTitle("J.A.R.V.I.S — MARK XXXIX")
         self.setMinimumSize(_MIN_W, _MIN_H)
         self.resize(_DEFAULT_W, _DEFAULT_H)
@@ -1070,9 +1071,12 @@ class MainWindow(QMainWindow):
         self._state_sig.connect(self._apply_state)
 
         self._overlay: SetupOverlay | None = None
-        self._ready = self._check_config()
-        if not self._ready:
-            self._show_setup()
+        if self._local_mode:
+            self._ready = True          # Skip API key check in local mode
+        else:
+            self._ready = self._check_config()
+            if not self._ready:
+                self._show_setup()
 
         sc_mute = QShortcut(QKeySequence("F4"), self)
         sc_mute.activated.connect(self._toggle_mute)
@@ -1489,10 +1493,10 @@ class _RootShim:
 
 
 class JarvisUI:
-    def __init__(self, face_path: str, size=None):
+    def __init__(self, face_path: str, size=None, local_mode: bool = False):
         self._app = QApplication.instance() or QApplication(sys.argv)
         self._app.setStyle("Fusion")
-        self._win = MainWindow(face_path)
+        self._win = MainWindow(face_path, local_mode=local_mode)
         self._win.show()
         self.root = _RootShim(self._app)
 
