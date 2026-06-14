@@ -856,7 +856,7 @@ class _DropCanvas(QWidget):
 
 
 class SetupOverlay(QWidget):
-    done = pyqtSignal(str, str, str)
+    done = pyqtSignal(str, str, str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -910,6 +910,13 @@ class SetupOverlay(QWidget):
             QLineEdit:focus {{ border: 1px solid {C.PRI}; }}
         """)
         layout.addWidget(self._key_input)
+        # Pre-fill existing Gemini key
+        try:
+            _existing = json.loads(API_FILE.read_text(encoding="utf-8"))
+            if _existing.get("gemini_api_key"):
+                self._key_input.setText(_existing["gemini_api_key"])
+        except Exception:
+            pass
         layout.addSpacing(8)
 
         layout.addWidget(_lbl("OPENROUTER API KEY", 8, color=C.TEXT_DIM,
@@ -927,6 +934,37 @@ class SetupOverlay(QWidget):
             QLineEdit:focus {{ border: 1px solid {C.ACC2}; }}
         """)
         layout.addWidget(self._or_input)
+        # Pre-fill existing OpenRouter key
+        try:
+            _existing = json.loads(API_FILE.read_text(encoding="utf-8"))
+            if _existing.get("openrouter_api_key"):
+                self._or_input.setText(_existing["openrouter_api_key"])
+        except Exception:
+            pass
+        layout.addSpacing(8)
+
+        layout.addWidget(_lbl("DISCORD TOKEN (optional)", 8, color=C.TEXT_DIM,
+                       align=Qt.AlignmentFlag.AlignLeft))
+        self._discord_input = QLineEdit()
+        self._discord_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self._discord_input.setPlaceholderText("Your Discord user token...")
+        self._discord_input.setFont(QFont("Courier New", 10))
+        self._discord_input.setFixedHeight(32)
+        self._discord_input.setStyleSheet(f"""
+            QLineEdit {{
+                background: #000d12; color: {C.TEXT};
+                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 4px 8px;
+            }}
+            QLineEdit:focus {{ border: 1px solid #5865F2; }}
+        """)
+        layout.addWidget(self._discord_input)
+        # Pre-fill existing Discord token
+        try:
+            _existing = json.loads(API_FILE.read_text(encoding="utf-8"))
+            if _existing.get("discord_token"):
+                self._discord_input.setText(_existing["discord_token"])
+        except Exception:
+            pass
 
         layout.addSpacing(12)
 
@@ -1006,7 +1044,8 @@ class SetupOverlay(QWidget):
                 f" QLineEdit {{ border: 1px solid {C.RED}; }}"
             )
             return
-        self.done.emit(key, or_key, self._sel_os)
+        discord_token = self._discord_input.text().strip()
+        self.done.emit(key, or_key, self._sel_os, discord_token)
 
 
 class MainWindow(QMainWindow):
@@ -1444,14 +1483,15 @@ class MainWindow(QMainWindow):
             d = json.loads(API_FILE.read_text(encoding="utf-8"))
             return (bool(d.get("gemini_api_key")) and
                     bool(d.get("openrouter_api_key")) and
-                    bool(d.get("os_system")))
+                    bool(d.get("os_system")) and
+                    bool(d.get("discord_token")))
         except Exception:
             return False
 
     def _show_setup(self):
         ov = SetupOverlay(self.centralWidget())
         cw = self.centralWidget()
-        ow, oh = 460, 430
+        ow, oh = 460, 530
         ov.setGeometry(
             (cw.width()  - ow) // 2,
             (cw.height() - oh) // 2,
@@ -1461,15 +1501,25 @@ class MainWindow(QMainWindow):
         ov.show()
         self._overlay = ov
 
-    # Change signature:
-    def _on_setup_done(self, key: str, or_key: str, os_name: str):
+    def _on_setup_done(self, key: str, or_key: str, os_name: str, discord_token: str = ""):
         os.makedirs(CONFIG_DIR, exist_ok=True)
+        config = {
+            "gemini_api_key":    key,
+            "openrouter_api_key": or_key,
+            "os_system":         os_name,
+        }
+        if discord_token:
+            config["discord_token"] = discord_token
+        else:
+            # Preserve existing discord_token if user left field empty
+            try:
+                existing = json.loads(API_FILE.read_text(encoding="utf-8"))
+                if existing.get("discord_token"):
+                    config["discord_token"] = existing["discord_token"]
+            except Exception:
+                pass
         API_FILE.write_text(
-            json.dumps({
-                "gemini_api_key":    key,
-                "openrouter_api_key": or_key,
-                "os_system":         os_name,
-            }, indent=4),
+            json.dumps(config, indent=4),
             encoding="utf-8",
         )
         self._ready = True

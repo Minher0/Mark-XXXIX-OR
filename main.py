@@ -148,6 +148,27 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "discord_control",
+        "description": (
+            "Controls the user's personal Discord account. Can send DMs, send messages in server channels, "
+            "read channel messages, list servers and channels, and check connection status. "
+            "Use when the user asks to send a Discord message, read Discord, check Discord servers, etc. "
+            "NOT for WhatsApp/Telegram — use send_message for those."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action":   {"type": "STRING", "description": "send_dm | send_channel | read_channel | list_servers | list_channels | status (default: status)"},
+                "receiver": {"type": "STRING", "description": "Username to DM (for send_dm)"},
+                "server":   {"type": "STRING", "description": "Server name (for send_channel, read_channel, list_channels)"},
+                "channel":  {"type": "STRING", "description": "Channel name (for send_channel, read_channel)"},
+                "message":  {"type": "STRING", "description": "Message text to send (for send_dm, send_channel)"},
+                "limit":    {"type": "INTEGER", "description": "Number of messages to read (for read_channel, default: 10)"}
+            },
+            "required": ["action"]
+        }
+    },
+    {
         "name": "reminder",
         "description": "Sets a timed reminder using Windows Task Scheduler.",
         "parameters": {
