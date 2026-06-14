@@ -168,16 +168,37 @@ def _find_user_id(receiver: str) -> str | None:
     
     Search order:
     1. If it's a numeric ID, use directly
-    2. Check existing DM channels (most reliable for user tokens)
-    3. Search guild member lists (paginated)
+    2. Check Discord relationships (friends list)
+    3. Check existing DM channels
+    4. Search guild member lists (paginated)
     """
+    def _s(val) -> str:
+        """Safe lower — handles None values from API."""
+        return (val or "").lower()
+
     # 1. Numeric ID
     if receiver.isdigit():
         return receiver
 
     search = receiver.lower().replace("#", "")
 
-    # 2. Check existing DM channels
+    # 2. Check relationships (friends list)
+    relationships = _api_get("/users/@me/relationships")
+    if relationships:
+        for rel in relationships:
+            if rel.get("type") != 1:  # 1 = friend
+                continue
+            user = rel.get("user", {})
+            username = _s(user.get("username"))
+            global_name = _s(user.get("global_name"))
+            discriminator = user.get("discriminator") or "0"
+            full_name = f"{username}#{discriminator}" if discriminator != "0" else username
+            if (search in username or
+                search in global_name or
+                search in full_name.replace("#", "")):
+                return user.get("id")
+
+    # 3. Check existing DM channels
     dm_channels = _api_get("/users/@me/channels")
     if dm_channels:
         for ch in dm_channels:
@@ -185,17 +206,16 @@ def _find_user_id(receiver: str) -> str | None:
                 continue
             recipients = ch.get("recipients", [])
             for r in recipients:
-                username = r.get("username", "").lower()
-                global_name = r.get("global_name", "").lower()
-                discriminator = r.get("discriminator", "0")
+                username = _s(r.get("username"))
+                global_name = _s(r.get("global_name"))
+                discriminator = r.get("discriminator") or "0"
                 full_name = f"{username}#{discriminator}" if discriminator != "0" else username
                 if (search in username or
                     search in global_name or
-                    search in full_name.replace("#", "") or
-                    search == username):
+                    search in full_name.replace("#", "")):
                     return r.get("id")
 
-    # 3. Search guild member lists (paginated, max 100 per page)
+    # 4. Search guild member lists (paginated, max 100 per page)
     guilds = _get_guilds()
     for g in guilds:
         after = "0"
@@ -205,10 +225,10 @@ def _find_user_id(receiver: str) -> str | None:
                 break
             for m in members:
                 user = m.get("user", {})
-                username = user.get("username", "").lower()
-                global_name = user.get("global_name", "").lower()
-                nick = m.get("nick", "").lower()
-                discriminator = user.get("discriminator", "0")
+                username = _s(user.get("username"))
+                global_name = _s(user.get("global_name"))
+                nick = _s(m.get("nick"))
+                discriminator = user.get("discriminator") or "0"
                 full_name = f"{username}#{discriminator}" if discriminator != "0" else username
                 if (search in username or
                     search in global_name or
@@ -229,22 +249,36 @@ def _send_dm(receiver: str, message: str) -> str:
     user_id = _find_user_id(receiver)
 
     if not user_id:
-        # Build helpful message with known contacts
-        dm_channels = _api_get("/users/@me/channels")
-        known = []
-        if dm_channels:
-            for ch in dm_channels:
-                if ch.get("type") != 1:
+        # Build helpful message with friends and DM contacts
+        known = set()
+        relationships = _api_get("/users/@me/relationships")
+        if relationships:
+            for rel in relationships:
+                if rel.get("type") != 1:
                     continue
-                for r in ch.get("recipients", []):
-                    name = r.get("username", "")
-                    disc = r.get("discriminator", "0")
-                    if disc != "0":
-                        name = f"{name}#{disc}"
-                    known.append(name)
-        suggestions = ", ".join(known[:15]) if known else ""
+                user = rel.get("user", {})
+                name = user.get("username", "")
+                disc = user.get("discriminator") or "0"
+                if disc != "0":
+                    name = f"{name}#{disc}"
+                if name:
+                    known.add(name)
+        if not known:
+            dm_channels = _api_get("/users/@me/channels")
+            if dm_channels:
+                for ch in dm_channels:
+                    if ch.get("type") != 1:
+                        continue
+                    for r in ch.get("recipients", []):
+                        name = r.get("username") or ""
+                        disc = r.get("discriminator") or "0"
+                        if disc != "0":
+                            name = f"{name}#{disc}"
+                        if name:
+                            known.add(name)
+        suggestions = ", ".join(list(known)[:15]) if known else ""
         if suggestions:
-            return f"User '{receiver}' not found. People you've DM'd: {suggestions}"
+            return f"User '{receiver}' not found. Your friends/contacts: {suggestions}"
         return f"User '{receiver}' not found. Try their Discord user ID (numeric)."
 
     # Create DM channel
@@ -324,7 +358,7 @@ def discord_control(parameters: dict, player=None) -> str:
     Main entry point for Jarvis tool dispatch.
 
     parameters:
-        action      : send_dm | send_channel | read_channel | list_servers | list_channels | status
+        action      : send_dm | send_channel | read_channel | list_servers | list_channels | list_friends | status
         receiver    : Username or user ID for send_dm
         message     : Message text to send
         server      : Server name for send_channel / read_channel / list_channels
@@ -379,13 +413,36 @@ def discord_control(parameters: dict, player=None) -> str:
                 return "Please specify a server name."
             result = _list_channels(server)
 
+        elif action == "list_friends":
+            relationships = _api_get("/users/@me/relationships")
+            if not relationships:
+                return "Could not fetch friends list."
+            friends = []
+            for rel in relationships:
+                if rel.get("type") != 1:
+                    continue
+                user = rel.get("user", {})
+                name = user.get("username", "?")
+                disc = user.get("discriminator") or "0"
+                gname = user.get("global_name") or ""
+                if disc != "0":
+                    display = f"{name}#{disc}"
+                else:
+                    display = name
+                if gname and gname != name:
+                    display = f"{gname} ({name})"
+                friends.append(display)
+            if not friends:
+                return "No friends found."
+            return f"Your Discord friends ({len(friends)}):\n" + ", ".join(friends[:50])
+
         elif action == "status":
             result = _status()
 
         else:
             result = (
                 f"Unknown Discord action: '{action}'. "
-                "Available: send_dm, send_channel, read_channel, list_servers, list_channels, status"
+                "Available: send_dm, send_channel, read_channel, list_servers, list_channels, list_friends, status"
             )
 
     except ValueError as e:

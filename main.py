@@ -151,14 +151,15 @@ TOOL_DECLARATIONS = [
         "name": "discord_control",
         "description": (
             "Controls the user's personal Discord account. Can send DMs, send messages in server channels, "
-            "read channel messages, list servers and channels, and check connection status. "
-            "Use when the user asks to send a Discord message, read Discord, check Discord servers, etc. "
+            "read channel messages, list servers, list channels, list friends, and check connection status. "
+            "Use when the user asks to send a Discord message, read Discord, check Discord servers, "
+            "list their Discord friends/contacts, etc. "
             "NOT for WhatsApp/Telegram — use send_message for those."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":   {"type": "STRING", "description": "send_dm | send_channel | read_channel | list_servers | list_channels | status (default: status)"},
+                "action":   {"type": "STRING", "description": "send_dm | send_channel | read_channel | list_servers | list_channels | list_friends | status (default: status)"},
                 "receiver": {"type": "STRING", "description": "Username to DM (for send_dm)"},
                 "server":   {"type": "STRING", "description": "Server name (for send_channel, read_channel, list_channels)"},
                 "channel":  {"type": "STRING", "description": "Channel name (for send_channel, read_channel)"},
@@ -549,42 +550,7 @@ TOOL_DECLARATIONS = [
             "required": ["category", "key", "value"]
         }
     },
-    {
-    "name": "discord_control",
-    "description": (
-        "Control the user's Discord via a bot. Send messages to channels or users, "
-        "read messages, list servers and channels, delete or edit messages. "
-        "Use this when the user asks to send a Discord message, check Discord, "
-        "read messages from a channel, or manage their Discord. "
-        "The user can say this in ANY language."
-    ),
-    "parameters": {
-        "type": "OBJECT",
-        "properties": {
-            "action": {
-                "type": "STRING",
-                "description": (
-                    "send_message — Send a message to a channel or DM a user | "
-                    "read_messages — Read recent messages from a channel | "
-                    "list_channels — List text channels in a server | "
-                    "list_servers — List all servers the bot is in | "
-                    "delete_message — Delete a message by ID | "
-                    "edit_message — Edit a message by ID"
-                )
-            },
-            "channel":    {"type": "STRING",  "description": "Channel name (e.g. 'general', 'dev-chat')"},
-            "user":       {"type": "STRING",  "description": "Username to send a DM to"},
-            "message":    {"type": "STRING",  "description": "Message content to send or edit"},
-            "channel_id": {"type": "STRING",  "description": "Discord channel ID (if name not found)"},
-            "message_id": {"type": "STRING",  "description": "Message ID for delete/edit"},
-            "server":     {"type": "STRING",  "description": "Server name for list_channels"},
-            "limit":      {"type": "STRING",  "description": "Number of messages to read (default: 10)"},
-        },
-        "required": ["action"]
-    }
-    },
 ]
-
 
 class JarvisLive:
 
