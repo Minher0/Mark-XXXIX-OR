@@ -34,12 +34,27 @@ import sounddevice as sd
 SAMPLE_RATE       = 16000
 WHISPER_MODEL     = "small"        # tiny / base / small / medium / large
 DEFAULT_LLM       = "qwen2.5:7b"   # Best tool-calling local model
-DEFAULT_TTS_VOICE = "fr-FR-DeniseNeural"
 SILENCE_DURATION  = 1.2            # Seconds of silence to end recording
 MIN_SPEECH_FRAMES = 10             # ~300ms minimum speech
 MAX_RECORD_SEC    = 30             # Max recording time
 MAX_TOOL_RESULT   = 2000           # Max chars for tool results
 MAX_HISTORY       = 50             # Max conversation messages
+
+# Language-specific settings: (whisper_lang, tts_voice, tts_voice_alt)
+LANG_CONFIG = {
+    "fr": ("fr", "fr-FR-HenriNeural",  "fr-FR-DeniseNeural"),   # French
+    "en": ("en", "en-US-GuyNeural",    "en-US-JennyNeural"),   # English
+    "de": ("de", "de-DE-ConradNeural",  "de-DE-KatjaNeural"),   # German
+    "es": ("es", "es-ES-AlvaroNeural",  "es-ES-ElviraNeural"),  # Spanish
+    "it": ("it", "it-IT-DiegoNeural",   "it-IT-ElsaNeural"),    # Italian
+    "pt": ("pt", "pt-BR-AntonioNeural", "pt-BR-FranciscaNeural"),# Portuguese
+    "tr": ("tr", "tr-TR-AhmetNeural",   "tr-TR-EmelNeural"),    # Turkish
+    "zh": ("zh", "zh-CN-YunxiNeural",   "zh-CN-XiaoxiaoNeural"),# Chinese
+    "ja": ("ja", "ja-JP-KeitaNeural",   "ja-JP-NanamiNeural"),  # Japanese
+    "ko": ("ko", "ko-KR-InJoonNeural",  "ko-KR-SunHiNeural"),   # Korean
+    "ru": ("ru", "ru-RU-DmitryNeural",  "ru-RU-SvetlanaNeural"),# Russian
+    "ar": ("ar", "ar-SA-HamedNeural",   "ar-SA-ZariyahNeural"), # Arabic
+}
 
 _BASE = Path(__file__).resolve().parent
 
@@ -273,9 +288,10 @@ class VoiceRecorder:
 class JarvisLocal:
     """Jarvis running entirely on local hardware — no cloud APIs."""
 
-    def __init__(self, ui, model=DEFAULT_LLM):
+    def __init__(self, ui, model=DEFAULT_LLM, lang="auto"):
         self.ui              = ui
         self.model           = model
+        self.lang            = lang          # "auto", "fr", "en", etc.
         self.recorder        = VoiceRecorder()
         self.whisper_model   = None
         self.ollama_client   = None
@@ -283,6 +299,7 @@ class JarvisLocal:
         self.messages        = []
         self.system_prompt   = ""
         self.running         = True
+        self._detected_lang  = None          # Whisper's detected language
 
     # ───────────────────────────────────────────────────────
     # INITIALIZATION
@@ -307,6 +324,16 @@ class JarvisLocal:
 
         # 1. System prompt
         self.system_prompt = self._load_system_prompt()
+        # Add language instruction to system prompt
+        if self.lang != "auto" and self.lang in LANG_CONFIG:
+            lang_names = {"fr": "French", "en": "English", "de": "German", "es": "Spanish",
+                         "it": "Italian", "pt": "Portuguese", "tr": "Turkish", "zh": "Chinese",
+                         "ja": "Japanese", "ko": "Korean", "ru": "Russian", "ar": "Arabic"}
+            self.system_prompt += (
+                f"\n\nIMPORTANT: You MUST always respond in {lang_names.get(self.lang, self.lang)}. "
+                f"Never respond in English unless the user explicitly asks. "
+                f"All your speech output must be in {lang_names.get(self.lang, self.lang)}."
+            )
         self.messages = [{"role": "system", "content": self.system_prompt}]
 
         # 2. Ollama
@@ -400,10 +427,20 @@ class JarvisLocal:
     def _transcribe(self, audio: np.ndarray) -> str:
         """Transcribe audio using faster-whisper."""
         try:
+            # Use configured language or auto-detect
+            whisper_lang = None
+            if self.lang != "auto" and self.lang in LANG_CONFIG:
+                whisper_lang = LANG_CONFIG[self.lang][0]
+
             segments, info = self.whisper_model.transcribe(
-                audio, language=None, beam_size=3, vad_filter=True,
+                audio, language=whisper_lang, beam_size=5, vad_filter=True,
+                condition_on_previous_text=True,
             )
             text = " ".join(s.text.strip() for s in segments).strip()
+
+            # Track detected language for auto mode
+            self._detected_lang = info.language
+
             if text:
                 print(f"[LocalMode] 📝 \"{text}\" (lang: {info.language})")
             return text
@@ -511,13 +548,27 @@ class JarvisLocal:
         try:
             import edge_tts
 
-            # Auto-select voice based on language
-            voice = DEFAULT_TTS_VOICE
-            french_chars = sum(1 for c in text if c in "éèêëàâùûîïôöçÉÈÊËÀÂÙÛÎÏÔÖÇ")
-            if french_chars > len(text) * 0.02:
-                voice = "fr-FR-DeniseNeural"
+            # Select voice based on language setting
+            voice = "en-US-GuyNeural"  # default
+            lang_code = self.lang
+
+            # Auto-detect from Whisper or text content
+            if lang_code == "auto":
+                lang_code = self._detected_lang or "en"
+                # Fallback: detect from text content
+                if lang_code == "en":
+                    french_chars = sum(1 for c in text if c in "éèêëàâùûîïôöçÉÈÊËÀÂÙÛÎÏÔÖÇ")
+                    if french_chars > len(text) * 0.05:
+                        lang_code = "fr"
+
+            # Get voice from config (male voice primary, female fallback)
+            if lang_code in LANG_CONFIG:
+                voice = LANG_CONFIG[lang_code][1]  # male voice
             else:
-                voice = "en-US-GuyNeural"
+                # Try 2-letter prefix match
+                prefix = lang_code[:2]
+                if prefix in LANG_CONFIG:
+                    voice = LANG_CONFIG[prefix][1]
 
             # Generate audio (edge-tts outputs MP3)
             communicate = edge_tts.Communicate(text, voice)

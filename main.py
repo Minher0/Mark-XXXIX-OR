@@ -968,6 +968,8 @@ def main():
                         help="Run in cloud mode (Gemini API, requires API key)")
     parser.add_argument("--model", type=str, default="qwen2.5:7b",
                         help="Ollama model for local mode (default: qwen2.5:7b)")
+    parser.add_argument("--lang", type=str, default="auto",
+                        help="Language: fr, en, de, es, it, pt, tr, zh, ja, ko, ru, ar (default: auto-detect)")
     args = parser.parse_args()
 
     is_local = not args.cloud
@@ -979,8 +981,8 @@ def main():
             jarvis = JarvisLive(ui)
         else:
             from local_mode import JarvisLocal
-            print(f"[JARVIS] 🏠 Starting in LOCAL mode (model: {args.model})")
-            jarvis = JarvisLocal(ui, model=args.model)
+            print(f"[JARVIS] 🏠 Starting in LOCAL mode (model: {args.model}, lang: {args.lang})")
+            jarvis = JarvisLocal(ui, model=args.model, lang=args.lang)
         try:
             asyncio.run(jarvis.run())
         except KeyboardInterrupt:
