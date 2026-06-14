@@ -962,11 +962,24 @@ class JarvisLive:
             reconnect_delay = min(reconnect_delay * 1.5, max_delay)  # Exponential backoff
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="JARVIS — AI Assistant")
+    parser.add_argument("--local", action="store_true",
+                        help="Run in local mode (Ollama + Whisper, no cloud APIs)")
+    parser.add_argument("--model", type=str, default="qwen2.5:7b",
+                        help="Ollama model for local mode (default: qwen2.5:7b)")
+    args = parser.parse_args()
+
     ui = JarvisUI("face.png")
 
     def runner():
-        ui.wait_for_api_key()
-        jarvis = JarvisLive(ui)
+        if args.local:
+            from local_mode import JarvisLocal
+            print(f"[JARVIS] 🏠 Starting in LOCAL mode (model: {args.model})")
+            jarvis = JarvisLocal(ui, model=args.model)
+        else:
+            ui.wait_for_api_key()
+            jarvis = JarvisLive(ui)
         try:
             asyncio.run(jarvis.run())
         except KeyboardInterrupt:
