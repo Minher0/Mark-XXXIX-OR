@@ -320,16 +320,18 @@ class JarvisLocal:
 
         # 1. System prompt
         self.system_prompt = self._load_system_prompt()
-        # Add language instruction to system prompt
+        # Always add language instruction if a specific language is set
         if self.lang != "auto" and self.lang in LANG_CONFIG:
-            lang_names = {"fr": "French", "en": "English", "de": "German", "es": "Spanish",
+            self._lang_name = {"fr": "French", "en": "English", "de": "German", "es": "Spanish",
                          "it": "Italian", "pt": "Portuguese", "tr": "Turkish", "zh": "Chinese",
-                         "ja": "Japanese", "ko": "Korean", "ru": "Russian", "ar": "Arabic"}
+                         "ja": "Japanese", "ko": "Korean", "ru": "Russian", "ar": "Arabic"}.get(self.lang, self.lang)
             self.system_prompt += (
-                f"\n\nIMPORTANT: You MUST always respond in {lang_names.get(self.lang, self.lang)}. "
-                f"Never respond in English unless the user explicitly asks. "
-                f"All your speech output must be in {lang_names.get(self.lang, self.lang)}."
+                f"\n\nCRITICAL RULE: You MUST respond in {self._lang_name}. "
+                f"Never use English unless the user explicitly asks for it. "
+                f"Every single word of your response must be in {self._lang_name}."
             )
+        else:
+            self._lang_name = None
         self.messages = [{"role": "system", "content": self.system_prompt}]
 
         # 2. Ollama
@@ -467,7 +469,22 @@ class JarvisLocal:
 
     def _chat(self, user_text: str) -> str:
         """Send message to Ollama, handle tool calls in a loop. Returns final text."""
-        self.messages.append({"role": "user", "content": user_text})
+        # Determine the response language based on detected or configured language
+        response_lang = self._lang_name  # Set via --lang flag
+        if not response_lang and self._detected_lang:
+            # Auto mode: use Whisper's detected language
+            lang_map = {"fr": "French", "en": "English", "de": "German", "es": "Spanish",
+                        "it": "Italian", "pt": "Portuguese", "tr": "Turkish", "zh": "Chinese",
+                        "ja": "Japanese", "ko": "Korean", "ru": "Russian", "ar": "Arabic"}
+            response_lang = lang_map.get(self._detected_lang)
+
+        # Inject language instruction into the user message for maximum compliance
+        if response_lang and response_lang != "English":
+            enhanced_text = f"[Respond in {response_lang}] {user_text}"
+        else:
+            enhanced_text = user_text
+
+        self.messages.append({"role": "user", "content": enhanced_text})
 
         max_iterations = 6   # Prevent infinite tool loops
 
