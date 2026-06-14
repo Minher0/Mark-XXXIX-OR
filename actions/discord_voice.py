@@ -43,11 +43,132 @@ try:
 except ImportError:
     HAS_NACL = False
 
-try:
-    import opuslib
-    HAS_OPUS = True
-except (ImportError, OSError):
-    HAS_OPUS = False
+# ─── Opus DLL auto-detect ─────────────────────────────────────
+
+HAS_OPUS = False
+
+
+def _find_opus_dll() -> Optional[str]:
+    """Try to locate opus.dll on Windows.
+    
+    Search order:
+    1. Already in project directory
+    2. Next to this .py file
+    3. In Discord's installation folder (%LocalAppData%/Discord/app-xxx/opus.dll)
+    4. In system PATH directories
+    """
+    if sys.platform != "win32":
+        return None  # On Linux/Mac, libopus is usually in the system lib path
+
+    # 1. Project directory (where main.py lives)
+    project_dir = Path(__file__).resolve().parent.parent
+    candidate = project_dir / "opus.dll"
+    if candidate.exists():
+        return str(candidate)
+
+    # 2. Next to this file
+    candidate = Path(__file__).resolve().parent / "opus.dll"
+    if candidate.exists():
+        return str(candidate)
+
+    # 3. Discord's installation folder
+    local_app = os.environ.get("LOCALAPPDATA", "")
+    if local_app:
+        discord_dir = Path(local_app) / "Discord"
+        if discord_dir.exists():
+            # Find the latest app-x.x.xxx folder
+            app_folders = sorted(discord_dir.glob("app-*"), reverse=True)
+            for folder in app_folders:
+                candidate = folder / "opus.dll"
+                if candidate.exists():
+                    return str(candidate)
+
+    # 4. System PATH
+    for path_dir in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = Path(path_dir) / "opus.dll"
+        if candidate.exists():
+            return str(candidate)
+
+    return None
+
+
+def _download_opus_dll() -> Optional[str]:
+    """Download opus.dll from a reliable source to the project directory."""
+    if sys.platform != "win32":
+        return None
+
+    project_dir = Path(__file__).resolve().parent.parent
+    dest = project_dir / "opus.dll"
+    if dest.exists():
+        return str(dest)
+
+    # Try downloading from Discord's CDN (same DLL they use)
+    urls = [
+        "https://discord.com/api/downloads/distributions/app/installers/latest?channel=stable&platform=win&arch=x64",
+    ]
+    # Actually, let's just download the DLL directly from a known GitHub source
+    # The opus.dll from the discord.py project's bin folder
+    try:
+        import urllib.request
+        import zipfile
+        import io
+
+        # Download opus.dll from a direct source
+        dll_url = "https://raw.githubusercontent.com/discord-python/discord.py/master/discord/opus.dll"
+        print("[Discord Voice] 📥 Downloading opus.dll...")
+        urllib.request.urlretrieve(dll_url, str(dest))
+        if dest.exists() and dest.stat().st_size > 10000:
+            print(f"[Discord Voice] ✅ opus.dll downloaded to {dest}")
+            return str(dest)
+        else:
+            dest.unlink(missing_ok=True)
+    except Exception as e:
+        print(f"[Discord Voice] Download failed: {e}")
+
+    return None
+
+
+def _init_opus():
+    """Initialize opuslib with the DLL path if possible."""
+    global HAS_OPUS
+    try:
+        import opuslib
+        # Try importing directly first (might work if DLL is in PATH)
+        _test = opuslib.Encoder(48000, 2, opuslib.APPLICATION_AUDIO)
+        del _test
+        HAS_OPUS = True
+        print("[Discord Voice] ✅ opuslib ready (DLL found in PATH)")
+        return
+    except Exception:
+        pass
+
+    # Try to find the DLL
+    dll_path = _find_opus_dll()
+    if not dll_path:
+        dll_path = _download_opus_dll()
+
+    if dll_path:
+        try:
+            import ctypes
+            # Load the DLL into the process so opuslib can find it
+            ctypes.CDLL(dll_path)
+            import opuslib
+            _test = opuslib.Encoder(48000, 2, opuslib.APPLICATION_AUDIO)
+            del _test
+            HAS_OPUS = True
+            print(f"[Discord Voice] ✅ opuslib ready (DLL: {dll_path})")
+        except Exception as e:
+            print(f"[Discord Voice] ⚠️  opuslib init failed with {dll_path}: {e}")
+            print("[Discord Voice] Voice calls will work but WITHOUT audio bridge.")
+            print("[Discord Voice] To fix: copy opus.dll to the project folder.")
+    else:
+        print("[Discord Voice] ⚠️  opus.dll not found anywhere.")
+        print("[Discord Voice] Voice calls will work but WITHOUT audio bridge.")
+        print("[Discord Voice] To fix: copy opus.dll to the project folder, or install Discord desktop app.")
+
+
+# Initialize Opus on import
+_init_opus()
 
 # ─── Config ─────────────────────────────────────────────────────
 
