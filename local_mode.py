@@ -42,8 +42,8 @@ MAX_HISTORY       = 50             # Max conversation messages
 
 # Language-specific settings: (whisper_lang, tts_voice, tts_voice_alt)
 LANG_CONFIG = {
-    "fr": ("fr", "fr-FR-HenriNeural",  "fr-FR-DeniseNeural"),   # French
-    "en": ("en", "en-US-GuyNeural",    "en-US-JennyNeural"),   # English
+    "fr": ("fr", "fr-FR-RemyMultilingualNeural",  "fr-FR-EloiseNeural"),   # French (Remy = naturel, multilingue)
+    "en": ("en", "en-US-GuyNeural",              "en-US-JennyNeural"),    # English
     "de": ("de", "de-DE-ConradNeural",  "de-DE-KatjaNeural"),   # German
     "es": ("es", "es-ES-AlvaroNeural",  "es-ES-ElviraNeural"),  # Spanish
     "it": ("it", "it-IT-DiegoNeural",   "it-IT-ElsaNeural"),    # Italian
@@ -320,27 +320,46 @@ class JarvisLocal:
 
         # 1. System prompt
         self.system_prompt = self._load_system_prompt()
-        # Add conciseness instruction for voice mode
+        # Jarvis personality + conciseness for voice mode
         self.system_prompt += (
-            "\n\nVOICE MODE RULES: "
-            "Keep responses SHORT and CONCISE. "
-            "Maximum 2-3 sentences unless the user asks for detail. "
-            "No unnecessary explanations or disclaimers. "
-            "Be direct, like a sharp assistant. "
-            "Do not repeat what the user said."
+            "\n\n"
+            "=== PERSONALITY ===\n"
+            "You are JARVIS — a sharp, efficient, dry-witted AI assistant.\n"
+            "Speak like the MCU Jarvis: concise, professional, slight dry humor.\n"
+            "NEVER be chatty, never over-explain, never add disclaimers.\n"
+            "1-2 short sentences max. Get straight to the point.\n"
+            "Do not repeat what the user said. Do not say 'Certainly' or 'Of course'.\n"
+            "Just do it, then report the result briefly."
         )
-        # Add language instruction if a specific language is set
-        if self.lang != "auto" and self.lang in LANG_CONFIG:
-            self._lang_name = {"fr": "French", "en": "English", "de": "German", "es": "Spanish",
-                         "it": "Italian", "pt": "Portuguese", "tr": "Turkish", "zh": "Chinese",
-                         "ja": "Japanese", "ko": "Korean", "ru": "Russian", "ar": "Arabic"}.get(self.lang, self.lang)
+        # Determine language name for instructions
+        self._lang_name = None
+        self._lang_name_fr = None  # French version of the language name
+        _LANG_MAP = {
+            "fr": ("French",  "français"),
+            "en": ("English", "anglais"),
+            "de": ("German",  "allemand"),
+            "es": ("Spanish", "espagnol"),
+            "it": ("Italian", "italien"),
+            "pt": ("Portuguese", "portugais"),
+            "tr": ("Turkish",  "turc"),
+            "zh": ("Chinese", "chinois"),
+            "ja": ("Japanese", "japonais"),
+            "ko": ("Korean",  "coréen"),
+            "ru": ("Russian", "russe"),
+            "ar": ("Arabic",  "arabe"),
+        }
+        if self.lang != "auto" and self.lang in _LANG_MAP:
+            self._lang_name, self._lang_name_fr = _LANG_MAP[self.lang]
+            # Language instruction in BOTH English and French for maximum compliance
             self.system_prompt += (
-                f"\n\nCRITICAL RULE: You MUST respond in {self._lang_name}. "
-                f"Never use English unless the user explicitly asks for it. "
-                f"Every single word of your response must be in {self._lang_name}."
+                f"\n\n"
+                f"=== LANGUAGE RULE (ABSOLUTE) ===\n"
+                f"You MUST respond in {self._lang_name}.\n"
+                f"Tu DOIS répondre en {self._lang_name_fr}. C'est obligatoire.\n"
+                f"Never respond in English. Jamais en anglais.\n"
+                f"Every word of your response must be in {self._lang_name}.\n"
+                f"Chaque mot doit être en {self._lang_name_fr}."
             )
-        else:
-            self._lang_name = None
         self.messages = [{"role": "system", "content": self.system_prompt}]
 
         # 2. Ollama
@@ -487,18 +506,25 @@ class JarvisLocal:
 
     def _chat(self, user_text: str) -> str:
         """Send message to Ollama, handle tool calls in a loop. Returns final text."""
-        # Determine the response language based on detected or configured language
-        response_lang = self._lang_name  # Set via --lang flag
+        # Determine the response language
+        response_lang = self._lang_name
+        response_lang_fr = self._lang_name_fr
         if not response_lang and self._detected_lang:
-            # Auto mode: use Whisper's detected language
-            lang_map = {"fr": "French", "en": "English", "de": "German", "es": "Spanish",
-                        "it": "Italian", "pt": "Portuguese", "tr": "Turkish", "zh": "Chinese",
-                        "ja": "Japanese", "ko": "Korean", "ru": "Russian", "ar": "Arabic"}
-            response_lang = lang_map.get(self._detected_lang)
+            _LANG_MAP = {
+                "fr": ("French", "français"), "en": ("English", "anglais"),
+                "de": ("German", "allemand"), "es": ("Spanish", "espagnol"),
+                "it": ("Italian", "italien"), "pt": ("Portuguese", "portugais"),
+                "tr": ("Turkish", "turc"), "zh": ("Chinese", "chinois"),
+                "ja": ("Japanese", "japonais"), "ko": ("Korean", "coréen"),
+                "ru": ("Russian", "russe"), "ar": ("Arabic", "arabe"),
+            }
+            langs = _LANG_MAP.get(self._detected_lang)
+            if langs:
+                response_lang, response_lang_fr = langs
 
-        # Inject language instruction into the user message for maximum compliance
+        # Inject language instruction in BOTH English and French
         if response_lang and response_lang != "English":
-            enhanced_text = f"[Respond in {response_lang}] {user_text}"
+            enhanced_text = f"[Réponds en {response_lang_fr}. Respond in {response_lang}.] {user_text}"
         else:
             enhanced_text = user_text
 
