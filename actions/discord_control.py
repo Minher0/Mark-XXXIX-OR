@@ -19,18 +19,30 @@ _thread = None
 def _get_discord():
     global _discord
     if _discord is None:
+        # Try discord.py-self first (installs as 'discord' module)
         try:
             import discord
-            from discord.ext import commands
+            # Verify it's actually discord.py-self and not the regular discord.py
+            # discord.py-self has 'user' client support; regular discord.py doesn't
+            if not hasattr(discord, 'Intents'):
+                raise ImportError(
+                    "Wrong 'discord' package detected. "
+                    "You have the regular discord.py, not discord.py-self. "
+                    "Run: pip uninstall discord.py && pip install discord.py-self"
+                )
+            # Check if it's the self-bot version by looking for specific attributes
             _discord = discord
         except ImportError:
+            pass
+
+        if _discord is None:
             try:
                 import selfcord
                 _discord = selfcord
             except ImportError:
                 raise ImportError(
-                    "Neither discord.py-self nor selfcord is installed. "
-                    "Run: pip install discord.py-self"
+                    "discord.py-self is not installed. "
+                    "Run: pip uninstall discord.py && pip install discord.py-self"
                 )
     return _discord
 
