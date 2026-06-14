@@ -519,9 +519,10 @@ class JarvisLocal:
             else:
                 voice = "en-US-GuyNeural"
 
-            # Generate audio
+            # Generate audio (WAV for Windows compatibility, MP3 elsewhere)
             communicate = edge_tts.Communicate(text, voice)
-            temp_file = tempfile.mktemp(suffix=".mp3", prefix="jarvis_tts_")
+            audio_ext = ".wav" if sys.platform == "win32" else ".mp3"
+            temp_file = tempfile.mktemp(suffix=audio_ext, prefix="jarvis_tts_")
             await communicate.save(temp_file)
 
             # Play audio
@@ -542,29 +543,40 @@ class JarvisLocal:
         self.ui.set_state("LISTENING")
 
     async def _play_audio_file(self, filepath: str):
-        """Play an audio file using the system player."""
+        """Play an audio file silently (no visible window)."""
         try:
             if sys.platform == "win32":
-                # Use PowerShell to play audio without showing a window
-                subprocess.run(
-                    ["powershell", "-Command",
-                     f"(New-Object Media.SoundPlayer '{filepath}').PlaySync()"],
-                    timeout=30, capture_output=True,
-                )
-                # If that didn't work (mp3), use start /wait
-                if not os.path.exists(filepath):
-                    return
-                subprocess.run(
-                    f'start /wait "" "{filepath}"',
-                    shell=True, timeout=30,
-                )
+                if filepath.endswith(".wav"):
+                    # SoundPlayer works great for WAV — no window
+                    subprocess.run(
+                        ["powershell", "-Command",
+                         f"(New-Object Media.SoundPlayer '{filepath}').PlaySync()"],
+                        timeout=30, capture_output=True,
+                    )
+                else:
+                    # MP3: use Windows MediaPlayer COM — no window, supports MP3
+                    ps_script = (
+                        "Add-Type -AssemblyName presentationCore; "
+                        "$p = New-Object System.Windows.Media.MediaPlayer; "
+                        f"$p.Open([Uri]::new('file:///{filepath}')); "
+                        "Start-Sleep -Milliseconds 500; "
+                        "while (-not $p.NaturalDuration.HasTimeSpan) { Start-Sleep -Milliseconds 200 }; "
+                        "$dur = $p.NaturalDuration.TimeSpan.TotalSeconds; "
+                        "$p.Play(); "
+                        "Start-Sleep -Seconds ($dur + 0.5); "
+                        "$p.Close()"
+                    )
+                    subprocess.run(
+                        ["powershell", "-Command", ps_script],
+                        timeout=60, capture_output=True,
+                    )
             elif sys.platform == "darwin":
                 subprocess.run(["afplay", filepath], timeout=30)
             else:
                 subprocess.run(["aplay", filepath], timeout=30)
         except Exception as e:
             print(f"[LocalMode] ⚠️ Audio playback failed: {e}")
-            print(f"[LocalMode] 💬 {self._last_response[:200] if hasattr(self, '_last_response') else ''}")
+            print(f"[LocalMode] 💬 (audio playback failed)")
 
     # ───────────────────────────────────────────────────────
     # MAIN LOOP
