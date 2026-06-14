@@ -138,7 +138,7 @@ TOOL_DECLARATIONS = [
         "name": "send_message",
         "description": (
             "Sends a text message via WhatsApp, Telegram, or other messaging platform. "
-            "NOT for Discord — use discord_control for all Discord actions (DM, channels, calls)."
+            "NOT for Discord — use discord_control for all Discord actions."
         ),
         "parameters": {
             "type": "OBJECT",
@@ -155,15 +155,14 @@ TOOL_DECLARATIONS = [
         "description": (
             "Controls the user's personal Discord account. Can send DMs, send messages in server channels, "
             "read channel messages, list servers, list channels, list friends, and check connection status. "
-            "Can also manage voice calls: list active calls, start/ring a DM call, join a call, leave a call. "
-            "Use for ANY Discord action: messaging, reading, calling, joining voice. "
+            "Use for ANY Discord action. "
             "NOT for WhatsApp/Telegram — use send_message for those."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":   {"type": "STRING", "description": "send_dm | send_channel | read_channel | list_servers | list_channels | list_friends | list_calls | start_call | join_call | leave_call | status (default: status)"},
-                "receiver": {"type": "STRING", "description": "Username or user ID (for send_dm, start_call, join_call)"},
+                "action":   {"type": "STRING", "description": "send_dm | send_channel | read_channel | list_servers | list_channels | list_friends | status (default: status)"},
+                "receiver": {"type": "STRING", "description": "Username or user ID (for send_dm)"},
                 "server":   {"type": "STRING", "description": "Server name (for send_channel, read_channel, list_channels)"},
                 "channel":  {"type": "STRING", "description": "Channel name (for send_channel, read_channel)"},
                 "message":  {"type": "STRING", "description": "Message text to send (for send_dm, send_channel)"},
@@ -567,20 +566,6 @@ class JarvisLive:
         self._speaking_lock = threading.Lock()
         self.ui.on_text_command = self._on_text_command
 
-        # Discord Gateway — start in background
-        self._discord_call_manager = None
-        try:
-            from actions.discord_voice import get_call_manager
-            self._discord_call_manager = get_call_manager()
-            if self._discord_call_manager.start():
-                print("[JARVIS] 🎧 Discord Gateway started")
-            else:
-                print("[JARVIS] ⚠️ Discord Gateway could not start (missing deps?)")
-                self._discord_call_manager = None
-        except Exception as e:
-            print(f"[JARVIS] ⚠️ Discord Gateway init error: {e}")
-            self._discord_call_manager = None
-
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
             return
@@ -837,10 +822,6 @@ class JarvisLive:
                     self.out_queue.put_nowait,
                     {"data": data, "mime_type": "audio/pcm"}
                 )
-                # Also forward mic audio to Discord if in a call
-                if self._discord_call_manager and self._discord_call_manager.is_in_call():
-                    self._discord_call_manager.push_mic_audio(data)
-
         try:
             with sd.InputStream(
                 samplerate=SEND_SAMPLE_RATE,
@@ -934,21 +915,9 @@ class JarvisLive:
         stream.start()
         try:
             while True:
-                # Check for Discord audio first (real-time priority)
-                if self._discord_call_manager and self._discord_call_manager.is_in_call():
-                    discord_audio = self._discord_call_manager.pop_speaker_audio()
-                    if discord_audio:
-                        await asyncio.to_thread(stream.write, discord_audio)
-                        continue
-
-                # Then check Gemini audio (with small timeout to allow Discord checks)
-                try:
-                    chunk = await asyncio.wait_for(self.audio_in_queue.get(), timeout=0.02)
-                    self.set_speaking(True)
-                    await asyncio.to_thread(stream.write, chunk)
-                except asyncio.TimeoutError:
-                    # No Gemini audio — loop back to check Discord again
-                    pass
+                chunk = await self.audio_in_queue.get()
+                self.set_speaking(True)
+                await asyncio.to_thread(stream.write, chunk)
         except Exception as e:
             print(f"[JARVIS] ❌ Play: {e}")
             raise
@@ -984,8 +953,6 @@ class JarvisLive:
                     print("[JARVIS] ✅ Connected.")
                     self.ui.set_state("LISTENING")
                     self.ui.write_log("SYS: JARVIS online.")
-                    if self._discord_call_manager and self._discord_call_manager.gateway.is_connected():
-                        self.ui.write_log("SYS: Discord Gateway online.")
                     reconnect_delay = 3  # Reset on successful connection
 
                     tg.create_task(self._send_realtime())

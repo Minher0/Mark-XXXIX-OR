@@ -20,6 +20,3 @@ send2trash
 youtube-transcript-api
 pywinauto
 pyaudio
-websockets
-pynacl
-opuslib
