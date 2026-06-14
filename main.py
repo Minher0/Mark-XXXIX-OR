@@ -33,6 +33,7 @@ from actions.computer_control  import computer_control
 from actions.cmd_control       import cmd_control
 from actions.game_updater      import game_updater
 from actions.discord_control   import discord_control
+from actions.media_control     import media_control
 
 
 def get_base_dir():
@@ -137,6 +138,34 @@ TOOL_DECLARATIONS = [
         "parameters": {
             "type": "OBJECT",
             "properties": {},
+            "required": []
+        }
+    },
+    {
+        "name": "media_control",
+        "description": (
+            "Controls media playback on the system. Works system-wide regardless of which app is focused. "
+            "Use for: play/pause music or videos, skip to next track, go back to previous track, "
+            "stop playback, seek forward or backward, and check what's currently playing. "
+            "Supports Spotify, YouTube Music, Apple Music, VLC, and any media app. "
+            "Use this when the user says: pause, play, skip, next, previous, what's playing, "
+            "qu'est-ce qui joue, met pause, passe, reviens, etc."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": (
+                        "play_pause | next | previous | stop | seek | now_playing  "
+                        "(default: play_pause)"
+                    )
+                },
+                "seconds": {
+                    "type": "INTEGER",
+                    "description": "Seconds to seek forward (positive) or backward (negative). Default: 10"
+                },
+            },
             "required": []
         }
     },
@@ -726,6 +755,10 @@ class JarvisLive:
             elif name == "list_open_apps":
                 r = await loop.run_in_executor(None, lambda: list_open_apps(parameters=args, response=None, player=self.ui))
                 result = r or "Apps listed."
+
+            elif name == "media_control":
+                r = await loop.run_in_executor(None, lambda: media_control(parameters=args, response=None, player=self.ui))
+                result = r or "Done."
 
             elif name == "weather_report":
                 r = await loop.run_in_executor(None, lambda: weather_action(parameters=args, player=self.ui))
