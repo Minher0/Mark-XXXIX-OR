@@ -519,10 +519,9 @@ class JarvisLocal:
             else:
                 voice = "en-US-GuyNeural"
 
-            # Generate audio (WAV for Windows compatibility, MP3 elsewhere)
+            # Generate audio (edge-tts outputs MP3)
             communicate = edge_tts.Communicate(text, voice)
-            audio_ext = ".wav" if sys.platform == "win32" else ".mp3"
-            temp_file = tempfile.mktemp(suffix=audio_ext, prefix="jarvis_tts_")
+            temp_file = tempfile.mktemp(suffix=".mp3", prefix="jarvis_tts_")
             await communicate.save(temp_file)
 
             # Play audio
@@ -546,30 +545,27 @@ class JarvisLocal:
         """Play an audio file silently (no visible window)."""
         try:
             if sys.platform == "win32":
-                if filepath.endswith(".wav"):
-                    # SoundPlayer works great for WAV — no window
-                    subprocess.run(
-                        ["powershell", "-Command",
-                         f"(New-Object Media.SoundPlayer '{filepath}').PlaySync()"],
-                        timeout=30, capture_output=True,
-                    )
-                else:
-                    # MP3: use Windows MediaPlayer COM — no window, supports MP3
-                    ps_script = (
-                        "Add-Type -AssemblyName presentationCore; "
-                        "$p = New-Object System.Windows.Media.MediaPlayer; "
-                        f"$p.Open([Uri]::new('file:///{filepath}')); "
-                        "Start-Sleep -Milliseconds 500; "
-                        "while (-not $p.NaturalDuration.HasTimeSpan) { Start-Sleep -Milliseconds 200 }; "
-                        "$dur = $p.NaturalDuration.TimeSpan.TotalSeconds; "
-                        "$p.Play(); "
-                        "Start-Sleep -Seconds ($dur + 0.5); "
-                        "$p.Close()"
-                    )
-                    subprocess.run(
-                        ["powershell", "-Command", ps_script],
-                        timeout=60, capture_output=True,
-                    )
+                # WMPlayer.OCX COM — plays MP3 silently, no window, built into Windows
+                escaped = filepath.replace("'", "''")
+                ps_script = (
+                    "$wmp = New-Object -ComObject WMPlayer.OCX; "
+                    f"$wmp.URL = '{escaped}'; "
+                    "$wmp.controls.play(); "
+                    # Wait for buffering/transitioning to finish
+                    "while ($wmp.playState -eq 9 -or $wmp.playState -eq 6) { Start-Sleep -Milliseconds 200 }; "
+                    # Wait until playback finishes (1=Stopped, 8=MediaEnded)
+                    "while ($wmp.playState -ne 1 -and $wmp.playState -ne 8) { Start-Sleep -Milliseconds 200 }; "
+                    "$wmp.controls.stop(); "
+                    "$wmp.close()"
+                )
+                result = subprocess.run(
+                    ["powershell", "-Command", ps_script],
+                    timeout=60, capture_output=True,
+                )
+                if result.returncode != 0:
+                    # Fallback: try winsound with WAV conversion
+                    print(f"[LocalMode] ⚠️ WMPlayer failed, trying winsound fallback...")
+                    await self._play_winsound_fallback(filepath)
             elif sys.platform == "darwin":
                 subprocess.run(["afplay", filepath], timeout=30)
             else:
@@ -577,6 +573,26 @@ class JarvisLocal:
         except Exception as e:
             print(f"[LocalMode] ⚠️ Audio playback failed: {e}")
             print(f"[LocalMode] 💬 (audio playback failed)")
+
+    async def _play_winsound_fallback(self, filepath: str):
+        """Fallback: convert MP3 to WAV and play with winsound (built-in Python)."""
+        try:
+            import winsound
+            # Try to convert with ffmpeg if available
+            wav_file = filepath.replace(".mp3", ".wav")
+            conv = subprocess.run(
+                ["ffmpeg", "-y", "-i", filepath, wav_file],
+                capture_output=True, timeout=15,
+            )
+            if conv.returncode == 0 and os.path.exists(wav_file):
+                winsound.PlaySound(wav_file, winsound.SND_FILENAME)
+                try: os.unlink(wav_file)
+                except: pass
+                return
+            # Last resort: print
+            print("[LocalMode] 💬 Install ffmpeg for audio playback, or check WMPlayer")
+        except Exception:
+            print("[LocalMode] 💬 (no audio playback available)")
 
     # ───────────────────────────────────────────────────────
     # MAIN LOOP
