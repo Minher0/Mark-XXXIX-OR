@@ -964,8 +964,8 @@ class JarvisLive:
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="JARVIS — AI Assistant")
-    parser.add_argument("--local", action="store_true",
-                        help="Run in local mode (Ollama + Whisper, no cloud APIs)")
+    parser.add_argument("--cloud", action="store_true",
+                        help="Run in cloud mode (Gemini API, requires API key)")
     parser.add_argument("--model", type=str, default="qwen2.5:7b",
                         help="Ollama model for local mode (default: qwen2.5:7b)")
     args = parser.parse_args()
@@ -973,13 +973,13 @@ def main():
     ui = JarvisUI("face.png")
 
     def runner():
-        if args.local:
+        if args.cloud:
+            ui.wait_for_api_key()
+            jarvis = JarvisLive(ui)
+        else:
             from local_mode import JarvisLocal
             print(f"[JARVIS] 🏠 Starting in LOCAL mode (model: {args.model})")
             jarvis = JarvisLocal(ui, model=args.model)
-        else:
-            ui.wait_for_api_key()
-            jarvis = JarvisLive(ui)
         try:
             asyncio.run(jarvis.run())
         except KeyboardInterrupt:
