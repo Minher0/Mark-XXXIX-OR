@@ -87,12 +87,8 @@ def _tool_dispatch(name: str, args: dict, ui) -> str:
     """Execute a tool by name and return the result string."""
     # ── Special tools ──
     if name == "shutdown_jarvis":
-        ui.write_log("SYS: Shutdown requested.")
-        def _shutdown():
-            time.sleep(1)
-            os._exit(0)
-        threading.Thread(target=_shutdown, daemon=True).start()
-        return "Goodbye, sir."
+        ui.write_log("SYS: Shutdown requested via tool call — ignored in local mode.")
+        return "Shutdown is not available in local mode. Just close the window to exit."
 
     if name == "agent_task":
         return "Agent tasks are not available in local mode yet. Use individual tools directly."
@@ -391,8 +387,11 @@ class JarvisLocal:
         # 3. Tool declarations
         try:
             from main import TOOL_DECLARATIONS
-            self.ollama_tools = _convert_tools(TOOL_DECLARATIONS)
-            print(f"[LocalMode] 🔧 Loaded {len(self.ollama_tools)} tools")
+            # Filter out dangerous tools that local LLMs tend to call by mistake
+            _BLOCKED_TOOLS = {"shutdown_jarvis", "agent_task"}
+            safe_tools = [t for t in TOOL_DECLARATIONS if t["name"] not in _BLOCKED_TOOLS]
+            self.ollama_tools = _convert_tools(safe_tools)
+            print(f"[LocalMode] 🔧 Loaded {len(self.ollama_tools)} tools (filtered: {_BLOCKED_TOOLS})")
         except ImportError:
             print("[LocalMode] ⚠️ Could not load tool declarations")
             self.ollama_tools = []
