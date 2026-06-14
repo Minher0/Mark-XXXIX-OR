@@ -120,10 +120,24 @@ def _find_windows_exe(app_name: str) -> str | None:
 
 
 def _launch_windows(app_name: str) -> bool:
-    """Launch app on Windows using CMD start command as primary method."""
-    # ── PRIMARY: CMD start command ──
-    # This opens the app via Windows' built-in start command, which uses
-    # the real default browser/program — NOT Chrome for Testing.
+    """Launch app on Windows using Win key + type + Enter as primary method."""
+    # ── PRIMARY: Win key + type + Enter (same as user doing it manually) ──
+    # This works for ALL apps — Start menu search finds everything.
+    try:
+        import pyautogui
+        pyautogui.PAUSE = 0.1
+        pyautogui.press("win")
+        time.sleep(0.6)
+        pyautogui.write(app_name, interval=0.05)
+        time.sleep(0.8)
+        pyautogui.press("enter")
+        time.sleep(2.5)
+        print(f"[open_app] ✅ Win+type: {app_name}")
+        return True
+    except Exception as e:
+        print(f"[open_app] ⚠️ Win+type failed: {e}")
+
+    # ── FALLBACK 1: CMD start command ──
     try:
         cmd_str = f'start "" "{app_name}"'
         subprocess.Popen(
@@ -138,7 +152,7 @@ def _launch_windows(app_name: str) -> bool:
     except Exception as e:
         print(f"[open_app] ⚠️ Windows CMD start failed: {e}")
 
-    # ── FALLBACK 1: Direct exe path ──
+    # ── FALLBACK 2: Direct exe path ──
     try:
         exe = _find_windows_exe(app_name)
         if exe:
@@ -153,21 +167,7 @@ def _launch_windows(app_name: str) -> bool:
     except Exception as e:
         print(f"[open_app] ⚠️ Windows direct exe launch failed: {e}")
 
-    # ── FALLBACK 2: pyautogui ──
-    try:
-        import pyautogui
-        pyautogui.PAUSE = 0.1
-        pyautogui.press("win")
-        time.sleep(0.6)
-        pyautogui.write(app_name, interval=0.05)
-        time.sleep(0.8)
-        pyautogui.press("enter")
-        time.sleep(3.0)
-        print(f"[open_app] ✅ pyautogui: {app_name}")
-        return True
-    except Exception as e:
-        print(f"[open_app] ⚠️ Windows pyautogui fallback failed: {e}")
-        return False
+    return False
 
 def _launch_macos(app_name: str) -> bool:
     try:
