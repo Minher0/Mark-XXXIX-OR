@@ -1,0 +1,6 @@
+# Local mode dependencies (python main.py --local)
+# Install: pip install -r requirements-local.txt
+ollama
+faster-whisper
+edge-tts
+webrtcvad-wheels

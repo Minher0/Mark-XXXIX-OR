@@ -21,8 +21,3 @@ send2trash
 youtube-transcript-api
 pywinauto
 pyaudio
-ollama
-faster-whisper
-edge-tts
-webrtcvad
-miniaudio

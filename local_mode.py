@@ -176,16 +176,22 @@ class VoiceRecorder:
         self._init_vad()
 
     def _init_vad(self):
-        """Initialize VAD — webrtcvad preferred, energy-based fallback."""
+        """Initialize VAD — webrtcvad-wheels preferred, energy-based fallback."""
         try:
-            import webrtcvad
+            import webrtcvad  # webrtcvad-wheels provides pre-compiled binaries
             self.vad = webrtcvad.Vad(3)      # High aggressiveness
             self._use_webrtc = True
             print("[LocalMode] 🎤 VAD: webrtcvad")
         except ImportError:
-            self._use_webrtc = False
-            self._energy_threshold = 500      # int16 amplitude threshold
-            print("[LocalMode] 🎤 VAD: energy-based (pip install webrtcvad for better accuracy)")
+            try:
+                import webrtcvad_wheels as webrtcvad
+                self.vad = webrtcvad.Vad(3)
+                self._use_webrtc = True
+                print("[LocalMode] 🎤 VAD: webrtcvad-wheels")
+            except ImportError:
+                self._use_webrtc = False
+                self._energy_threshold = 500      # int16 amplitude threshold
+                print("[LocalMode] 🎤 VAD: energy-based (pip install webrtcvad-wheels for better accuracy)")
 
     def _is_speech(self, frame_int16: np.ndarray) -> bool:
         """Check if an audio frame contains speech."""
@@ -534,25 +540,18 @@ class JarvisLocal:
         self.ui.set_state("LISTENING")
 
     async def _play_audio_file(self, filepath: str):
-        """Play an audio file — try miniaudio first, then system player."""
-        # Method 1: miniaudio + sounddevice (best quality)
-        try:
-            import miniaudio
-            decoded = miniaudio.decode_file(filepath)
-            samples = np.frombuffer(decoded.samples, dtype=np.int16).astype(np.float32) / 32767.0
-            if decoded.num_channels > 1:
-                samples = samples[::decoded.num_channels]  # Mono
-            sd.play(samples, samplerate=decoded.sample_rate)
-            sd.wait()
-            return
-        except ImportError:
-            pass
-        except Exception as e:
-            print(f"[LocalMode] ⚠️ miniaudio playback failed: {e}")
-
-        # Method 2: System player
+        """Play an audio file using the system player."""
         try:
             if sys.platform == "win32":
+                # Use PowerShell to play audio without showing a window
+                subprocess.run(
+                    ["powershell", "-Command",
+                     f"(New-Object Media.SoundPlayer '{filepath}').PlaySync()"],
+                    timeout=30, capture_output=True,
+                )
+                # If that didn't work (mp3), use start /wait
+                if not os.path.exists(filepath):
+                    return
                 subprocess.run(
                     f'start /wait "" "{filepath}"',
                     shell=True, timeout=30,
@@ -563,6 +562,7 @@ class JarvisLocal:
                 subprocess.run(["aplay", filepath], timeout=30)
         except Exception as e:
             print(f"[LocalMode] ⚠️ Audio playback failed: {e}")
+            print(f"[LocalMode] 💬 {self._last_response[:200] if hasattr(self, '_last_response') else ''}")
 
     # ───────────────────────────────────────────────────────
     # MAIN LOOP

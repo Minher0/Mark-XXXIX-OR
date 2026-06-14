@@ -6,16 +6,25 @@ print("=" * 60)
 print("  JARVIS — Setup")
 print("=" * 60)
 
-# ── 1. Install Python dependencies ──
-print("\n[1/4] 📦 Installing Python packages...")
+# ── 1. Install core Python dependencies ──
+print("\n[1/5] 📦 Installing core Python packages...")
 subprocess.run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"], check=True)
 
-# ── 2. Install Playwright browsers ──
-print("\n[2/4] 🌐 Installing Playwright browsers...")
+# ── 2. Install local mode dependencies ──
+print("\n[2/5] 🏠 Installing local mode packages (Ollama, Whisper, edge-tts)...")
+try:
+    subprocess.run([sys.executable, "-m", "pip", "install", "-r", "requirements-local.txt"], check=True)
+    print("  ✅ Local mode packages installed")
+except subprocess.CalledProcessError as e:
+    print(f"  ⚠️ Some local mode packages failed to install: {e}")
+    print("  Local mode may not work. Cloud mode (Gemini) will still work fine.")
+
+# ── 3. Install Playwright browsers ──
+print("\n[3/5] 🌐 Installing Playwright browsers...")
 subprocess.run([sys.executable, "-m", "playwright", "install"], check=True)
 
-# ── 3. Install Ollama (for local mode) ──
-print("\n[3/4] 🤖 Setting up Ollama for local mode...")
+# ── 4. Install Ollama (for local mode) ──
+print("\n[4/5] 🤖 Setting up Ollama for local mode...")
 system = platform.system()
 
 ollama_installed = False
@@ -58,8 +67,8 @@ if not ollama_installed:
         except Exception:
             print("  Please install manually: https://ollama.com/download")
 
-# ── 4. Pull default model ──
-print("\n[4/4] 📥 Downloading default AI model (qwen2.5:7b)...")
+# ── 5. Pull default model ──
+print("\n[5/5] 📥 Downloading default AI model (qwen2.5:7b)...")
 if ollama_installed:
     try:
         # Start Ollama service if not running
