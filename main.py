@@ -350,26 +350,29 @@ TOOL_DECLARATIONS = [
     {
         "name": "cmd_control",
         "description": (
-            "Executes terminal/CMD commands, opens files, opens memory, AND can modify Jarvis's own source code. "
+            "Executes terminal/CMD commands, opens files, opens memory, manages apps, AND can modify Jarvis's own source code. "
             "Use for: running shell commands, piped commands, background processes, "
             "listing/killing processes, network info, disk usage, system info, "
             "opening files (open_file, open_project_file), opening the long-term memory file (open_memory), "
+            "uninstalling applications (uninstall_app), listing installed apps (list_installed_apps), "
             "AND reading/writing/appending the Jarvis's own Python files (self_read, self_write, self_append, self_list). "
             "Has built-in safety checks against dangerous commands. "
             "Use this when the user asks to run a terminal command, CMD command, "
-            "open a file, open their memory, modify Jarvis's code, add features, fix bugs in itself. "
-            "CRITICAL: Always use action:open_memory when user asks to open their memory/long-term memory."
+            "open a file, open their memory, uninstall an app, modify Jarvis's code, add features, fix bugs in itself. "
+            "CRITICAL: Always use action:open_memory when user asks to open their memory/long-term memory. "
+            "CRITICAL: Always use action:uninstall_app when user asks to uninstall an application."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "run | run_in_dir | run_piped | run_background | list_processes | kill_process | network_info | disk_usage | system_info | open_file | open_project_file | open_memory | self_read | self_write | self_append | self_list"},
+                "action":      {"type": "STRING", "description": "run | run_in_dir | run_piped | run_background | list_processes | kill_process | network_info | disk_usage | system_info | open_file | open_project_file | open_memory | uninstall_app | list_installed_apps | self_read | self_write | self_append | self_list"},
                 "command":     {"type": "STRING", "description": "The command string to execute"},
                 "working_dir": {"type": "STRING", "description": "Working directory for run_in_dir"},
                 "timeout":     {"type": "INTEGER", "description": "Execution timeout in seconds (default: 30, max: 120)"},
-                "filter":      {"type": "STRING", "description": "Process name filter for list_processes"},
+                "filter":      {"type": "STRING", "description": "Process name filter for list_processes / app name filter for list_installed_apps"},
                 "process":     {"type": "STRING", "description": "PID or process name for kill_process"},
                 "path":        {"type": "STRING", "description": "File path for open_file, open_project_file, and self_* actions"},
+                "app_name":    {"type": "STRING", "description": "Application name for uninstall_app"},
                 "content":     {"type": "STRING", "description": "File content to write/append (for self_write/self_append)"},
             },
             "required": ["action"]

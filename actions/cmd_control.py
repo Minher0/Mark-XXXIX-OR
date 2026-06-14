@@ -386,6 +386,171 @@ def _open_memory() -> str:
         return f"Failed to open memory file: {e}"
 
 
+def _uninstall_app(app_name: str) -> str:
+    """Uninstall an application using winget (Windows), or open the uninstall panel."""
+    os_name = _get_os()
+
+    if os_name == "windows":
+        # ── PRIMARY: winget uninstall ──
+        # winget is built into Windows 10 1709+ and Windows 11
+        try:
+            # First, check if winget is available
+            check = subprocess.run(
+                ["winget", "--version"],
+                capture_output=True, text=True, timeout=5
+            )
+            if check.returncode == 0:
+                # Search for the app first to get the exact ID
+                search = subprocess.run(
+                    ["winget", "list", "--name", app_name, "--source", "winget", "--msstore", "--exact", "--accept-source-agreements"],
+                    capture_output=True, text=True, timeout=30
+                )
+                print(f"[CmdControl] winget search for '{app_name}':\n{search.stdout}")
+
+                # Try uninstall with --name for user-friendliness
+                result = subprocess.run(
+                    ["winget", "uninstall", "--name", app_name, "--accept-source-agreements", "--accept-package-agreements"],
+                    capture_output=True, text=True, timeout=120
+                )
+                output = ""
+                if result.stdout:
+                    output += result.stdout.strip()
+                if result.stderr:
+                    if output:
+                        output += "\n"
+                    output += result.stderr.strip()
+
+                if result.returncode == 0:
+                    return f"Uninstall initiated for '{app_name}'.\n{output}"
+                else:
+                    # Fallback: try with the raw name as ID
+                    result2 = subprocess.run(
+                        ["winget", "uninstall", app_name, "--accept-source-agreements", "--accept-package-agreements"],
+                        capture_output=True, text=True, timeout=120
+                    )
+                    if result2.returncode == 0:
+                        return f"Uninstall initiated for '{app_name}'.\n{result2.stdout.strip()}"
+                    return f"Could not uninstall '{app_name}' via winget. Output: {output}"
+            else:
+                print("[CmdControl] winget not available, falling back to control panel")
+        except subprocess.TimeoutExpired:
+            return f"Winget uninstall timed out for '{app_name}'. It may need manual confirmation."
+        except Exception as e:
+            print(f"[CmdControl] winget uninstall error: {e}")
+
+        # ── FALLBACK: Open Apps & Features settings ──
+        try:
+            subprocess.Popen(
+                'start ms-settings:appsfeatures',
+                shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return (
+                f"winget not available. Opened Settings > Apps & Features — "
+                f"search for '{app_name}' and uninstall manually."
+            )
+        except Exception as e:
+            return f"Failed to open uninstall settings: {e}"
+
+    elif os_name == "darwin":
+        # macOS: Open Applications folder or use brew
+        try:
+            # Check if homebrew is installed
+            brew_check = subprocess.run(
+                ["brew", "--version"],
+                capture_output=True, text=True, timeout=5
+            )
+            if brew_check.returncode == 0:
+                result = subprocess.run(
+                    ["brew", "uninstall", app_name],
+                    capture_output=True, text=True, timeout=60
+                )
+                if result.returncode == 0:
+                    return f"Uninstalled '{app_name}' via Homebrew."
+                return f"Homebrew couldn't uninstall '{app_name}': {result.stderr.strip()}"
+        except Exception:
+            pass
+        # Fallback: open Applications folder
+        try:
+            subprocess.Popen(["open", "/Applications"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return f"Opened Applications folder — drag '{app_name}' to Trash to uninstall."
+        except Exception as e:
+            return f"Failed to open Applications: {e}"
+
+    else:
+        # Linux: use apt/pacman/dnf or open package manager
+        for pm_cmd in [
+            (["sudo", "apt", "remove", "-y", app_name], "apt"),
+            (["sudo", "dnf", "remove", "-y", app_name], "dnf"),
+            (["sudo", "pacman", "-R", "--noconfirm", app_name], "pacman"),
+        ]:
+            cmd, name = pm_cmd
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                if result.returncode == 0:
+                    return f"Uninstalled '{app_name}' via {name}."
+            except FileNotFoundError:
+                continue
+            except Exception:
+                continue
+        return f"Could not find a package manager to uninstall '{app_name}'. Try manually."
+
+
+def _list_installed_apps(filter_name: str = "") -> str:
+    """List installed applications using winget (Windows) or package manager."""
+    os_name = _get_os()
+
+    if os_name == "windows":
+        try:
+            cmd = ["winget", "list", "--accept-source-agreements"]
+            if filter_name:
+                cmd += ["--name", filter_name]
+            result = subprocess.run(
+                cmd,
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                lines = result.stdout.strip().splitlines()
+                # Limit output to first 50 lines to avoid huge responses
+                if len(lines) > 50:
+                    return "\n".join(lines[:50]) + f"\n... and {len(lines) - 50} more apps. Use filter to narrow down."
+                return "\n".join(lines)
+            return "No applications found or winget not available."
+        except subprocess.TimeoutExpired:
+            return "Listing apps timed out."
+        except Exception as e:
+            return f"Failed to list apps: {e}"
+
+    elif os_name == "darwin":
+        try:
+            # List Applications folder
+            apps = sorted(Path("/Applications").glob("*.app"))
+            if filter_name:
+                apps = [a for a in apps if filter_name.lower() in a.name.lower()]
+            lines = [a.stem for a in apps[:50]]
+            if not lines:
+                return f"No applications found matching '{filter_name}'."
+            return "Installed apps:\n" + "\n".join(lines) + (f"\n... and {len(apps) - 50} more" if len(apps) > 50 else "")
+        except Exception as e:
+            return f"Failed to list apps: {e}"
+
+    else:
+        # Linux: try dpkg or rpm
+        try:
+            result = subprocess.run(
+                ["dpkg", "-l"], capture_output=True, text=True, timeout=15
+            )
+            if result.returncode == 0:
+                lines = result.stdout.strip().splitlines()
+                if filter_name:
+                    lines = [l for l in lines if filter_name.lower() in l.lower()]
+                return "\n".join(lines[:50]) + (f"\n... and {len(lines) - 50} more" if len(lines) > 50 else "")
+        except Exception:
+            pass
+        return "Could not list installed apps."
+
+
 def _self_read(file_path: str) -> str:
     """Read a file from the Jarvis project directory."""
     target = _BASE / file_path.lstrip("/").lstrip("\\")
@@ -498,6 +663,8 @@ def cmd_control(
       open_file      — open any file with the system default program via CMD
       open_project_file — open a file from the Jarvis project with default program
       open_memory    — open the long-term memory file (memory/long_term.json)
+      uninstall_app  — uninstall an application (winget on Windows, brew on macOS, apt on Linux)
+      list_installed_apps — list installed applications (optional filter)
       self_read      — read a file from the Jarvis project
       self_write     — write/overwrite a file in the Jarvis project
       self_append    — append content to a file in the Jarvis project
@@ -590,6 +757,16 @@ def cmd_control(
         if action == "open_memory":
             return _open_memory()
 
+        if action == "uninstall_app":
+            app_name = params.get("app_name", params.get("name", "")).strip()
+            if not app_name:
+                return "No application name provided for uninstall_app."
+            print(f"[CmdControl] 🗑️ Uninstalling: {app_name}")
+            return _uninstall_app(app_name)
+
+        if action == "list_installed_apps":
+            filter_name = params.get("filter", params.get("name", "")).strip()
+            return _list_installed_apps(filter_name)
 
         if action == "self_read":
             file_path = params.get("path", "").strip()
