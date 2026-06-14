@@ -20,4 +20,3 @@ send2trash
 youtube-transcript-api
 pywinauto
 pyaudio
-discord.py
