@@ -336,7 +336,7 @@ class JarvisLocal:
                 self.ollama_client.list()  # Verify it's running
 
             # Check if model is available, pull if not
-            models = [m.get("name", "") for m in self.ollama_client.list().get("models", [])]
+            models = [m.get("name", "") for m in (self.ollama_client.list().get("models") or [])]
             if not any(self.model in m for m in models):
                 print(f"[LocalMode] 📥 Pulling {self.model} (first time, may take a while)...")
                 self.ui.write_log(f"SYS: Downloading {self.model}...")
@@ -344,7 +344,9 @@ class JarvisLocal:
                 for chunk in stream:
                     status = chunk.get("status", "")
                     if "pulling" in status:
-                        pct = chunk.get("completed", 0) / max(chunk.get("total", 1), 1) * 100
+                        total     = chunk.get("total") or 1
+                        completed = chunk.get("completed") or 0
+                        pct = completed / total * 100
                         print(f"\r[LocalMode] 📥 Pulling {self.model}: {pct:.0f}%", end="", flush=True)
                 print(f"\n[LocalMode] ✅ {self.model} downloaded")
 
