@@ -16,7 +16,7 @@ from memory.memory_manager import (
 
 from actions.file_processor import file_processor
 from actions.flight_finder     import flight_finder
-from actions.open_app          import open_app
+from actions.open_app          import open_app, close_app, list_open_apps
 from actions.weather_report    import weather_action
 from actions.send_message      import send_message
 from actions.reminder          import reminder
@@ -94,7 +94,7 @@ TOOL_DECLARATIONS = [
     {
         "name": "open_app",
         "description": (
-            "Opens any application on the Windows computer. "
+            "Opens any application on the computer. "
             "Use this whenever the user asks to open, launch, or start any app, "
             "website, or program. Always call this tool — never just say you opened it."
         ),
@@ -107,6 +107,37 @@ TOOL_DECLARATIONS = [
                 }
             },
             "required": ["app_name"]
+        }
+    },
+    {
+        "name": "close_app",
+        "description": (
+            "Closes a specific application by name. Uses taskkill on Windows, pkill on Mac/Linux. "
+            "Does NOT use Alt+F4 — targets the exact process. "
+            "Use when user asks to close, quit, or exit an app. "
+            "For Discord, use discord_control instead."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "app_name": {
+                    "type": "STRING",
+                    "description": "Name of the application to close (e.g. 'Chrome', 'Spotify', 'Discord')"
+                }
+            },
+            "required": ["app_name"]
+        }
+    },
+    {
+        "name": "list_open_apps",
+        "description": (
+            "Lists all currently running applications. "
+            "Use when the user asks what apps are open, what's running, or wants to see open programs."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {},
+            "required": []
         }
     },
     {
@@ -379,25 +410,26 @@ TOOL_DECLARATIONS = [
             "Use for: running shell commands, piped commands, background processes, "
             "listing/killing processes, network info, disk usage, system info, "
             "opening files (open_file, open_project_file), opening the long-term memory file (open_memory), "
-            "uninstalling applications (uninstall_app), listing installed apps (list_installed_apps), "
+            "installing applications (install_app), uninstalling applications (uninstall_app), listing installed apps (list_installed_apps), "
             "AND reading/writing/appending the Jarvis's own Python files (self_read, self_write, self_append, self_list). "
             "Has built-in safety checks against dangerous commands. "
             "Use this when the user asks to run a terminal command, CMD command, "
-            "open a file, open their memory, uninstall an app, modify Jarvis's code, add features, fix bugs in itself. "
+            "open a file, open their memory, install or uninstall an app, modify Jarvis's code, add features, fix bugs in itself. "
             "CRITICAL: Always use action:open_memory when user asks to open their memory/long-term memory. "
+            "CRITICAL: Always use action:install_app when user asks to install an application. "
             "CRITICAL: Always use action:uninstall_app when user asks to uninstall an application."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "run | run_in_dir | run_piped | run_background | list_processes | kill_process | network_info | disk_usage | system_info | open_file | open_project_file | open_memory | uninstall_app | list_installed_apps | self_read | self_write | self_append | self_list"},
+                "action":      {"type": "STRING", "description": "run | run_in_dir | run_piped | run_background | list_processes | kill_process | network_info | disk_usage | system_info | open_file | open_project_file | open_memory | install_app | uninstall_app | list_installed_apps | self_read | self_write | self_append | self_list"},
                 "command":     {"type": "STRING", "description": "The command string to execute"},
                 "working_dir": {"type": "STRING", "description": "Working directory for run_in_dir"},
                 "timeout":     {"type": "INTEGER", "description": "Execution timeout in seconds (default: 30, max: 120)"},
                 "filter":      {"type": "STRING", "description": "Process name filter for list_processes / app name filter for list_installed_apps"},
                 "process":     {"type": "STRING", "description": "PID or process name for kill_process"},
                 "path":        {"type": "STRING", "description": "File path for open_file, open_project_file, and self_* actions"},
-                "app_name":    {"type": "STRING", "description": "Application name for uninstall_app"},
+                "app_name":    {"type": "STRING", "description": "Application name for install_app / uninstall_app"},
                 "content":     {"type": "STRING", "description": "File content to write/append (for self_write/self_append)"},
             },
             "required": ["action"]
@@ -686,6 +718,14 @@ class JarvisLive:
             if name == "open_app":
                 r = await loop.run_in_executor(None, lambda: open_app(parameters=args, response=None, player=self.ui))
                 result = r or f"Opened {args.get('app_name')}."
+
+            elif name == "close_app":
+                r = await loop.run_in_executor(None, lambda: close_app(parameters=args, response=None, player=self.ui))
+                result = r or f"Closed {args.get('app_name')}."
+
+            elif name == "list_open_apps":
+                r = await loop.run_in_executor(None, lambda: list_open_apps(parameters=args, response=None, player=self.ui))
+                result = r or "Apps listed."
 
             elif name == "weather_report":
                 r = await loop.run_in_executor(None, lambda: weather_action(parameters=args, player=self.ui))

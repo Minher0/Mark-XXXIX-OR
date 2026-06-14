@@ -308,3 +308,212 @@ def open_app(
     except Exception as e:
         print(f"[open_app] ❌ {e}")
         return f"Failed to open {app_name}, sir: {e}"
+
+
+# ─── Close app ──────────────────────────────────────────────
+
+# Process names to NEVER kill (would crash Jarvis or the system)
+_PROTECTED_PROCESSES = {
+    "python", "pythonw", "python.exe", "python3",
+    "main.py", "jarvis",
+    "explorer", "explorer.exe",
+    "csrss", "csrss.exe", "lsass", "lsass.exe",
+    "services", "services.exe", "svchost", "svchost.exe",
+    "wininit", "wininit.exe", "winlogon", "winlogon.exe",
+    "dwm", "dwm.exe", "taskmgr", "taskmgr.exe",
+}
+
+# App name → process name mapping
+_APP_PROCESS_MAP = {
+    "chrome":        ["chrome.exe", "chrome"],
+    "google chrome": ["chrome.exe", "chrome"],
+    "firefox":       ["firefox.exe", "firefox"],
+    "spotify":       ["Spotify.exe", "Spotify", "spotify"],
+    "discord":       ["Discord.exe", "Discord", "discord"],
+    "telegram":      ["Telegram.exe", "Telegram", "telegram-desktop"],
+    "whatsapp":      ["WhatsApp.exe", "WhatsApp"],
+    "vscode":        ["Code.exe", "Code", "code"],
+    "visual studio code": ["Code.exe", "Code", "code"],
+    "edge":          ["msedge.exe", "msedge"],
+    "brave":         ["brave.exe", "brave"],
+    "vlc":           ["vlc.exe", "vlc"],
+    "zoom":          ["Zoom.exe", "Zoom", "zoom"],
+    "slack":         ["Slack.exe", "Slack", "slack"],
+    "steam":         ["steam.exe", "steam"],
+    "notion":        ["Notion.exe", "Notion"],
+    "obsidian":      ["Obsidian.exe", "Obsidian"],
+    "word":          ["WINWORD.EXE", "WINWORD"],
+    "excel":         ["EXCEL.EXE", "EXCEL"],
+    "powerpoint":    ["POWERPNT.EXE", "POWERPNT"],
+    "paint":         ["mspaint.exe", "mspaint"],
+    "notepad":       ["notepad.exe", "notepad"],
+    "calculator":    ["Calculator.exe", "Calculator", "calc.exe"],
+    "capcut":        ["CapCut.exe", "CapCut"],
+    "figma":         ["Figma.exe", "Figma"],
+    "postman":       ["Postman.exe", "Postman"],
+    "blender":       ["blender.exe", "blender"],
+    "obs":           ["obs64.exe", "obs"],
+    "twitch":        ["Twitch.exe", "Twitch"],
+    "epic games":    ["EpicGamesLauncher.exe", "EpicGamesLauncher"],
+    "spotify":       ["Spotify.exe", "Spotify"],
+    "outlook":       ["OUTLOOK.EXE", "OUTLOOK"],
+    "teams":         ["ms-teams.exe", "ms-teams", "Teams.exe", "Teams"],
+}
+
+
+def _find_process_names(app_name: str) -> list:
+    """Get likely process names for an app."""
+    key = app_name.lower().replace(".exe", "").strip()
+    if key in _APP_PROCESS_MAP:
+        return _APP_PROCESS_MAP[key]
+    # Fuzzy match
+    for mapped_key, procs in _APP_PROCESS_MAP.items():
+        if key in mapped_key or mapped_key in key:
+            return procs
+    # Generate likely process name
+    base = app_name.strip()
+    if platform.system() == "Windows":
+        return [base, f"{base}.exe"]
+    return [base.lower()]
+
+
+def close_app(
+    parameters=None,
+    response=None,
+    player=None,
+    session_memory=None,
+) -> str:
+    """Close an application by name — uses taskkill (Windows) / pkill (Mac/Linux).
+    Does NOT use Alt+F4, so it won't accidentally close the focused window."""
+    app_name = (parameters or {}).get("app_name", "").strip()
+    if not app_name:
+        return "Please specify which application to close."
+
+    # Protect Jarvis itself
+    if app_name.lower().replace(".exe", "") in _PROTECTED_PROCESSES:
+        return f"I can't close '{app_name}' — that would shut me down!"
+
+    proc_names = _find_process_names(app_name)
+    system = platform.system()
+
+    if player:
+        player.write_log(f"[close_app] {app_name}")
+
+    print(f"[close_app] 🛑 Closing: {app_name} (candidates: {proc_names})")
+
+    if system == "Windows":
+        # Use taskkill — /F = force, /IM = image name
+        for proc in proc_names:
+            try:
+                result = subprocess.run(
+                    ["taskkill", "/F", "/IM", proc],
+                    capture_output=True, text=True, timeout=10
+                )
+                if result.returncode == 0:
+                    print(f"[close_app] ✅ Killed: {proc}")
+                    return f"Closed {app_name}."
+            except Exception:
+                continue
+        # Fallback: try with pyautogui (only if taskkill failed for all candidates)
+        # Actually, don't use Alt+F4 at all — it closes the wrong window
+        return f"Could not find a running process for '{app_name}'. It might not be open."
+
+    elif system == "Darwin":
+        # macOS: osascript or pkill
+        for proc in proc_names:
+            try:
+                # Try AppleScript first (cleaner quit)
+                result = subprocess.run(
+                    ["osascript", "-e", f'tell application "{proc}" to quit'],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0:
+                    return f"Closed {app_name}."
+            except Exception:
+                pass
+        # pkill fallback
+        for proc in proc_names:
+            try:
+                result = subprocess.run(["pkill", "-f", proc], capture_output=True, timeout=5)
+                if result.returncode == 0:
+                    return f"Closed {app_name}."
+            except Exception:
+                continue
+        return f"Could not find a running process for '{app_name}'."
+
+    else:
+        # Linux: pkill
+        for proc in proc_names:
+            try:
+                result = subprocess.run(["pkill", "-f", proc], capture_output=True, timeout=5)
+                if result.returncode == 0:
+                    return f"Closed {app_name}."
+            except Exception:
+                continue
+        return f"Could not find a running process for '{app_name}'."
+
+
+# ─── List open apps ─────────────────────────────────────────
+
+def list_open_apps(
+    parameters=None,
+    response=None,
+    player=None,
+    session_memory=None,
+) -> str:
+    """List currently running applications."""
+    if not _PSUTIL:
+        return "psutil is not installed. Run: pip install psutil"
+
+    try:
+        apps = set()
+        for proc in psutil.process_iter(["name"]):
+            try:
+                name = proc.info["name"]
+                if name:
+                    # Skip system processes and tiny utilities
+                    lower = name.lower()
+                    if lower in _PROTECTED_PROCESSES:
+                        continue
+                    # Skip very short/system-like names
+                    base = name.replace(".exe", "")
+                    if len(base) <= 3:
+                        continue
+                    # Skip common system/background processes
+                    skip = {
+                        "conhost", "cmd", "powershell", "runtimebroker",
+                        "searchhost", "shellexperiencehost", "startmenuexperiencehost",
+                        "taskbar", "widgets", "dwm", "fontdrvhost", "lsass",
+                        "sihost", "ctfmon", "dllhost", "svchost", "services",
+                        "wininit", "winlogon", "csrss", "smss", "msdtc",
+                        "nvspcap", "wermgr", "werfault", "mrt", "wuauclt",
+                        "backgroundtaskhost", "applicationframehost",
+                        "searchindexer", "securesystem", "memorycompression",
+                        "registry", "system", "idle", "interrupts",
+                        "threadpool", "spoolsv", "audiodg",
+                    }
+                    if base.lower() in skip:
+                        continue
+                    apps.add(base)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        sorted_apps = sorted(apps, key=str.lower)
+        if not sorted_apps:
+            return "No applications currently running."
+
+        lines = []
+        for i, app in enumerate(sorted_apps[:30], 1):
+            lines.append(f"{i}. {app}")
+
+        result = f"Applications ouvertes ({len(sorted_apps)}):\n" + "\n".join(lines)
+        if len(sorted_apps) > 30:
+            result += f"\n... et {len(sorted_apps) - 30} autres."
+
+        if player:
+            player.write_log("[list_open_apps] listed")
+
+        return result
+
+    except Exception as e:
+        return f"Failed to list applications: {e}"

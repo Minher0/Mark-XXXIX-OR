@@ -386,6 +386,114 @@ def _open_memory() -> str:
         return f"Failed to open memory file: {e}"
 
 
+def _install_app(app_name: str) -> str:
+    """Install an application using winget (Windows), brew (macOS), or apt (Linux)."""
+    os_name = _get_os()
+
+    if os_name == "windows":
+        # ── PRIMARY: winget install ──
+        try:
+            check = subprocess.run(
+                ["winget", "--version"],
+                capture_output=True, text=True, timeout=5
+            )
+            if check.returncode == 0:
+                # Search first to find the exact ID
+                search = subprocess.run(
+                    ["winget", "search", app_name, "--accept-source-agreements"],
+                    capture_output=True, text=True, timeout=30
+                )
+                if search.returncode == 0 and search.stdout.strip():
+                    # Try to extract the best match ID from search results
+                    lines = search.stdout.strip().splitlines()
+                    best_id = None
+                    for line in lines[2:]:  # Skip header lines
+                        if app_name.lower() in line.lower():
+                            parts = line.split()
+                            if len(parts) >= 2:
+                                best_id = parts[1]  # Second column is usually the ID
+                                break
+
+                    if best_id:
+                        result = subprocess.run(
+                            ["winget", "install", "--id", best_id, "--accept-source-agreements", "--accept-package-agreements"],
+                            capture_output=True, text=True, timeout=300
+                        )
+                        if result.returncode == 0:
+                            return f"Installed '{app_name}' (ID: {best_id})."
+                        return f"Install attempted for '{app_name}': {result.stdout.strip()[-200:]}"
+
+                    # Fallback: install by name
+                    result = subprocess.run(
+                        ["winget", "install", "--name", app_name, "--accept-source-agreements", "--accept-package-agreements"],
+                        capture_output=True, text=True, timeout=300
+                    )
+                    if result.returncode == 0:
+                        return f"Installed '{app_name}'."
+                    return f"Install result: {result.stdout.strip()[-200:]}"
+                else:
+                    return f"'{app_name}' not found in winget search results."
+            else:
+                print("[CmdControl] winget not available")
+        except subprocess.TimeoutExpired:
+            return f"Installation timed out for '{app_name}'. It may need manual confirmation."
+        except Exception as e:
+            print(f"[CmdControl] winget install error: {e}")
+
+        # Fallback: open Microsoft Store
+        try:
+            subprocess.Popen(
+                f'start ms-windows-store://search/?query={app_name}',
+                shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            return f"Opened Microsoft Store search for '{app_name}'."
+        except Exception:
+            return f"Could not install '{app_name}'. Try manually."
+
+    elif os_name == "darwin":
+        # macOS: try brew first
+        try:
+            brew_check = subprocess.run(
+                ["brew", "--version"],
+                capture_output=True, text=True, timeout=5
+            )
+            if brew_check.returncode == 0:
+                result = subprocess.run(
+                    ["brew", "install", app_name],
+                    capture_output=True, text=True, timeout=300
+                )
+                if result.returncode == 0:
+                    return f"Installed '{app_name}' via Homebrew."
+                return f"Homebrew install result: {result.stderr.strip()[-200:]}"
+        except Exception:
+            pass
+
+        # Fallback: open brew search or App Store
+        try:
+            subprocess.Popen(["open", f"macappstore://itunes.apple.com/search?term={app_name}"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return f"Opened App Store search for '{app_name}'."
+        except Exception:
+            return f"Could not install '{app_name}'. Try manually."
+
+    else:
+        # Linux: try apt/pacman/dnf
+        for cmd_list, name in [
+            (["sudo", "apt", "install", "-y", app_name], "apt"),
+            (["sudo", "dnf", "install", "-y", app_name], "dnf"),
+            (["sudo", "pacman", "-S", "--noconfirm", app_name], "pacman"),
+        ]:
+            try:
+                result = subprocess.run(cmd_list, capture_output=True, text=True, timeout=120)
+                if result.returncode == 0:
+                    return f"Installed '{app_name}' via {name}."
+            except FileNotFoundError:
+                continue
+            except Exception:
+                continue
+        return f"Could not install '{app_name}'. No supported package manager found."
+
+
 def _uninstall_app(app_name: str) -> str:
     """Uninstall an application using winget (Windows), or open the uninstall panel."""
     os_name = _get_os()
@@ -681,6 +789,7 @@ def cmd_control(
       open_project_file — open a file from the Jarvis project with default program
       open_memory    — open the long-term memory file (memory/long_term.json)
       uninstall_app  — uninstall an application (winget on Windows, brew on macOS, apt on Linux)
+      install_app    — install an application (winget on Windows, brew on macOS, apt on Linux)
       list_installed_apps — list installed applications (optional filter)
       self_read      — read a file from the Jarvis project
       self_write     — write/overwrite a file in the Jarvis project
@@ -780,6 +889,13 @@ def cmd_control(
                 return "No application name provided for uninstall_app."
             print(f"[CmdControl] 🗑️ Uninstalling: {app_name}")
             return _uninstall_app(app_name)
+
+        if action == "install_app":
+            app_name = params.get("app_name", params.get("name", "")).strip()
+            if not app_name:
+                return "No application name provided for install_app."
+            print(f"[CmdControl] 📦 Installing: {app_name}")
+            return _install_app(app_name)
 
         if action == "list_installed_apps":
             filter_name = params.get("filter", params.get("name", "")).strip()
