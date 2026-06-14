@@ -361,8 +361,9 @@ def discord_control(parameters: dict, player=None) -> str:
     Main entry point for Jarvis tool dispatch.
 
     parameters:
-        action      : send_dm | send_channel | read_channel | list_servers | list_channels | list_friends | status
-        receiver    : Username or user ID for send_dm
+        action      : send_dm | send_channel | read_channel | list_servers | list_channels |
+                      list_friends | list_calls | start_call | join_call | leave_call | status
+        receiver    : Username or user ID for send_dm / start_call / join_call
         message     : Message text to send
         server      : Server name for send_channel / read_channel / list_channels
         channel     : Channel name for send_channel / read_channel
@@ -465,13 +466,43 @@ def discord_control(parameters: dict, player=None) -> str:
                 else:
                     result = "Could not fetch Discord contacts."
 
+        elif action == "list_calls":
+            from actions.discord_voice import get_call_manager
+            cm = get_call_manager()
+            if not cm.gateway.is_connected():
+                result = "Discord Gateway non connecté. Démarre Jarvis pour activer la gestion d'appels."
+            else:
+                result = cm.list_calls()
+
+        elif action == "start_call":
+            receiver = params.get("receiver", "").strip()
+            if not receiver:
+                return "Précise avec qui lancer l'appel."
+            from actions.discord_voice import get_call_manager
+            cm = get_call_manager()
+            result = cm.start_call(receiver)
+
+        elif action == "join_call":
+            receiver = params.get("receiver", "").strip()
+            if not receiver:
+                return "Précise quel appel rejoindre (pseudo ou ID channel)."
+            from actions.discord_voice import get_call_manager
+            cm = get_call_manager()
+            result = cm.join_call(receiver)
+
+        elif action == "leave_call":
+            from actions.discord_voice import get_call_manager
+            cm = get_call_manager()
+            result = cm.leave_call()
+
         elif action == "status":
             result = _status()
 
         else:
             result = (
                 f"Unknown Discord action: '{action}'. "
-                "Available: send_dm, send_channel, read_channel, list_servers, list_channels, list_friends, status"
+                "Available: send_dm, send_channel, read_channel, list_servers, list_channels, "
+                "list_friends, list_calls, start_call, join_call, leave_call, status"
             )
 
     except ValueError as e:
