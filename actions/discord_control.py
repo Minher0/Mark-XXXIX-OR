@@ -37,8 +37,8 @@ def _headers() -> dict:
     }
 
 
-def _api_get(endpoint: str, params: dict = None) -> dict | list | None:
-    """Make a GET request to Discord API."""
+def _api_get(endpoint: str, params: dict = None, silent: bool = False) -> dict | list | None:
+    """Make a GET request to Discord API. Returns None on failure."""
     try:
         r = requests.get(f"{BASE_API}{endpoint}", headers=_headers(), params=params, timeout=15)
         if r.status_code == 401:
@@ -49,8 +49,11 @@ def _api_get(endpoint: str, params: dict = None) -> dict | list | None:
             r = requests.get(f"{BASE_API}{endpoint}", headers=_headers(), params=params, timeout=15)
         r.raise_for_status()
         return r.json() if r.text else None
+    except ValueError:
+        raise  # Re-raise auth errors
     except requests.exceptions.RequestException as e:
-        print(f"[Discord] API GET {endpoint} failed: {e}")
+        if not silent:
+            print(f"[Discord] API GET {endpoint} failed: {e}")
         return None
 
 
@@ -182,8 +185,8 @@ def _find_user_id(receiver: str) -> str | None:
 
     search = receiver.lower().replace("#", "")
 
-    # 2. Check relationships (friends list)
-    relationships = _api_get("/users/@me/relationships")
+    # 2. Check relationships (friends list) — may return 400 for user tokens
+    relationships = _api_get("/users/@me/relationships", silent=True)
     if relationships:
         for rel in relationships:
             if rel.get("type") != 1:  # 1 = friend
@@ -414,27 +417,53 @@ def discord_control(parameters: dict, player=None) -> str:
             result = _list_channels(server)
 
         elif action == "list_friends":
-            relationships = _api_get("/users/@me/relationships")
-            if not relationships:
-                return "Could not fetch friends list."
-            friends = []
-            for rel in relationships:
-                if rel.get("type") != 1:
-                    continue
-                user = rel.get("user", {})
-                name = user.get("username", "?")
-                disc = user.get("discriminator") or "0"
-                gname = user.get("global_name") or ""
-                if disc != "0":
-                    display = f"{name}#{disc}"
+            # Try relationships API first (may not work for user tokens)
+            relationships = _api_get("/users/@me/relationships", silent=True)
+            if relationships:
+                friends = []
+                for rel in relationships:
+                    if rel.get("type") != 1:
+                        continue
+                    user = rel.get("user", {})
+                    name = user.get("username", "?")
+                    disc = user.get("discriminator") or "0"
+                    gname = user.get("global_name") or ""
+                    if disc != "0":
+                        display = f"{name}#{disc}"
+                    else:
+                        display = name
+                    if gname and gname != name:
+                        display = f"{gname} ({name})"
+                    friends.append(display)
+                if friends:
+                    result = f"Your Discord friends ({len(friends)}):\n" + ", ".join(friends[:50])
                 else:
-                    display = name
-                if gname and gname != name:
-                    display = f"{gname} ({name})"
-                friends.append(display)
-            if not friends:
-                return "No friends found."
-            return f"Your Discord friends ({len(friends)}):\n" + ", ".join(friends[:50])
+                    result = "No friends found."
+            else:
+                # Fallback: list DM contacts
+                dm_channels = _api_get("/users/@me/channels")
+                if dm_channels:
+                    contacts = []
+                    for ch in dm_channels:
+                        if ch.get("type") != 1:
+                            continue
+                        for r in ch.get("recipients", []):
+                            name = r.get("username") or "?"
+                            disc = r.get("discriminator") or "0"
+                            gname = r.get("global_name") or ""
+                            if disc != "0":
+                                display = f"{name}#{disc}"
+                            else:
+                                display = name
+                            if gname and gname != name:
+                                display = f"{gname} ({name})"
+                            contacts.append(display)
+                    if contacts:
+                        result = f"Your Discord DM contacts ({len(contacts)}):\n" + ", ".join(contacts[:50])
+                    else:
+                        result = "No Discord contacts found."
+                else:
+                    result = "Could not fetch Discord contacts."
 
         elif action == "status":
             result = _status()

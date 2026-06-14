@@ -205,6 +205,17 @@ def send_message(
     elif "telegram" in platform or "tg" in platform:
         result = _send_telegram(receiver, message_text)
 
+    elif "discord" in platform or "dc" in platform:
+        # Redirect to discord_control for proper API-based sending
+        try:
+            from actions.discord_control import discord_control
+            result = discord_control(
+                parameters={"action": "send_dm", "receiver": receiver, "message": message_text},
+                player=player
+            )
+        except Exception as e:
+            result = f"Discord send failed: {e}"
+
     else:
         result = _send_generic(platform, receiver, message_text)
 
