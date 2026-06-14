@@ -400,14 +400,7 @@ def _uninstall_app(app_name: str) -> str:
                 capture_output=True, text=True, timeout=5
             )
             if check.returncode == 0:
-                # Search for the app first to get the exact ID
-                search = subprocess.run(
-                    ["winget", "list", "--name", app_name, "--source", "winget", "--msstore", "--exact", "--accept-source-agreements"],
-                    capture_output=True, text=True, timeout=30
-                )
-                print(f"[CmdControl] winget search for '{app_name}':\n{search.stdout}")
-
-                # Try uninstall with --name for user-friendliness
+                # Try uninstall with --name directly (no pre-search to avoid flag compat issues)
                 result = subprocess.run(
                     ["winget", "uninstall", "--name", app_name, "--accept-source-agreements", "--accept-package-agreements"],
                     capture_output=True, text=True, timeout=120
@@ -422,15 +415,39 @@ def _uninstall_app(app_name: str) -> str:
 
                 if result.returncode == 0:
                     return f"Uninstall initiated for '{app_name}'.\n{output}"
-                else:
-                    # Fallback: try with the raw name as ID
-                    result2 = subprocess.run(
-                        ["winget", "uninstall", app_name, "--accept-source-agreements", "--accept-package-agreements"],
-                        capture_output=True, text=True, timeout=120
+
+                # Fallback: try with the raw name as ID
+                result2 = subprocess.run(
+                    ["winget", "uninstall", app_name, "--accept-source-agreements", "--accept-package-agreements"],
+                    capture_output=True, text=True, timeout=120
+                )
+                if result2.returncode == 0:
+                    return f"Uninstalled '{app_name}'.\n{result2.stdout.strip()}"
+
+                # Fallback: try querying installed apps for a match
+                try:
+                    search = subprocess.run(
+                        ["winget", "list", "--name", app_name, "--accept-source-agreements"],
+                        capture_output=True, text=True, timeout=30
                     )
-                    if result2.returncode == 0:
-                        return f"Uninstall initiated for '{app_name}'.\n{result2.stdout.strip()}"
-                    return f"Could not uninstall '{app_name}' via winget. Output: {output}"
+                    print(f"[CmdControl] winget list for '{app_name}':\n{search.stdout}")
+                    # Try to extract the ID from search results and uninstall by ID
+                    for line in search.stdout.splitlines():
+                        if app_name.lower() in line.lower():
+                            # Extract ID (usually the second column)
+                            parts = line.split()
+                            if len(parts) >= 2:
+                                potential_id = parts[1]
+                                result3 = subprocess.run(
+                                    ["winget", "uninstall", "--id", potential_id, "--accept-source-agreements", "--accept-package-agreements"],
+                                    capture_output=True, text=True, timeout=120
+                                )
+                                if result3.returncode == 0:
+                                    return f"Uninstalled '{app_name}' (ID: {potential_id}).\n{result3.stdout.strip()}"
+                except Exception:
+                    pass
+
+                return f"Could not uninstall '{app_name}' via winget. Output: {output}"
             else:
                 print("[CmdControl] winget not available, falling back to control panel")
         except subprocess.TimeoutExpired:

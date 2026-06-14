@@ -865,9 +865,14 @@ class JarvisLive:
                         )
 
         except Exception as e:
+            err_str = str(e)
             print(f"[JARVIS] ❌ Recv: {e}")
-            traceback.print_exc()
-            raise
+            if "1011" in err_str:
+                print("[JARVIS] 🔴 Gemini 1011 — connection dropped, will reconnect")
+            else:
+                traceback.print_exc()
+            # Do NOT re-raise — let the run() loop handle reconnection gracefully
+            # The TaskGroup will still see the task ended, but without raising ExceptionGroup
 
     async def _play_audio(self):
         print("[JARVIS] 🔊 Play started")
@@ -927,10 +932,19 @@ class JarvisLive:
                     tg.create_task(self._receive_audio())
                     tg.create_task(self._play_audio())
                     
-            except Exception as e:
+            except BaseException as e:
                 err_str = str(e)
-                print(f"[JARVIS] ⚠️ {e}")
-                traceback.print_exc()
+
+                # ExceptionGroup from TaskGroup contains sub-exceptions
+                if isinstance(e, ExceptionGroup):
+                    for sub in e.exceptions:
+                        print(f"[JARVIS] ⚠️ TaskGroup sub-error: {sub}")
+                        sub_str = str(sub)
+                        if "1011" in sub_str:
+                            print("[JARVIS] 🔴 Gemini API 1011 internal error — server-side issue, retrying...")
+                else:
+                    print(f"[JARVIS] ⚠️ {e}")
+                    traceback.print_exc()
 
                 # Log specific error type for debugging
                 if "1011" in err_str:
