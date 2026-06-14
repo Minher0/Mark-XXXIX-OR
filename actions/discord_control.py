@@ -163,37 +163,89 @@ def _list_channels(server_name: str) -> str:
     return f"Channels in {guild['name']}:\n" + "\n".join(lines)
 
 
+def _find_user_id(receiver: str) -> str | None:
+    """Find a Discord user ID from a name string.
+    
+    Search order:
+    1. If it's a numeric ID, use directly
+    2. Check existing DM channels (most reliable for user tokens)
+    3. Search guild member lists (paginated)
+    """
+    # 1. Numeric ID
+    if receiver.isdigit():
+        return receiver
+
+    search = receiver.lower().replace("#", "")
+
+    # 2. Check existing DM channels
+    dm_channels = _api_get("/users/@me/channels")
+    if dm_channels:
+        for ch in dm_channels:
+            if ch.get("type") != 1:  # DM type = 1
+                continue
+            recipients = ch.get("recipients", [])
+            for r in recipients:
+                username = r.get("username", "").lower()
+                global_name = r.get("global_name", "").lower()
+                discriminator = r.get("discriminator", "0")
+                full_name = f"{username}#{discriminator}" if discriminator != "0" else username
+                if (search in username or
+                    search in global_name or
+                    search in full_name.replace("#", "") or
+                    search == username):
+                    return r.get("id")
+
+    # 3. Search guild member lists (paginated, max 100 per page)
+    guilds = _get_guilds()
+    for g in guilds:
+        after = "0"
+        for _ in range(10):  # Max 10 pages = 1000 members
+            members = _api_get(f"/guilds/{g['id']}/members", params={"limit": 100, "after": after})
+            if not members:
+                break
+            for m in members:
+                user = m.get("user", {})
+                username = user.get("username", "").lower()
+                global_name = user.get("global_name", "").lower()
+                nick = m.get("nick", "").lower()
+                discriminator = user.get("discriminator", "0")
+                full_name = f"{username}#{discriminator}" if discriminator != "0" else username
+                if (search in username or
+                    search in global_name or
+                    search in nick or
+                    search in full_name.replace("#", "")):
+                    return user.get("id")
+            # Pagination: use last member's ID as 'after'
+            last_id = members[-1].get("user", {}).get("id")
+            if not last_id:
+                break
+            after = last_id
+
+    return None
+
+
 def _send_dm(receiver: str, message: str) -> str:
     """Send a DM to a user."""
-    # Try to find the user ID
-    user_id = None
-
-    # If it's a numeric ID, use directly
-    if receiver.isdigit():
-        user_id = receiver
-    else:
-        # Search through guild members
-        guilds = _get_guilds()
-        for g in guilds:
-            members = _api_get(f"/guilds/{g['id']}/members/search", params={"query": receiver, "limit": 5})
-            if members and len(members) > 0:
-                for m in members:
-                    user = m.get("user", {})
-                    username = user.get("username", "")
-                    global_name = user.get("global_name", "")
-                    nick = m.get("nick", "")
-                    # Match against all name variants
-                    if (receiver.lower() in username.lower() or
-                        receiver.lower() in global_name.lower() or
-                        receiver.lower() in nick.lower()):
-                        user_id = user.get("id")
-                        break
-            if user_id:
-                break
+    user_id = _find_user_id(receiver)
 
     if not user_id:
-        # Try fetching user directly (if receiver is a username without tag)
-        return f"User '{receiver}' not found. Try their Discord user ID instead."
+        # Build helpful message with known contacts
+        dm_channels = _api_get("/users/@me/channels")
+        known = []
+        if dm_channels:
+            for ch in dm_channels:
+                if ch.get("type") != 1:
+                    continue
+                for r in ch.get("recipients", []):
+                    name = r.get("username", "")
+                    disc = r.get("discriminator", "0")
+                    if disc != "0":
+                        name = f"{name}#{disc}"
+                    known.append(name)
+        suggestions = ", ".join(known[:15]) if known else ""
+        if suggestions:
+            return f"User '{receiver}' not found. People you've DM'd: {suggestions}"
+        return f"User '{receiver}' not found. Try their Discord user ID (numeric)."
 
     # Create DM channel
     dm_channel = _api_post("/users/@me/channels", {"recipient_id": user_id})
@@ -207,8 +259,7 @@ def _send_dm(receiver: str, message: str) -> str:
     # Send message
     result = _api_post(f"/channels/{channel_id}/messages", {"content": message})
     if result:
-        recipient_name = receiver
-        return f"DM sent to {recipient_name}."
+        return f"DM sent to {receiver}."
     return f"Failed to send DM to '{receiver}'."
 
 
