@@ -276,7 +276,9 @@ class DiscordGateway:
                 time.sleep(5)
 
     async def _connect_and_listen(self):
-        async with websockets.connect(GATEWAY_URL, max_size=2 ** 20) as ws:
+        # User accounts receive very large READY payloads (~2-5 MB)
+        # Default limit is 1 MB, must increase to avoid 1009 close
+        async with websockets.connect(GATEWAY_URL, max_size=2 ** 24) as ws:
             self.ws = ws
             self._loop = asyncio.get_event_loop()
 
@@ -297,6 +299,8 @@ class DiscordGateway:
                         "device": "Chrome",
                     },
                     "compress": False,
+                    # Request only essential data to reduce payload size
+                    "intents": 0,  # No privileged intents needed for voice
                 },
             }))
 
@@ -889,6 +893,15 @@ class CallManager:
     # ── Start / ring a DM call ──
 
     def start_call(self, receiver: str) -> str:
+        """Start a DM call by joining the voice channel via Gateway.
+        
+        The REST endpoint POST /channels/{id}/call returns 405 for user tokens.
+        Instead, we join the DM voice channel via VOICE_STATE_UPDATE (op 4),
+        which triggers a ring on the other user's end — same as the Discord client.
+        """
+        if not self.gateway.is_connected():
+            return "Discord Gateway non connecté. Impossible de lancer un appel."
+
         from actions.discord_control import _find_user_id
 
         user_id = _find_user_id(receiver)
@@ -905,15 +918,39 @@ class CallManager:
         except Exception as e:
             return f"Impossible d'ouvrir un MP avec '{receiver}' : {e}"
 
-        # Ring
-        try:
-            r = requests.post(f"{BASE_API}/channels/{channel_id}/call",
-                              headers=_headers(), json={}, timeout=10)
-            if r.status_code in (200, 204):
-                return f"Appel lancé vers {receiver} !"
-            return f"Sonnerie envoyée à {receiver} (status {r.status_code})."
-        except Exception as e:
-            return f"Impossible d'appeler {receiver} : {e}"
+        if self._in_call:
+            return f"Déjà en appel. Quitte l'appel actuel d'abord, puis rappelle {receiver}."
+
+        # Join the DM voice channel via Gateway — this triggers the ring
+        print(f"[Discord Call] Starting call with {receiver} (channel {channel_id})")
+        self.gateway.send_voice_state_update(guild_id=None, channel_id=channel_id)
+
+        # Wait for VOICE_SERVER_UPDATE
+        voice_info = self.gateway.wait_for_voice_server_update(timeout=10)
+        if not voice_info:
+            self.gateway.send_voice_state_update(guild_id=None, channel_id=None)
+            return f"Impossible de lancer l'appel avec {receiver}. Timeout du serveur vocal."
+
+        # Connect voice client
+        if not HAS_NACL:
+            # Still join the channel (appear in call) even without NaCl
+            self._in_call = True
+            self._current_channel_id = channel_id
+            self._current_guild_id = None
+            return (f"Appel lancé vers {receiver} (sans audio — installe pynacl pour l'audio). "
+                    f"Dis « quitte l'appel » pour sortir.")
+
+        self.voice_client = DiscordVoiceClient(self.gateway)
+        if self.voice_client.connect(voice_info):
+            self._in_call = True
+            self._current_channel_id = channel_id
+            self._current_guild_id = None
+            audio_ok = self.voice_client.has_audio
+            status = "avec audio" if audio_ok else "sans audio (installe opuslib + opus.dll pour l'audio)"
+            return f"Appel lancé vers {receiver} {status}. Dis « quitte l'appel » pour sortir."
+        else:
+            self.gateway.send_voice_state_update(guild_id=None, channel_id=None)
+            return f"Échec de connexion vocale avec {receiver}."
 
     # ── Join a call ──
 
