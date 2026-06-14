@@ -962,27 +962,11 @@ class JarvisLive:
             reconnect_delay = min(reconnect_delay * 1.5, max_delay)  # Exponential backoff
 
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="JARVIS — AI Assistant")
-    parser.add_argument("--cloud", action="store_true",
-                        help="Run in cloud mode (Gemini API, requires API key)")
-    parser.add_argument("--model", type=str, default="qwen2.5:7b",
-                        help="Ollama model for local mode (default: qwen2.5:7b)")
-    parser.add_argument("--lang", type=str, default="auto",
-                        help="Language: fr, en, de, es, it, pt, tr, zh, ja, ko, ru, ar (default: auto-detect)")
-    args = parser.parse_args()
-
-    is_local = not args.cloud
-    ui = JarvisUI("face.png", local_mode=is_local)
+    ui = JarvisUI("face.png")
 
     def runner():
-        if args.cloud:
-            ui.wait_for_api_key()
-            jarvis = JarvisLive(ui)
-        else:
-            from local_mode import JarvisLocal
-            print(f"[JARVIS] 🏠 Starting in LOCAL mode (model: {args.model}, lang: {args.lang})")
-            jarvis = JarvisLocal(ui, model=args.model, lang=args.lang)
+        ui.wait_for_api_key()
+        jarvis = JarvisLive(ui)
         try:
             asyncio.run(jarvis.run())
         except KeyboardInterrupt:

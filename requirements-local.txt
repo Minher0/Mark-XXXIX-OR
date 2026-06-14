@@ -1,8 +1,0 @@
-# Local mode dependencies (python main.py --local)
-# Install: pip install -r requirements-local.txt
-ollama
-faster-whisper
-edge-tts
-webrtcvad-wheels
-pygame
-numpy<2           # faster-whisper/ctranslate2 need numpy 1.x
