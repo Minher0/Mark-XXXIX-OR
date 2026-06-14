@@ -4,3 +4,5 @@ ollama
 faster-whisper
 edge-tts
 webrtcvad-wheels
+pygame
+numpy<2           # faster-whisper/ctranslate2 need numpy 1.x

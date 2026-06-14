@@ -542,57 +542,39 @@ class JarvisLocal:
         self.ui.set_state("LISTENING")
 
     async def _play_audio_file(self, filepath: str):
-        """Play an audio file silently (no visible window)."""
+        """Play an audio file silently using pygame (no visible window)."""
+        try:
+            import pygame
+            if not pygame.mixer.get_init():
+                pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=2048)
+            pygame.mixer.music.load(filepath)
+            pygame.mixer.music.play()
+            # Wait until playback finishes
+            while pygame.mixer.music.get_busy():
+                await asyncio.sleep(0.1)
+            pygame.mixer.music.unload()
+            return
+        except ImportError:
+            pass
+        except Exception as e:
+            print(f"[LocalMode] ⚠️ pygame playback failed: {e}")
+
+        # Fallback: platform-specific players
         try:
             if sys.platform == "win32":
-                # WMPlayer.OCX COM — plays MP3 silently, no window, built into Windows
-                escaped = filepath.replace("'", "''")
-                ps_script = (
-                    "$wmp = New-Object -ComObject WMPlayer.OCX; "
-                    f"$wmp.URL = '{escaped}'; "
-                    "$wmp.controls.play(); "
-                    # Wait for buffering/transitioning to finish
-                    "while ($wmp.playState -eq 9 -or $wmp.playState -eq 6) { Start-Sleep -Milliseconds 200 }; "
-                    # Wait until playback finishes (1=Stopped, 8=MediaEnded)
-                    "while ($wmp.playState -ne 1 -and $wmp.playState -ne 8) { Start-Sleep -Milliseconds 200 }; "
-                    "$wmp.controls.stop(); "
-                    "$wmp.close()"
+                # ffplay from ffmpeg — no window, auto-exit
+                subprocess.run(
+                    ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", filepath],
+                    timeout=60,
                 )
-                result = subprocess.run(
-                    ["powershell", "-Command", ps_script],
-                    timeout=60, capture_output=True,
-                )
-                if result.returncode != 0:
-                    # Fallback: try winsound with WAV conversion
-                    print(f"[LocalMode] ⚠️ WMPlayer failed, trying winsound fallback...")
-                    await self._play_winsound_fallback(filepath)
             elif sys.platform == "darwin":
                 subprocess.run(["afplay", filepath], timeout=30)
             else:
                 subprocess.run(["aplay", filepath], timeout=30)
+        except FileNotFoundError:
+            print("[LocalMode] 💬 No audio player found. Install: pip install pygame")
         except Exception as e:
             print(f"[LocalMode] ⚠️ Audio playback failed: {e}")
-            print(f"[LocalMode] 💬 (audio playback failed)")
-
-    async def _play_winsound_fallback(self, filepath: str):
-        """Fallback: convert MP3 to WAV and play with winsound (built-in Python)."""
-        try:
-            import winsound
-            # Try to convert with ffmpeg if available
-            wav_file = filepath.replace(".mp3", ".wav")
-            conv = subprocess.run(
-                ["ffmpeg", "-y", "-i", filepath, wav_file],
-                capture_output=True, timeout=15,
-            )
-            if conv.returncode == 0 and os.path.exists(wav_file):
-                winsound.PlaySound(wav_file, winsound.SND_FILENAME)
-                try: os.unlink(wav_file)
-                except: pass
-                return
-            # Last resort: print
-            print("[LocalMode] 💬 Install ffmpeg for audio playback, or check WMPlayer")
-        except Exception:
-            print("[LocalMode] 💬 (no audio playback available)")
 
     # ───────────────────────────────────────────────────────
     # MAIN LOOP
