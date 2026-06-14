@@ -32,6 +32,7 @@ from actions.web_search        import web_search as web_search_action
 from actions.computer_control  import computer_control
 from actions.cmd_control       import cmd_control
 from actions.game_updater      import game_updater
+from actions.discord_control   import discord_control
 
 
 def get_base_dir():
@@ -527,6 +528,40 @@ TOOL_DECLARATIONS = [
             "required": ["category", "key", "value"]
         }
     },
+    {
+    "name": "discord_control",
+    "description": (
+        "Control the user's Discord via a bot. Send messages to channels or users, "
+        "read messages, list servers and channels, delete or edit messages. "
+        "Use this when the user asks to send a Discord message, check Discord, "
+        "read messages from a channel, or manage their Discord. "
+        "The user can say this in ANY language."
+    ),
+    "parameters": {
+        "type": "OBJECT",
+        "properties": {
+            "action": {
+                "type": "STRING",
+                "description": (
+                    "send_message — Send a message to a channel or DM a user | "
+                    "read_messages — Read recent messages from a channel | "
+                    "list_channels — List text channels in a server | "
+                    "list_servers — List all servers the bot is in | "
+                    "delete_message — Delete a message by ID | "
+                    "edit_message — Edit a message by ID"
+                )
+            },
+            "channel":    {"type": "STRING",  "description": "Channel name (e.g. 'general', 'dev-chat')"},
+            "user":       {"type": "STRING",  "description": "Username to send a DM to"},
+            "message":    {"type": "STRING",  "description": "Message content to send or edit"},
+            "channel_id": {"type": "STRING",  "description": "Discord channel ID (if name not found)"},
+            "message_id": {"type": "STRING",  "description": "Message ID for delete/edit"},
+            "server":     {"type": "STRING",  "description": "Server name for list_channels"},
+            "limit":      {"type": "STRING",  "description": "Number of messages to read (default: 10)"},
+        },
+        "required": ["action"]
+    }
+    },
 ]
 
 
@@ -747,6 +782,11 @@ class JarvisLive:
             elif name == "flight_finder":
                 r = await loop.run_in_executor(None, lambda: flight_finder(parameters=args, player=self.ui))
                 result = r or "Done."
+
+            elif name == "discord_control":
+                r = await loop.run_in_executor(None, lambda: discord_control(parameters=args, player=self.ui))
+                result = r or "Done."
+
             elif name == "shutdown_jarvis":
                 self.ui.write_log("SYS: Shutdown requested.")
                 self.speak("Goodbye, sir.")
@@ -962,6 +1002,18 @@ class JarvisLive:
             reconnect_delay = min(reconnect_delay * 1.5, max_delay)  # Exponential backoff
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="JARVIS — AI Assistant")
+    parser.add_argument("--discord", action="store_true",
+                        help="Run as Discord bot instead of voice assistant")
+    args = parser.parse_args()
+
+    if args.discord:
+        print("[JARVIS] 🤖 Starting Discord bot mode...")
+        from discord_bot import run_discord_bot
+        asyncio.run(run_discord_bot())
+        return
+
     ui = JarvisUI("face.png")
 
     def runner():
