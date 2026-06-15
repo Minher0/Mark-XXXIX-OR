@@ -123,6 +123,47 @@ def _kill_jarvis() -> bool:
     return False
 
 
+# Directories that must NEVER be touched during updates
+_PROTECTED_DIRS = {"memory", "config"}
+
+
+def _backup_protected() -> dict[str, Path]:
+    """Backup memory/ and config/ to a temp location before updating.
+    Returns a dict of {name: backup_path}."""
+    backups = {}
+    backup_root = APP_DIR / "_update_backup"
+    if backup_root.exists():
+        shutil.rmtree(str(backup_root))
+    backup_root.mkdir(parents=True, exist_ok=True)
+
+    for name in _PROTECTED_DIRS:
+        src = REPO_DIR / name
+        if src.exists():
+            dst = backup_root / name
+            shutil.copytree(str(src), str(dst))
+            backups[name] = dst
+            print(f"      Backed up {name}/")
+
+    return backups
+
+
+def _restore_protected(backups: dict[str, Path]) -> None:
+    """Restore memory/ and config/ from backup after updating."""
+    for name, backup_path in backups.items():
+        dst = REPO_DIR / name
+        # Remove whatever git/zip put there
+        if dst.exists():
+            shutil.rmtree(str(dst))
+        # Restore our backup
+        shutil.copytree(str(backup_path), str(dst))
+        print(f"      Restored {name}/")
+
+    # Cleanup backup dir
+    backup_root = APP_DIR / "_update_backup"
+    if backup_root.exists():
+        shutil.rmtree(str(backup_root))
+
+
 # ─── Update steps ────────────────────────────────────────────
 
 def check_git() -> str | None:
@@ -140,8 +181,12 @@ def check_git() -> str | None:
 
 
 def git_pull() -> bool:
-    """Pull latest changes from GitHub using git."""
+    """Pull latest changes from GitHub using git.
+    Protects memory/ and config/ from being overwritten."""
     try:
+        # Backup protected dirs before pulling
+        backups = _backup_protected()
+
         # Check if the repo is a git repo
         git_dir = REPO_DIR / ".git"
         if not git_dir.exists():
@@ -158,10 +203,13 @@ def git_pull() -> bool:
                 ["git", "fetch", "origin"],
                 cwd=str(REPO_DIR), capture_output=True, timeout=30
             )
+            # Force checkout but we already backed up protected dirs
             subprocess.run(
-                ["git", "reset", "--hard", "origin/main"],
+                ["git", "checkout", "-b", "main", "origin/main"],
                 cwd=str(REPO_DIR), capture_output=True, timeout=10
             )
+            # Restore protected dirs
+            _restore_protected(backups)
             _ok("Initialized and fetched")
             return True
 
@@ -178,7 +226,11 @@ def git_pull() -> bool:
             capture_output=True, text=True, timeout=60
         )
 
-        # Restore stashed changes (if any)
+        # Restore protected dirs (overwrite whatever git put there)
+        _restore_protected(backups)
+
+        # Don't restore stash for memory/config (we already have our backup)
+        # Only restore stash for other files like code changes user made
         stash_result = subprocess.run(
             ["git", "stash", "pop"],
             cwd=str(REPO_DIR), capture_output=True, timeout=10
@@ -190,7 +242,7 @@ def git_pull() -> bool:
                 _ok("Already up to date")
                 return False  # No changes
             else:
-                _ok("Updated successfully")
+                _ok("Updated successfully (memory/ and config/ preserved)")
                 return True  # Changes were pulled
         else:
             _warn(f"git pull failed: {result.stderr.strip()[:100]}")
@@ -205,8 +257,13 @@ def git_pull() -> bool:
 
 
 def download_zip_update() -> bool:
-    """Fallback: download ZIP from GitHub and extract."""
+    """Fallback: download ZIP from GitHub and extract.
+    Protects memory/ and config/ from being overwritten."""
     print("\n      Downloading latest version from GitHub...")
+
+    # Backup protected dirs before any file operations
+    backups = _backup_protected()
+
     try:
         req = urllib.request.Request(GITHUB_ZIP, headers={
             "User-Agent": "Jarvis-Updater/1.0"
@@ -224,35 +281,31 @@ def download_zip_update() -> bool:
         extracted = list(extract_dir.iterdir())
         if extracted:
             src = extracted[0]
-            # Copy over the existing files (preserve config and memory)
+            # Copy over the existing files, SKIPPING protected dirs entirely
             for item in src.iterdir():
                 dst = REPO_DIR / item.name
-                # Preserve user data
-                if item.name in ("config", "memory"):
-                    # Only copy new/changed files, don't overwrite user data
-                    if item.is_dir():
-                        for sub in item.rglob("*"):
-                            if sub.is_file():
-                                rel = sub.relative_to(item)
-                                target = dst / rel
-                                if not target.exists():
-                                    target.parent.mkdir(parents=True, exist_ok=True)
-                                    shutil.copy2(str(sub), str(target))
-                else:
-                    # Overwrite everything else
-                    if dst.exists():
-                        if dst.is_dir():
-                            shutil.rmtree(str(dst))
-                        else:
-                            dst.unlink()
-                    shutil.move(str(item), str(dst))
+                # NEVER touch memory/ and config/
+                if item.name in _PROTECTED_DIRS:
+                    continue  # Skip completely
+                # Overwrite everything else
+                if dst.exists():
+                    if dst.is_dir():
+                        shutil.rmtree(str(dst))
+                    else:
+                        dst.unlink()
+                shutil.move(str(item), str(dst))
 
             shutil.rmtree(str(extract_dir), ignore_errors=True)
 
-        _ok("Downloaded and updated")
+        # Restore protected dirs (in case git/zip overwrote them)
+        _restore_protected(backups)
+
+        _ok("Downloaded and updated (memory/ and config/ preserved)")
         return True
 
     except Exception as e:
+        # Restore even on failure
+        _restore_protected(backups)
         _fail(f"Download failed: {e}")
         return False
 
