@@ -20,4 +20,5 @@ win10toast
 send2trash
 youtube-transcript-api
 pywinauto
-pyaudio
+# pyaudio removed - requires portaudio.h C library to compile
+# sounddevice handles audio input/output without compilation

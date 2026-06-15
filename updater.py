@@ -311,33 +311,55 @@ def download_zip_update() -> bool:
 
 
 def update_deps() -> bool:
-    """Update pip dependencies if requirements.txt changed."""
+    """Update pip dependencies if requirements.txt changed.
+    Installs packages one by one so one failure doesn't block others."""
     if not REQUIREMENTS.exists() or not VENV_PYTHON.exists():
         _warn("Cannot update deps (missing requirements or venv)")
         return False
 
-    print("\n      Checking dependencies...")
+    # Read packages, skip comments and blank lines
     try:
-        process = subprocess.Popen(
-            [str(VENV_PYTHON), "-m", "pip", "install", "-r", str(REQUIREMENTS), "--quiet", "--upgrade"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        for line in process.stdout:
-            line = line.strip()
-            if line and "already satisfied" not in line.lower():
-                print(f"        {line}")
+        content = REQUIREMENTS.read_text(encoding="utf-8")
+    except Exception:
+        content = REQUIREMENTS.read_text()
 
-        process.wait()
-        if process.returncode == 0:
-            _ok("Dependencies up to date")
-            return True
-        _warn("Some dependencies failed to update")
+    packages = []
+    for line in content.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            packages.append(line)
+
+    if not packages:
+        _ok("No packages to update")
         return True
-    except Exception as e:
-        _fail(str(e))
-        return False
+
+    print(f"\n      Checking {len(packages)} dependencies...")
+
+    failed = []
+    succeeded = 0
+
+    for pkg in packages:
+        pkg_name = pkg.split("==")[0].split(">=")[0].split("<=")[0].split("[")[0].strip()
+        try:
+            result = subprocess.run(
+                [str(VENV_PYTHON), "-m", "pip", "install", pkg, "--quiet", "--upgrade"],
+                capture_output=True, text=True, timeout=300
+            )
+            if result.returncode == 0:
+                succeeded += 1
+            else:
+                failed.append(pkg_name)
+        except Exception:
+            failed.append(pkg_name)
+
+    if not failed:
+        _ok(f"All {succeeded} dependencies up to date")
+    elif succeeded > 0:
+        _warn(f"{succeeded} OK, {len(failed)} failed: {', '.join(failed)}")
+    else:
+        _fail("All dependencies failed to update")
+
+    return True
 
 
 def restart_jarvis() -> None:

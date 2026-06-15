@@ -352,34 +352,70 @@ def _bootstrap_pip() -> None:
 
 
 def install_deps() -> bool:
-    """Install pip dependencies from requirements.txt."""
+    """Install pip dependencies from requirements.txt.
+    Installs packages one by one so one failure doesn't block others."""
     if not REQUIREMENTS.exists():
         _fail(f"requirements.txt not found at {REQUIREMENTS}")
         return False
 
-    print(f"      Installing from {REQUIREMENTS.name}...")
+    # Read packages, skip comments and blank lines
     try:
-        process = subprocess.Popen(
-            [str(VENV_PYTHON), "-m", "pip", "install", "-r", str(REQUIREMENTS), "--quiet"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        # Show live output
-        for line in process.stdout:
-            line = line.strip()
-            if line and "already satisfied" not in line.lower():
-                print(f"        {line}")
+        content = REQUIREMENTS.read_text(encoding="utf-8")
+    except Exception:
+        content = REQUIREMENTS.read_text()
 
-        process.wait()
-        if process.returncode == 0:
-            _ok("All dependencies installed")
-            return True
-        _fail("Some dependencies failed to install")
-        return True  # Continue anyway — some deps are optional
-    except Exception as e:
-        _fail(str(e))
+    packages = []
+    for line in content.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            packages.append(line)
+
+    if not packages:
+        _warn("No packages found in requirements.txt")
         return False
+
+    print(f"      Installing {len(packages)} packages...")
+
+    failed = []
+    succeeded = 0
+
+    for pkg in packages:
+        pkg_name = pkg.split("==")[0].split(">=")[0].split("<=")[0].split("[")[0].strip()
+        print(f"        Installing {pkg_name}...", end=" ", flush=True)
+        try:
+            result = subprocess.run(
+                [str(VENV_PYTHON), "-m", "pip", "install", pkg, "--quiet"],
+                capture_output=True, text=True, timeout=300
+            )
+            if result.returncode == 0:
+                print(_green("OK"))
+                succeeded += 1
+            else:
+                err = result.stderr.strip()
+                # Check if it's already installed (not really a failure)
+                if "already satisfied" in (result.stdout or "").lower():
+                    print(_green("OK (already installed)"))
+                    succeeded += 1
+                else:
+                    print(_red("FAILED"))
+                    if err:
+                        print(f"          {err[:120]}")
+                    failed.append(pkg_name)
+        except subprocess.TimeoutExpired:
+            print(_red("TIMEOUT"))
+            failed.append(pkg_name)
+        except Exception as e:
+            print(_red("ERROR"))
+            failed.append(pkg_name)
+
+    if not failed:
+        _ok(f"All {succeeded} dependencies installed")
+    elif succeeded > 0:
+        _warn(f"{succeeded} installed, {len(failed)} failed: {', '.join(failed)}")
+    else:
+        _fail("All dependencies failed to install")
+
+    return True  # Continue anyway — some deps are optional
 
 
 def create_shortcut() -> bool:
