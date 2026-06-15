@@ -34,6 +34,7 @@ APP_NAME     = "Jarvis"
 GITHUB_REPO  = "https://github.com/Minher0/Mark-XXXIX-OR.git"
 GITHUB_ZIP   = "https://github.com/Minher0/Mark-XXXIX-OR/archive/refs/heads/main.zip"
 MIN_PYTHON   = (3, 10)
+MAX_PYTHON   = (3, 13)  # Python 3.14+ is pre-release / no PyQt6 wheels yet
 
 LOCAL_APP    = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
 APP_DIR      = LOCAL_APP / APP_NAME
@@ -89,24 +90,42 @@ def _is_frozen() -> bool:
     return getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS')
 
 
+def _parse_python_version(version_str: str) -> tuple[int, int, int, bool]:
+    """Parse a Python version string like 'Python 3.11.9' or 'Python 3.14.0a4'.
+    Returns (major, minor, patch, is_prerelease)."""
+    version_str = version_str.replace("Python", "").strip()
+    is_prerelease = any(c in version_str for c in "abcrc")  # alpha/beta/rc
+    # Remove prerelease suffix for parsing
+    for suffix in "abcrc":
+        if suffix in version_str:
+            version_str = version_str.split(suffix)[0].rstrip(".")
+            break
+    parts = version_str.split(".")
+    try:
+        major = int(parts[0]) if len(parts) > 0 else 0
+        minor = int(parts[1]) if len(parts) > 1 else 0
+        patch = int(parts[2]) if len(parts) > 2 else 0
+    except ValueError:
+        return (0, 0, 0, True)
+    return (major, minor, patch, is_prerelease)
+
+
 def _find_system_python() -> str | None:
-    """Find the real system Python (not the PyInstaller exe)."""
+    """Find the real system Python (not the PyInstaller exe).
+    Prefers stable releases (3.10-3.13) over pre-release versions (3.14+ alpha/beta)."""
     # When frozen, sys.executable points to the .exe, not Python.
     # We need to find the actual Python interpreter on the system.
-    candidates = [
-        # Windows Python Launcher (most reliable on Windows)
-        "py",
-        # Standard commands
-        "python",
-        "python3",
-    ]
 
-    # Add versioned names for Windows
-    for minor in range(12, 9, -1):  # 3.12 down to 3.10
-        candidates.append(f"python3.{minor}")
+    # Strategy: try versioned names FIRST (most specific), then generic
+    # This ensures we pick a stable version if available
+    candidates = []
+
+    # Versioned names - stable versions first (3.13 down to 3.10)
+    for minor in range(13, 9, -1):
         candidates.append(f"py -3.{minor}")
+        candidates.append(f"python3.{minor}")
 
-    # Also check common install paths on Windows
+    # Common install paths on Windows (specific versions first)
     if os.name == "nt":
         local_app = os.environ.get("LOCALAPPDATA", "")
         program_files = os.environ.get("ProgramFiles", "C:\\Program Files")
@@ -115,10 +134,23 @@ def _find_system_python() -> str | None:
         for base in [local_app, program_files, program_files_x86]:
             if not base:
                 continue
-            for minor in range(12, 9, -1):
+            for minor in range(13, 9, -1):
                 candidates.append(
                     os.path.join(base, f"Programs\\Python\\Python3{minor}\\python.exe")
                 )
+
+    # Generic names (lowest priority - may return any version)
+    candidates.extend([
+        "py",
+        "python",
+        "python3",
+    ])
+
+    # Track the best candidate (stable > prerelease)
+    best_stable = None
+    best_stable_version = (0, 0, 0)
+    best_prerelease = None
+    best_prerelease_version = (0, 0, 0)
 
     for candidate in candidates:
         try:
@@ -130,15 +162,34 @@ def _find_system_python() -> str | None:
             )
             if result.returncode == 0:
                 version_str = result.stdout.strip() or result.stderr.strip()
-                # Parse "Python 3.12.1"
-                parts = version_str.replace("Python", "").strip().split(".")
-                if len(parts) >= 2:
-                    v = (int(parts[0]), int(parts[1]))
-                    if v >= MIN_PYTHON:
-                        return candidate
+                major, minor, patch, is_prerelease = _parse_python_version(version_str)
+                v = (major, minor)
+
+                if v < MIN_PYTHON:
+                    continue  # Too old
+
+                version_tuple = (major, minor, patch)
+
+                if is_prerelease or v > MAX_PYTHON:
+                    # Pre-release or too new — keep as fallback only
+                    if version_tuple > best_prerelease_version:
+                        best_prerelease = candidate
+                        best_prerelease_version = version_tuple
+                else:
+                    # Stable and in range — prefer this
+                    if version_tuple > best_stable_version:
+                        best_stable = candidate
+                        best_stable_version = version_tuple
+
         except Exception:
             continue
 
+    # Prefer stable Python, fall back to pre-release if nothing else
+    if best_stable:
+        return best_stable
+    if best_prerelease:
+        _warn(f"Only Python pre-release found ({best_prerelease_version}). Some packages may not work.")
+        return best_prerelease
     return None
 
 
@@ -590,19 +641,22 @@ def main():
             input("  Press Enter to exit...")
             sys.exit(1)
     # Get the actual Python version from the found python_path
-    if _is_frozen():
-        try:
-            py_cmd = python_path.split() if " " in python_path else [python_path]
-            ver_result = subprocess.run(
-                py_cmd + ["--version"],
-                capture_output=True, text=True, timeout=5
-            )
-            ver_str = ver_result.stdout.strip() if ver_result.returncode == 0 else f"Python ({python_path})"
-        except Exception:
-            ver_str = f"Python ({python_path})"
-        _ok(ver_str)
-    else:
-        _ok(f"Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
+    try:
+        py_cmd = python_path.split() if " " in python_path else [python_path]
+        ver_result = subprocess.run(
+            py_cmd + ["--version"],
+            capture_output=True, text=True, timeout=5
+        )
+        ver_str = ver_result.stdout.strip() if ver_result.returncode == 0 else f"Python ({python_path})"
+    except Exception:
+        ver_str = f"Python ({python_path})"
+    _ok(ver_str)
+
+    # Warn if using a pre-release Python version
+    _, _, _, is_prerelease = _parse_python_version(ver_str)
+    if is_prerelease:
+        _warn("Python pre-release detected! Some packages (PyQt6, etc.) may not have")
+        _warn("compatible wheels and could crash. Consider installing Python 3.10-3.13.")
 
     # Step 2: Check/Install Git
     _step(2, TOTAL_STEPS, "Checking Git...")
