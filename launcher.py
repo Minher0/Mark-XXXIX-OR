@@ -383,7 +383,30 @@ def install_deps() -> bool:
 
 
 def create_shortcut() -> bool:
-    """Create a desktop shortcut for Jarvis."""
+    """Create a desktop shortcut and a start menu entry for Jarvis."""
+    success = False
+
+    # --- 1. Create Jarvis.bat on Desktop (most reliable) ---
+    try:
+        desktop = Path.home() / "Desktop"
+        bat_path = desktop / "Jarvis.bat"
+        bat_content = f'''@echo off
+title JARVIS - AI Assistant
+cd /d "{REPO_DIR}"
+"{VENV_PYTHON}" "{REPO_DIR / "main.py"}"
+if errorlevel 1 (
+    echo.
+    echo Jarvis exited with an error.
+    pause
+)
+'''
+        bat_path.write_text(bat_content, encoding="utf-8")
+        _ok("Desktop shortcut (Jarvis.bat) created")
+        success = True
+    except Exception as e:
+        _warn(f"Could not create Desktop bat: {e}")
+
+    # --- 2. Create .lnk shortcut on Desktop ---
     try:
         desktop = Path.home() / "Desktop"
         shortcut_path = desktop / "Jarvis.lnk"
@@ -396,7 +419,7 @@ $Shortcut.TargetPath = "{VENV_PYTHON}"
 $Shortcut.Arguments = '"{REPO_DIR / "main.py"}"'
 $Shortcut.WorkingDirectory = "{REPO_DIR}"
 $Shortcut.IconLocation = "{REPO_DIR / "Jarvis-logo.ico"},0"
-$Shortcut.Description = "JARVIS — AI Assistant"
+$Shortcut.Description = "JARVIS - AI Assistant"
 $Shortcut.Save()
 '''
         subprocess.run(
@@ -404,12 +427,37 @@ $Shortcut.Save()
             capture_output=True, timeout=10
         )
         if shortcut_path.exists():
-            _ok("Desktop shortcut created")
-            return True
+            if not success:
+                _ok("Desktop shortcut created")
+            success = True
     except Exception:
         pass
 
-    _warn("Could not create desktop shortcut (non-critical)")
+    # --- 3. Create Start Menu shortcut ---
+    try:
+        start_menu = Path.home() / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+        start_menu.mkdir(parents=True, exist_ok=True)
+        sm_shortcut = start_menu / "Jarvis.lnk"
+
+        ps_script_sm = f'''
+$WshShell = New-Object -ComObject WScript.Shell
+$Shortcut = $WshShell.CreateShortcut("{sm_shortcut}")
+$Shortcut.TargetPath = "{VENV_PYTHON}"
+$Shortcut.Arguments = '"{REPO_DIR / "main.py"}"'
+$Shortcut.WorkingDirectory = "{REPO_DIR}"
+$Shortcut.IconLocation = "{REPO_DIR / "Jarvis-logo.ico"},0"
+$Shortcut.Description = "JARVIS - AI Assistant"
+$Shortcut.Save()
+'''
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script_sm],
+            capture_output=True, timeout=10
+        )
+    except Exception:
+        pass
+
+    if not success:
+        _warn("Could not create desktop shortcut (non-critical)")
     return True
 
 
@@ -438,6 +486,18 @@ def create_config_if_needed() -> bool:
 
 def launch_jarvis() -> None:
     """Launch Jarvis using the venv Python."""
+    if not VENV_PYTHON.exists():
+        print(_red("  Virtual environment not found!"))
+        print(_yellow("  Please run Jarvis.exe to reinstall."))
+        input("\n  Press Enter to exit...")
+        return
+
+    if not (REPO_DIR / "main.py").exists():
+        print(_red("  main.py not found!"))
+        print(_yellow("  Please run Jarvis.exe to reinstall."))
+        input("\n  Press Enter to exit...")
+        return
+
     print()
     print(_bold("  ╔══════════════════════════════════════╗"))
     print(_bold("  ║       JARVIS IS NOW LAUNCHING        ║"))
@@ -446,8 +506,12 @@ def launch_jarvis() -> None:
 
     try:
         os.chdir(str(REPO_DIR))
-        # Use the same console window — don't create a new one
-        subprocess.run([str(VENV_PYTHON), str(REPO_DIR / "main.py")])
+        # Use the same console window
+        result = subprocess.run([str(VENV_PYTHON), str(REPO_DIR / "main.py")])
+        # If Jarvis exits with an error code, keep window open so user can see
+        if result.returncode != 0:
+            print(_red(f"\n  Jarvis exited with error code {result.returncode}"))
+            input("  Press Enter to exit...")
     except KeyboardInterrupt:
         print("\n  Jarvis shutting down...")
     except Exception as e:
