@@ -247,17 +247,25 @@ TOOL_DECLARATIONS = [
     {
         "name": "youtube_video",
         "description": (
-            "Controls YouTube. Use for: playing videos, summarizing a video's content, "
-            "getting video info, or showing trending videos."
+            "Controls YouTube, YouTube Music, and Spotify. "
+            "Use for: playing videos, playing music, summarizing a video's content, "
+            "getting video info, or showing trending videos. "
+            "CRITICAL: Use platform='youtube_music' when the user asks to play MUSIC, "
+            "listen to a song, or anything music-related. "
+            "Use platform='youtube' (default) only for videos. "
+            "Use platform='spotify' when the user explicitly mentions Spotify. "
+            "Examples: 'joue musique X' → platform=youtube_music, 'regarde vidéo X' → platform=youtube, "
+            "'lance sur Spotify X' → platform=spotify."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action": {"type": "STRING", "description": "play | summarize | get_info | trending (default: play)"},
-                "query":  {"type": "STRING", "description": "Search query for play action"},
-                "save":   {"type": "BOOLEAN", "description": "Save summary to Notepad (summarize only)"},
-                "region": {"type": "STRING", "description": "Country code for trending e.g. TR, US"},
-                "url":    {"type": "STRING", "description": "Video URL for get_info action"},
+                "action":   {"type": "STRING", "description": "play | summarize | get_info | trending (default: play)"},
+                "query":    {"type": "STRING", "description": "Search query for play action"},
+                "platform": {"type": "STRING", "description": "youtube | youtube_music | spotify (default: youtube). Use youtube_music for music/songs, youtube for videos, spotify when user mentions Spotify."},
+                "save":     {"type": "BOOLEAN", "description": "Save summary to Notepad (summarize only)"},
+                "region":   {"type": "STRING", "description": "Country code for trending e.g. TR, US"},
+                "url":      {"type": "STRING", "description": "Video URL for get_info action"},
             },
             "required": []
         }

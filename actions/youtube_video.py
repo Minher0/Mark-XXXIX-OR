@@ -258,31 +258,65 @@ def _scrape_trending(region: str = "TR", max_results: int = 8) -> list[dict]:
         print(f"[YouTube] ⚠️ Trending scrape failed: {e}")
         return []
 
+def _to_youtube_music_url(yt_url: str) -> str:
+    """Convert a YouTube URL to a YouTube Music URL.
+    https://www.youtube.com/watch?v=XYZ → https://music.youtube.com/watch?v=XYZ"""
+    # Replace the domain part only, avoid double-replacing
+    return re.sub(r'(https?://)(www\.)?youtube\.com', r'\1music.youtube.com', yt_url)
+
+
 def _handle_play(parameters: dict, player) -> str:
-    query = parameters.get("query", "").strip()
+    query     = parameters.get("query", "").strip()
+    platform  = parameters.get("platform", "youtube").lower().strip()
     if not query:
         return "Please tell me what you'd like to watch, sir."
 
     if player:
-        player.write_log(f"[YouTube] Searching: {query}")
+        player.write_log(f"[YouTube] Searching: {query} (platform: {platform})")
 
-    print(f"[YouTube] 🔍 Scraping first non-Shorts video for: {query}")
+    print(f"[YouTube] 🔍 Scraping first non-Shorts video for: {query} (platform: {platform})")
 
     video_url = _scrape_first_video_url(query)
 
     if video_url:
-        print(f"[YouTube] ▶️ Opening: {video_url}")
-        _open_url(video_url)
-        return f"Playing: {query}"
+        # ── Route to the correct platform ──
+        if platform in ("youtube_music", "music", "ytmusic", "yt_music"):
+            video_url = _to_youtube_music_url(video_url)
+            print(f"[YouTube Music] 🎵 Opening: {video_url}")
+            _open_url(video_url)
+            return f"Playing on YouTube Music: {query}"
+        elif platform == "spotify":
+            # Open Spotify search instead (Spotify app or web)
+            spotify_url = f"https://open.spotify.com/search/{quote_plus(query)}"
+            print(f"[Spotify] 🎵 Opening: {spotify_url}")
+            _open_url(spotify_url)
+            return f"Opened Spotify search for: {query}"
+        else:
+            print(f"[YouTube] ▶️ Opening: {video_url}")
+            _open_url(video_url)
+            return f"Playing on YouTube: {query}"
 
+    # ── Fallback: open search page ──
     print(f"[YouTube] ⚠️ Scrape failed, opening filtered search page")
-    fallback_url = (
-        f"https://www.youtube.com/results"
-        f"?search_query={quote_plus(query)}"
-        f"&sp={_YT_VIDEO_FILTER}"
-    )
-    _open_url(fallback_url)
-    return f"Opened YouTube search for: {query} (manual selection required)"
+    if platform in ("youtube_music", "music", "ytmusic", "yt_music"):
+        fallback_url = (
+            f"https://music.youtube.com/search"
+            f"?q={quote_plus(query)}"
+        )
+        _open_url(fallback_url)
+        return f"Opened YouTube Music search for: {query}"
+    elif platform == "spotify":
+        spotify_url = f"https://open.spotify.com/search/{quote_plus(query)}"
+        _open_url(spotify_url)
+        return f"Opened Spotify search for: {query}"
+    else:
+        fallback_url = (
+            f"https://www.youtube.com/results"
+            f"?search_query={quote_plus(query)}"
+            f"&sp={_YT_VIDEO_FILTER}"
+        )
+        _open_url(fallback_url)
+        return f"Opened YouTube search for: {query} (manual selection required)"
 
 
 def _handle_summarize(parameters: dict, player, speak) -> str:
