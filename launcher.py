@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+"""
+╔══════════════════════════════════════════════════════╗
+║  JARVIS — Mark XXXIX Launcher                       ║
+║  Self-installing executable                          ║
+║                                                      ║
+║  On first run:                                       ║
+║    1. Checks Python 3.10+                            ║
+║    2. Clones the GitHub repo                         ║
+║    3. Creates a virtual environment                  ║
+║    4. Installs all pip dependencies                  ║
+║    5. Creates a desktop shortcut                     ║
+║    6. Launches Jarvis                                ║
+║                                                      ║
+║  On subsequent runs: just launches Jarvis instantly  ║
+╚══════════════════════════════════════════════════════╝
+"""
+
+import os
+import sys
+import subprocess
+import shutil
+import json
+import urllib.request
+import urllib.error
+import zipfile
+import io
+import time
+from pathlib import Path
+
+# ─── Constants ───────────────────────────────────────────────
+
+APP_NAME     = "Jarvis"
+GITHUB_REPO  = "https://github.com/Minher0/Mark-XXXIX-OR.git"
+GITHUB_ZIP   = "https://github.com/Minher0/Mark-XXXIX-OR/archive/refs/heads/main.zip"
+MIN_PYTHON   = (3, 10)
+
+LOCAL_APP    = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+APP_DIR      = LOCAL_APP / APP_NAME
+REPO_DIR     = APP_DIR / "app"
+VENV_DIR     = APP_DIR / "venv"
+CONFIG_DIR   = APP_DIR / "config"
+REQUIREMENTS = REPO_DIR / "requirements.txt"
+
+# Venv Python paths (Windows)
+VENV_PYTHON  = VENV_DIR / "Scripts" / "python.exe"
+VENV_PIP     = VENV_DIR / "Scripts" / "pip.exe"
+
+
+# ─── Console helpers ─────────────────────────────────────────
+
+def _bold(text: str) -> str:
+    return f"\033[1m{text}\033[0m"
+
+def _green(text: str) -> str:
+    return f"\033[92m{text}\033[0m"
+
+def _red(text: str) -> str:
+    return f"\033[91m{text}\033[0m"
+
+def _yellow(text: str) -> str:
+    return f"\033[93m{text}\033[0m"
+
+def _cyan(text: str) -> str:
+    return f"\033[96m{text}\033[0m"
+
+def _step(n: int, total: int, msg: str) -> None:
+    print(f"  {_cyan(f'[{n}/{total}]')} {msg}", end=" ", flush=True)
+
+def _ok(msg: str = "OK") -> None:
+    print(_green(f"✓ {msg}"))
+
+def _fail(msg: str = "FAILED") -> None:
+    print(_red(f"✗ {msg}"))
+
+def _warn(msg: str) -> None:
+    print(_yellow(f"  ⚠ {msg}"))
+
+
+# ─── Checks ──────────────────────────────────────────────────
+
+def is_installed() -> bool:
+    """Check if Jarvis is already set up."""
+    return (REPO_DIR / "main.py").exists() and VENV_PYTHON.exists()
+
+
+def check_python() -> str | None:
+    """Check that Python 3.10+ is available. Returns path or None."""
+    # Try current Python first
+    py_version = sys.version_info[:2]
+    if py_version >= MIN_PYTHON:
+        return sys.executable
+
+    # Try common locations
+    for candidate in ["python", "python3", "py"]:
+        try:
+            result = subprocess.run(
+                [candidate, "--version"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                version_str = result.stdout.strip()
+                # Parse "Python 3.12.1"
+                parts = version_str.replace("Python", "").strip().split(".")
+                if len(parts) >= 2:
+                    v = (int(parts[0]), int(parts[1]))
+                    if v >= MIN_PYTHON:
+                        return candidate
+        except Exception:
+            continue
+
+    return None
+
+
+def check_git() -> str | None:
+    """Check if git is available. Returns path or None."""
+    try:
+        result = subprocess.run(
+            ["git", "--version"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            return "git"
+    except Exception:
+        pass
+    return None
+
+
+# ─── Installation steps ──────────────────────────────────────
+
+def install_git() -> bool:
+    """Try to install git via winget."""
+    print(_yellow("\n  Git is not installed. Attempting to install via winget..."))
+    try:
+        result = subprocess.run(
+            ["winget", "install", "Git.Git", "--accept-source-agreements", "--accept-package-agreements"],
+            capture_output=True, text=True, timeout=300
+        )
+        if result.returncode == 0:
+            _ok("Git installed successfully")
+            return True
+    except Exception as e:
+        _fail(f"Could not install git: {e}")
+    _warn("Please install git manually: https://git-scm.com/download/win")
+    return False
+
+
+def setup_app_dir() -> bool:
+    """Create the application directory structure."""
+    try:
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        REPO_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        return True
+    except Exception as e:
+        _fail(str(e))
+        return False
+
+
+def clone_repo() -> bool:
+    """Clone the GitHub repository. Falls back to ZIP download."""
+    # If main.py already exists, skip
+    if (REPO_DIR / "main.py").exists():
+        _ok("Already cloned")
+        return True
+
+    git = check_git()
+
+    if git:
+        print(f"      Cloning from {GITHUB_REPO}...")
+        try:
+            result = subprocess.run(
+                ["git", "clone", GITHUB_REPO, str(REPO_DIR)],
+                capture_output=True, text=True, timeout=120
+            )
+            if result.returncode == 0:
+                _ok("Repository cloned")
+                return True
+            _warn(f"git clone failed: {result.stderr.strip()[:100]}")
+        except subprocess.TimeoutExpired:
+            _warn("git clone timed out")
+        except Exception as e:
+            _warn(f"git clone error: {e}")
+
+    # Fallback: download ZIP
+    print("      Downloading from GitHub (ZIP)...")
+    try:
+        req = urllib.request.Request(GITHUB_ZIP, headers={
+            "User-Agent": "Jarvis-Launcher/1.0"
+        })
+        with urllib.request.urlopen(req, timeout=60) as response:
+            zip_data = response.read()
+
+        with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
+            # GitHub ZIPs have a root folder like "Mark-XXXIX-OR-main/"
+            extract_dir = APP_DIR / "_temp_extract"
+            zf.extractall(str(extract_dir))
+
+            # Find the extracted folder
+            extracted = list(extract_dir.iterdir())
+            if extracted:
+                src = extracted[0]
+                # Move contents to REPO_DIR
+                if REPO_DIR.exists():
+                    shutil.rmtree(str(REPO_DIR))
+                shutil.move(str(src), str(REPO_DIR))
+                shutil.rmtree(str(extract_dir), ignore_errors=True)
+
+        _ok("Downloaded and extracted")
+        return True
+
+    except Exception as e:
+        _fail(f"Download failed: {e}")
+        return False
+
+
+def create_venv() -> bool:
+    """Create a Python virtual environment."""
+    if VENV_PYTHON.exists():
+        _ok("Already exists")
+        return True
+
+    python_path = check_python()
+    if not python_path:
+        _fail("Python not found!")
+        return False
+
+    print(f"      Creating venv at {VENV_DIR}...")
+    try:
+        result = subprocess.run(
+            [python_path, "-m", "venv", str(VENV_DIR)],
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode == 0 and VENV_PYTHON.exists():
+            _ok("Virtual environment created")
+            return True
+        _fail(result.stderr.strip()[:100] if result.stderr else "Unknown error")
+        return False
+    except Exception as e:
+        _fail(str(e))
+        return False
+
+
+def install_deps() -> bool:
+    """Install pip dependencies from requirements.txt."""
+    if not REQUIREMENTS.exists():
+        _fail(f"requirements.txt not found at {REQUIREMENTS}")
+        return False
+
+    print(f"      Installing from {REQUIREMENTS.name}...")
+    try:
+        process = subprocess.Popen(
+            [str(VENV_PYTHON), "-m", "pip", "install", "-r", str(REQUIREMENTS), "--quiet"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        # Show live output
+        for line in process.stdout:
+            line = line.strip()
+            if line and "already satisfied" not in line.lower():
+                print(f"        {line}")
+
+        process.wait()
+        if process.returncode == 0:
+            _ok("All dependencies installed")
+            return True
+        _fail("Some dependencies failed to install")
+        return True  # Continue anyway — some deps are optional
+    except Exception as e:
+        _fail(str(e))
+        return False
+
+
+def create_shortcut() -> bool:
+    """Create a desktop shortcut for Jarvis."""
+    try:
+        desktop = Path.home() / "Desktop"
+        shortcut_path = desktop / "Jarvis.lnk"
+
+        # Use PowerShell to create a shortcut
+        ps_script = f'''
+$WshShell = New-Object -ComObject WScript.Shell
+$Shortcut = $WshShell.CreateShortcut("{shortcut_path}")
+$Shortcut.TargetPath = "{VENV_PYTHON}"
+$Shortcut.Arguments = '"{REPO_DIR / "main.py"}"'
+$Shortcut.WorkingDirectory = "{REPO_DIR}"
+$Shortcut.IconLocation = "{REPO_DIR / "Jarvis-logo.ico"},0"
+$Shortcut.Description = "JARVIS — AI Assistant"
+$Shortcut.Save()
+'''
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            capture_output=True, timeout=10
+        )
+        if shortcut_path.exists():
+            _ok("Desktop shortcut created")
+            return True
+    except Exception:
+        pass
+
+    _warn("Could not create desktop shortcut (non-critical)")
+    return True
+
+
+def create_config_if_needed() -> bool:
+    """Create default api_keys.json if it doesn't exist."""
+    config_file = REPO_DIR / "config" / "api_keys.json"
+    if config_file.exists():
+        return True
+
+    example = REPO_DIR / "config" / "api_keys.example.json"
+    try:
+        if example.exists():
+            shutil.copy(str(example), str(config_file))
+        else:
+            config_file.write_text(json.dumps({
+                "gemini_api_key": "",
+                "discord_token": ""
+            }, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+    return True
+
+
+# ─── Launch ──────────────────────────────────────────────────
+
+def launch_jarvis() -> None:
+    """Launch Jarvis using the venv Python."""
+    print()
+    print(_bold("  ╔══════════════════════════════════════╗"))
+    print(_bold("  ║       JARVIS IS NOW LAUNCHING        ║"))
+    print(_bold("  ╚══════════════════════════════════════╝"))
+    print()
+
+    try:
+        os.chdir(str(REPO_DIR))
+        # Use the same console window — don't create a new one
+        subprocess.run([str(VENV_PYTHON), str(REPO_DIR / "main.py")])
+    except KeyboardInterrupt:
+        print("\n  Jarvis shutting down...")
+    except Exception as e:
+        print(_red(f"\n  Error launching Jarvis: {e}"))
+        input("\n  Press Enter to exit...")
+
+
+# ─── Main ────────────────────────────────────────────────────
+
+def main():
+    print()
+    print(_bold("  ╔════════════════════════════════════════════════╗"))
+    print(_bold("  ║   JARVIS — Mark XXXIX OR   ·   Launcher       ║"))
+    print(_bold("  ╚════════════════════════════════════════════════╝"))
+    print()
+
+    # ── Fast path: already installed ──
+    if is_installed():
+        print(_green("  ✓ Jarvis is installed. Launching..."))
+        launch_jarvis()
+        return
+
+    # ── Slow path: first-time setup ──
+    print(_bold("  First-time setup detected. Installing Jarvis...\n"))
+
+    TOTAL_STEPS = 7
+
+    # Step 1: Check Python
+    _step(1, TOTAL_STEPS, "Checking Python...")
+    python_path = check_python()
+    if not python_path:
+        _fail("Python 3.10+ not found!")
+        print(_yellow("\n  Please install Python 3.10 or later:"))
+        print(_cyan("    https://www.python.org/downloads/"))
+        print(_yellow("  Make sure to check 'Add Python to PATH' during installation."))
+        input("\n  Press Enter after installing Python to retry...")
+        python_path = check_python()
+        if not python_path:
+            print(_red("  Python still not found. Cannot continue."))
+            input("  Press Enter to exit...")
+            sys.exit(1)
+    _ok(f"Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
+
+    # Step 2: Check/Install Git
+    _step(2, TOTAL_STEPS, "Checking Git...")
+    git = check_git()
+    if git:
+        _ok("Git available")
+    else:
+        _warn("Git not found")
+        if not install_git():
+            print(_yellow("  Will use ZIP download instead (no auto-updates)."))
+        else:
+            _ok("Git installed")
+
+    # Step 3: Setup directories
+    _step(3, TOTAL_STEPS, "Creating directories...")
+    if not setup_app_dir():
+        print(_red("  Cannot create application directory. Check permissions."))
+        input("  Press Enter to exit...")
+        sys.exit(1)
+    _ok()
+
+    # Step 4: Clone repo
+    _step(4, TOTAL_STEPS, "Downloading Jarvis...")
+    if not clone_repo():
+        print(_red("  Cannot download Jarvis. Check your internet connection."))
+        input("  Press Enter to exit...")
+        sys.exit(1)
+
+    # Step 5: Create venv
+    _step(5, TOTAL_STEPS, "Creating virtual environment...")
+    if not create_venv():
+        print(_red("  Cannot create virtual environment."))
+        input("  Press Enter to exit...")
+        sys.exit(1)
+
+    # Step 6: Install dependencies
+    _step(6, TOTAL_STEPS, "Installing dependencies (this may take a minute)...")
+    install_deps()
+
+    # Step 7: Create shortcut & config
+    _step(7, TOTAL_STEPS, "Finishing setup...")
+    create_config_if_needed()
+    create_shortcut()
+    _ok()
+
+    print()
+    print(_green(_bold("  ╔══════════════════════════════════════╗")))
+    print(_green(_bold("  ║     JARVIS INSTALLED SUCCESSFULLY    ║")))
+    print(_green(_bold("  ╚══════════════════════════════════════╝")))
+    print()
+    print(f"  App location:  {_cyan(str(REPO_DIR))}")
+    print(f"  Config:        {_cyan(str(REPO_DIR / 'config' / 'api_keys.json'))}")
+    print(f"  Venv:          {_cyan(str(VENV_DIR))}")
+    print()
+    print(_yellow("  Tip: Run Updater.exe to check for updates."))
+    print(_yellow("  Tip: You can edit files directly in the app folder."))
+    print()
+
+    time.sleep(2)
+    launch_jarvis()
+
+
+if __name__ == "__main__":
+    main()
