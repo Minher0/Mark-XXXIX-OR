@@ -386,69 +386,101 @@ def _open_memory() -> str:
         return f"Failed to open memory file: {e}"
 
 
+def _is_python_package(name: str) -> bool:
+    """Heuristic to detect if the user wants a Python package (pip install)."""
+    python_hints = {
+        "pip", "python", "py-", "py3", "django", "flask", "fastapi", "requests",
+        "numpy", "pandas", "scipy", "matplotlib", "scikit-learn", "sklearn",
+        "tensorflow", "pytorch", "torch", "keras", "beautifulsoup4", "bs4",
+        "selenium", "playwright", "pillow", "opencv-python", "pyautogui",
+        "flask-cors", "sqlalchemy", "alembic", "pytest", "black", "pylint",
+        "mypy", "isort", "rich", "click", "typer", "httpx", "aiohttp",
+        "pydantic", "uvicorn", "gunicorn", "celery", "redis", "mongoengine",
+    }
+    lower = name.lower().strip()
+    if lower in python_hints:
+        return True
+    # Common patterns: package names with hyphens that look like PyPI packages
+    if lower.startswith("py") and len(lower) > 3:
+        return True
+    return False
+
+
 def _install_app(app_name: str) -> str:
-    """Install an application using winget (Windows), brew (macOS), or apt (Linux)."""
+    """Install an application using winget (Windows), pip, brew (macOS), or apt (Linux).
+    NEVER opens the Microsoft Store — uses only CLI package managers."""
     os_name = _get_os()
 
     if os_name == "windows":
-        # ── PRIMARY: winget install ──
-        try:
-            check = subprocess.run(
-                ["winget", "--version"],
-                capture_output=True, text=True, timeout=5
-            )
-            if check.returncode == 0:
-                # Search first to find the exact ID
-                search = subprocess.run(
-                    ["winget", "search", app_name, "--accept-source-agreements"],
-                    capture_output=True, text=True, timeout=30
+        # ── 1. pip install (for Python packages) ──
+        if _is_python_package(app_name):
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", app_name],
+                    capture_output=True, text=True, timeout=120
                 )
-                if search.returncode == 0 and search.stdout.strip():
-                    # Try to extract the best match ID from search results
-                    lines = search.stdout.strip().splitlines()
-                    best_id = None
-                    for line in lines[2:]:  # Skip header lines
-                        if app_name.lower() in line.lower():
-                            parts = line.split()
-                            if len(parts) >= 2:
-                                best_id = parts[1]  # Second column is usually the ID
-                                break
+                if result.returncode == 0:
+                    return f"Installed Python package '{app_name}' via pip."
+                # If pip failed, fall through to winget
+                print(f"[CmdControl] pip install failed for '{app_name}', trying winget: {result.stderr.strip()[:100]}")
+            except Exception as e:
+                print(f"[CmdControl] pip install error: {e}")
 
-                    if best_id:
-                        result = subprocess.run(
-                            ["winget", "install", "--id", best_id, "--accept-source-agreements", "--accept-package-agreements"],
-                            capture_output=True, text=True, timeout=300
-                        )
-                        if result.returncode == 0:
-                            return f"Installed '{app_name}' (ID: {best_id})."
-                        return f"Install attempted for '{app_name}': {result.stdout.strip()[-200:]}"
+        # ── 2. winget install (PRIMARY for Windows apps) ──
+        try:
+            # Try direct install by name first (fastest, avoids search issues)
+            result = subprocess.run(
+                ["winget", "install", "--name", app_name, "--accept-source-agreements", "--accept-package-agreements"],
+                capture_output=True, text=True, timeout=300
+            )
+            if result.returncode == 0:
+                return f"Installed '{app_name}' via winget."
 
-                    # Fallback: install by name
-                    result = subprocess.run(
-                        ["winget", "install", "--name", app_name, "--accept-source-agreements", "--accept-package-agreements"],
+            # If direct name install failed, try search + install by ID
+            search = subprocess.run(
+                ["winget", "search", app_name, "--accept-source-agreements"],
+                capture_output=True, text=True, timeout=30
+            )
+            if search.returncode == 0 and search.stdout.strip():
+                lines = search.stdout.strip().splitlines()
+                best_id = None
+                for line in lines[2:]:  # Skip header lines
+                    if app_name.lower() in line.lower():
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            best_id = parts[1]  # Second column is usually the ID
+                            break
+
+                if best_id:
+                    result2 = subprocess.run(
+                        ["winget", "install", "--id", best_id, "--accept-source-agreements", "--accept-package-agreements"],
                         capture_output=True, text=True, timeout=300
                     )
-                    if result.returncode == 0:
-                        return f"Installed '{app_name}'."
-                    return f"Install result: {result.stdout.strip()[-200:]}"
-                else:
-                    return f"'{app_name}' not found in winget search results."
-            else:
-                print("[CmdControl] winget not available")
-        except subprocess.TimeoutExpired:
-            return f"Installation timed out for '{app_name}'. It may need manual confirmation."
-        except Exception as e:
-            print(f"[CmdControl] winget install error: {e}")
+                    if result2.returncode == 0:
+                        return f"Installed '{app_name}' (ID: {best_id}) via winget."
+                    output = result2.stdout.strip()[-200:] or result2.stderr.strip()[-200:]
+                    return f"Winget install result for '{app_name}': {output}"
 
-        # Fallback: open Microsoft Store
-        try:
-            subprocess.Popen(
-                f'start ms-windows-store://search/?query={app_name}',
-                shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            return f"Opened Microsoft Store search for '{app_name}'."
-        except Exception:
-            return f"Could not install '{app_name}'. Try manually."
+            # If winget search found nothing, try pip as last resort
+            if not _is_python_package(app_name):
+                try:
+                    result = subprocess.run(
+                        [sys.executable, "-m", "pip", "install", app_name],
+                        capture_output=True, text=True, timeout=120
+                    )
+                    if result.returncode == 0:
+                        return f"Installed '{app_name}' via pip (not found in winget)."
+                except Exception:
+                    pass
+
+            return f"Could not find '{app_name}' in winget or pip. Try: winget install \"{app_name}\""
+
+        except subprocess.TimeoutExpired:
+            return f"Installation timed out for '{app_name}'. It may need manual confirmation via 'winget install {app_name}'."
+        except FileNotFoundError:
+            return f"winget is not available on this system. Try installing it via: https://github.com/microsoft/winget-cli"
+        except Exception as e:
+            return f"Installation error for '{app_name}': {e}"
 
     elif os_name == "darwin":
         # macOS: try brew first
