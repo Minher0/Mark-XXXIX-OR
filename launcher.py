@@ -84,22 +84,52 @@ def is_installed() -> bool:
     return (REPO_DIR / "main.py").exists() and VENV_PYTHON.exists()
 
 
-def check_python() -> str | None:
-    """Check that Python 3.10+ is available. Returns path or None."""
-    # Try current Python first
-    py_version = sys.version_info[:2]
-    if py_version >= MIN_PYTHON:
-        return sys.executable
+def _is_frozen() -> bool:
+    """Check if running as a PyInstaller executable."""
+    return getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS')
 
-    # Try common locations
-    for candidate in ["python", "python3", "py"]:
+
+def _find_system_python() -> str | None:
+    """Find the real system Python (not the PyInstaller exe)."""
+    # When frozen, sys.executable points to the .exe, not Python.
+    # We need to find the actual Python interpreter on the system.
+    candidates = [
+        # Windows Python Launcher (most reliable on Windows)
+        "py",
+        # Standard commands
+        "python",
+        "python3",
+    ]
+
+    # Add versioned names for Windows
+    for minor in range(12, 9, -1):  # 3.12 down to 3.10
+        candidates.append(f"python3.{minor}")
+        candidates.append(f"py -3.{minor}")
+
+    # Also check common install paths on Windows
+    if os.name == "nt":
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        program_files = os.environ.get("ProgramFiles", "C:\\Program Files")
+        program_files_x86 = os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")
+
+        for base in [local_app, program_files, program_files_x86]:
+            if not base:
+                continue
+            for minor in range(12, 9, -1):
+                candidates.append(
+                    os.path.join(base, f"Programs\\Python\\Python3{minor}\\python.exe")
+                )
+
+    for candidate in candidates:
         try:
+            # Handle "py -3.12" style candidates
+            cmd = candidate.split() if " " in candidate else [candidate]
             result = subprocess.run(
-                [candidate, "--version"],
+                cmd + ["--version"],
                 capture_output=True, text=True, timeout=5
             )
             if result.returncode == 0:
-                version_str = result.stdout.strip()
+                version_str = result.stdout.strip() or result.stderr.strip()
                 # Parse "Python 3.12.1"
                 parts = version_str.replace("Python", "").strip().split(".")
                 if len(parts) >= 2:
@@ -110,6 +140,21 @@ def check_python() -> str | None:
             continue
 
     return None
+
+
+def check_python() -> str | None:
+    """Check that Python 3.10+ is available. Returns path or None."""
+    # If running as PyInstaller .exe, NEVER use sys.executable
+    if _is_frozen():
+        return _find_system_python()
+
+    # Try current Python first (only if NOT frozen)
+    py_version = sys.version_info[:2]
+    if py_version >= MIN_PYTHON:
+        return sys.executable
+
+    # Fallback to searching the system
+    return _find_system_python()
 
 
 def check_git() -> str | None:
@@ -225,20 +270,85 @@ def create_venv() -> bool:
         _fail("Python not found!")
         return False
 
+    # Build the command list for running Python
+    # "py -3.11" needs to be split, full paths can be used directly
+    if " " in python_path and not os.path.isfile(python_path):
+        # Likely a multi-part command like "py -3.11"
+        py_cmd = python_path.split()
+    else:
+        py_cmd = [python_path]
+
     print(f"      Creating venv at {VENV_DIR}...")
+    print(f"      Using Python: {python_path}")
+
+    # Try creating venv with ensurepip first
     try:
         result = subprocess.run(
-            [python_path, "-m", "venv", str(VENV_DIR)],
-            capture_output=True, text=True, timeout=60
+            py_cmd + ["-m", "venv", str(VENV_DIR)],
+            capture_output=True, text=True, timeout=120
         )
         if result.returncode == 0 and VENV_PYTHON.exists():
             _ok("Virtual environment created")
             return True
-        _fail(result.stderr.strip()[:100] if result.stderr else "Unknown error")
+
+        # Show the actual error for debugging
+        err_msg = result.stderr.strip() if result.stderr else ""
+        out_msg = result.stdout.strip() if result.stdout else ""
+        _warn(f"venv creation failed: {(err_msg or out_msg)[:200]}")
+    except subprocess.TimeoutExpired:
+        _warn("venv creation timed out")
+    except Exception as e:
+        _warn(f"venv error: {e}")
+
+    # Fallback: try with --without-pip (pip will be bootstrapped later)
+    _warn("Retrying without pip (will bootstrap pip separately)...")
+    try:
+        # Clean up partial venv first
+        if VENV_DIR.exists():
+            shutil.rmtree(str(VENV_DIR), ignore_errors=True)
+
+        result = subprocess.run(
+            py_cmd + ["-m", "venv", "--without-pip", str(VENV_DIR)],
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode == 0 and VENV_PYTHON.exists():
+            _ok("Virtual environment created (without pip)")
+            # Bootstrap pip manually using get-pip.py
+            _bootstrap_pip()
+            return True
+
+        err_msg = result.stderr.strip() if result.stderr else ""
+        _fail(f"Cannot create venv: {(err_msg)[:200]}")
         return False
     except Exception as e:
         _fail(str(e))
         return False
+
+
+def _bootstrap_pip() -> None:
+    """Bootstrap pip in the virtual environment using get-pip.py."""
+    print("      Bootstrapping pip...")
+    try:
+        # Download get-pip.py
+        get_pip_url = "https://bootstrap.pypa.io/get-pip.py"
+        get_pip_path = VENV_DIR / "get-pip.py"
+        urllib.request.urlretrieve(get_pip_url, str(get_pip_path))
+
+        # Run get-pip.py in the venv
+        result = subprocess.run(
+            [str(VENV_PYTHON), str(get_pip_path)],
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode == 0:
+            _ok("pip bootstrapped successfully")
+        else:
+            _warn("pip bootstrap failed, will retry during dependency install")
+
+        # Clean up
+        if get_pip_path.exists():
+            get_pip_path.unlink()
+    except Exception as e:
+        _warn(f"pip bootstrap error: {e}")
 
 
 def install_deps() -> bool:
@@ -379,7 +489,20 @@ def main():
             print(_red("  Python still not found. Cannot continue."))
             input("  Press Enter to exit...")
             sys.exit(1)
-    _ok(f"Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
+    # Get the actual Python version from the found python_path
+    if _is_frozen():
+        try:
+            py_cmd = python_path.split() if " " in python_path else [python_path]
+            ver_result = subprocess.run(
+                py_cmd + ["--version"],
+                capture_output=True, text=True, timeout=5
+            )
+            ver_str = ver_result.stdout.strip() if ver_result.returncode == 0 else f"Python ({python_path})"
+        except Exception:
+            ver_str = f"Python ({python_path})"
+        _ok(ver_str)
+    else:
+        _ok(f"Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
 
     # Step 2: Check/Install Git
     _step(2, TOTAL_STEPS, "Checking Git...")
