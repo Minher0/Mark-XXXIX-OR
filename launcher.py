@@ -549,20 +549,34 @@ $Shortcut.Save()
 
 
 def create_config_if_needed() -> bool:
-    """Create default api_keys.json if it doesn't exist."""
+    """Create default api_keys.json with EMPTY values.
+    Never copies from example file — users must enter their own keys."""
     config_file = REPO_DIR / "config" / "api_keys.json"
     if config_file.exists():
+        # If it has placeholder text, wipe it clean
+        try:
+            data = json.loads(config_file.read_text(encoding="utf-8"))
+            needs_wipe = False
+            for key in ["gemini_api_key", "openrouter_api_key", "discord_token"]:
+                val = data.get(key, "")
+                if val and any(p in val.lower() for p in ["your_", "xxx", "placeholder", "example", "here"]):
+                    data[key] = ""
+                    needs_wipe = True
+            if needs_wipe:
+                config_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
         return True
 
-    example = REPO_DIR / "config" / "api_keys.example.json"
+    # Create with empty values — NEVER copy from example
     try:
-        if example.exists():
-            shutil.copy(str(example), str(config_file))
-        else:
-            config_file.write_text(json.dumps({
-                "gemini_api_key": "",
-                "discord_token": ""
-            }, indent=2), encoding="utf-8")
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text(json.dumps({
+            "gemini_api_key": "",
+            "openrouter_api_key": "",
+            "discord_token": "",
+            "os_system": ""
+        }, indent=2), encoding="utf-8")
     except Exception:
         pass
 

@@ -855,6 +855,19 @@ class _DropCanvas(QWidget):
             z.mousePressEvent(e)
 
 
+def _is_placeholder(value: str) -> bool:
+    """Check if a value looks like a placeholder/example text, not a real API key."""
+    if not value:
+        return True
+    v = value.strip().lower()
+    placeholders = [
+        "your_", "xxx", "placeholder", "example", "here",
+        "insert_", "put_", "replace_", "change_",
+        "api_key", "token_here", "key_here",
+    ]
+    return any(p in v for p in placeholders)
+
+
 class SetupOverlay(QWidget):
     done = pyqtSignal(str, str, str, str)
 
@@ -910,11 +923,12 @@ class SetupOverlay(QWidget):
             QLineEdit:focus {{ border: 1px solid {C.PRI}; }}
         """)
         layout.addWidget(self._key_input)
-        # Pre-fill existing Gemini key
+        # Pre-fill existing Gemini key (but NOT placeholder text)
         try:
             _existing = json.loads(API_FILE.read_text(encoding="utf-8"))
-            if _existing.get("gemini_api_key"):
-                self._key_input.setText(_existing["gemini_api_key"])
+            val = _existing.get("gemini_api_key", "")
+            if val and not _is_placeholder(val):
+                self._key_input.setText(val)
         except Exception:
             pass
         layout.addSpacing(8)
@@ -934,11 +948,12 @@ class SetupOverlay(QWidget):
             QLineEdit:focus {{ border: 1px solid {C.ACC2}; }}
         """)
         layout.addWidget(self._or_input)
-        # Pre-fill existing OpenRouter key
+        # Pre-fill existing OpenRouter key (but NOT placeholder text)
         try:
             _existing = json.loads(API_FILE.read_text(encoding="utf-8"))
-            if _existing.get("openrouter_api_key"):
-                self._or_input.setText(_existing["openrouter_api_key"])
+            val = _existing.get("openrouter_api_key", "")
+            if val and not _is_placeholder(val):
+                self._or_input.setText(val)
         except Exception:
             pass
         layout.addSpacing(8)
@@ -958,11 +973,12 @@ class SetupOverlay(QWidget):
             QLineEdit:focus {{ border: 1px solid #5865F2; }}
         """)
         layout.addWidget(self._discord_input)
-        # Pre-fill existing Discord token
+        # Pre-fill existing Discord token (but NOT placeholder text)
         try:
             _existing = json.loads(API_FILE.read_text(encoding="utf-8"))
-            if _existing.get("discord_token"):
-                self._discord_input.setText(_existing["discord_token"])
+            val = _existing.get("discord_token", "")
+            if val and not _is_placeholder(val):
+                self._discord_input.setText(val)
         except Exception:
             pass
 
@@ -1032,18 +1048,39 @@ class SetupOverlay(QWidget):
     def _submit(self):
         key = self._key_input.text().strip()
         or_key = self._or_input.text().strip()
-        if not key:
+
+        # Block placeholder text — user must enter real keys
+        if not key or _is_placeholder(key):
             self._key_input.setStyleSheet(
                 self._key_input.styleSheet() +
-                f" QLineEdit {{ border: 1px solid {C.RED}; }}"
+                f" QLineEdit {{ border: 2px solid {C.RED}; }}"
             )
+            self._key_input.setPlaceholderText("Enter your REAL Gemini API key...")
             return
-        if not or_key:
+        if not or_key or _is_placeholder(or_key):
             self._or_input.setStyleSheet(
                 self._or_input.styleSheet() +
-                f" QLineEdit {{ border: 1px solid {C.RED}; }}"
+                f" QLineEdit {{ border: 2px solid {C.RED}; }}"
             )
+            self._or_input.setPlaceholderText("Enter your REAL OpenRouter key...")
             return
+
+        # Validate key format (Gemini starts with AIza, OpenRouter with sk-or-)
+        if not key.startswith("AIza"):
+            self._key_input.setStyleSheet(
+                self._key_input.styleSheet() +
+                f" QLineEdit {{ border: 2px solid {C.RED}; }}"
+            )
+            self._key_input.setPlaceholderText("Gemini keys start with 'AIza'...")
+            return
+        if not or_key.startswith("sk-or-"):
+            self._or_input.setStyleSheet(
+                self._or_input.styleSheet() +
+                f" QLineEdit {{ border: 2px solid {C.RED}; }}"
+            )
+            self._or_input.setPlaceholderText("OpenRouter keys start with 'sk-or-'...")
+            return
+
         discord_token = self._discord_input.text().strip()
         self.done.emit(key, or_key, self._sel_os, discord_token)
 
