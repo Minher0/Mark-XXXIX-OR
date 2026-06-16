@@ -451,16 +451,20 @@ TOOL_DECLARATIONS = [
         "description": (
             "Smart auto-click that finds and clicks a UI element using multiple strategies automatically. "
             "Tries UI Automation first, then AI vision (screenshot analysis), then browser smart click. "
-            "Supports repeated clicking with intervals. "
-            "Use when user asks to click something by name/description, or to auto-click repeatedly. "
+            "Supports repeated clicking with intervals and SPATIAL POSITIONING. "
+            "When multiple matching elements exist (e.g. 6 videos), use 'position' to specify which one: "
+            "by number (1-9), ordinal (first, second, 3rd), or spatial keyword (top-left, center, bottom-right). "
+            "The AI will find ALL instances, sort them in reading order, and click the one at the requested position. "
+            "Use when user asks to click something by name/description, click a specific item among several, or auto-click repeatedly. "
             "More reliable than computer_control's screen_click or ui_click alone because it chains fallbacks. "
             "For simple coordinate clicks, use computer_control instead."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "target":       {"type": "STRING",  "description": "Name or description of the element to click (e.g. 'Save button', 'Submit', 'Accept cookies')"},
-                "strategy":     {"type": "STRING",  "description": "Click strategy: auto | ui | vision | browser | ui_vision (default: auto). 'auto' tries all in order."},
+                "target":       {"type": "STRING",  "description": "Name or description of the element to click (e.g. 'video', 'Save button', 'Submit', 'Accept cookies')"},
+                "position":     {"type": "STRING",  "description": "Which instance to click when multiple matches exist. Number: '1'-'9'. Ordinal: 'first','second','3rd','4th'. Spatial: 'top-left','top-right','center','bottom-left','bottom-right'. French: 'premier','deuxieme','troisieme','haut-gauche','bas-droite'. Triggers AI vision grid mode."},
+                "strategy":     {"type": "STRING",  "description": "Click strategy: auto | ui | vision | browser | ui_vision | spatial (default: auto). 'auto' tries all in order. 'spatial' forces grid mode."},
                 "click_type":   {"type": "STRING",  "description": "Click type: left | right | double (default: left)"},
                 "element_type": {"type": "STRING",  "description": "Element type filter: button | link | input | checkbox | tab | menu | any (default: any)"},
                 "index":        {"type": "INTEGER", "description": "Index when multiple elements match (default: 0)"},
