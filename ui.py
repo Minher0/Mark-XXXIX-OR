@@ -912,7 +912,7 @@ class SetupOverlay(QWidget):
                                align=Qt.AlignmentFlag.AlignLeft))
         self._key_input = QLineEdit()
         self._key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self._key_input.setPlaceholderText("AIza…")
+        self._key_input.setPlaceholderText("Your Gemini API key...")
         self._key_input.setFont(QFont("Courier New", 10))
         self._key_input.setFixedHeight(32)
         self._key_input.setStyleSheet(f"""
@@ -1065,21 +1065,9 @@ class SetupOverlay(QWidget):
             self._or_input.setPlaceholderText("Enter your REAL OpenRouter key...")
             return
 
-        # Validate key format (Gemini starts with AIza, OpenRouter with sk-or-)
-        if not key.startswith("AIza"):
-            self._key_input.setStyleSheet(
-                self._key_input.styleSheet() +
-                f" QLineEdit {{ border: 2px solid {C.RED}; }}"
-            )
-            self._key_input.setPlaceholderText("Gemini keys start with 'AIza'...")
-            return
-        if not or_key.startswith("sk-or-"):
-            self._or_input.setStyleSheet(
-                self._or_input.styleSheet() +
-                f" QLineEdit {{ border: 2px solid {C.RED}; }}"
-            )
-            self._or_input.setPlaceholderText("OpenRouter keys start with 'sk-or-'...")
-            return
+        # Basic format validation — warn but don't block
+        # Gemini keys typically start with 'AIza', but other formats (OAuth, etc.) also work
+        # OpenRouter keys typically start with 'sk-or-', but format may vary
 
         discord_token = self._discord_input.text().strip()
         self.done.emit(key, or_key, self._sel_os, discord_token)
