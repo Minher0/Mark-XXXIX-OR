@@ -417,11 +417,11 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "computer_control",
-        "description": "Direct computer control: type, click, hotkeys, scroll, move mouse, screenshots, find elements on screen.",
+        "description": "Direct computer control: type, click, hotkeys, scroll, move mouse, screenshots, find and interact with UI elements on screen by name.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "type | smart_type | click | double_click | right_click | hotkey | press | scroll | move | copy | paste | screenshot | wait | clear_field | focus_window | screen_find | screen_click | random_data | user_data"},
+                "action":      {"type": "STRING", "description": "type | smart_type | click | double_click | right_click | hotkey | press | scroll | move | copy | paste | screenshot | wait | clear_field | focus_window | screen_find | screen_click | ui_click | ui_type | ui_find | ui_list | random_data | user_data"},
                 "text":        {"type": "STRING", "description": "Text to type or paste"},
                 "x":           {"type": "INTEGER", "description": "X coordinate"},
                 "y":           {"type": "INTEGER", "description": "Y coordinate"},
@@ -431,7 +431,12 @@ TOOL_DECLARATIONS = [
                 "amount":      {"type": "INTEGER", "description": "Scroll amount (default: 3)"},
                 "seconds":     {"type": "NUMBER",  "description": "Seconds to wait"},
                 "title":       {"type": "STRING",  "description": "Window title for focus_window"},
-                "description": {"type": "STRING",  "description": "Element description for screen_find/screen_click"},
+                "description": {"type": "STRING",  "description": "Element description for screen_find/screen_click, or element name for ui_click/ui_type/ui_find"},
+                "name":        {"type": "STRING",  "description": "UI element name for ui_click, ui_type, ui_find (e.g. 'Save', 'OK', 'Search')"},
+                "element_type":{"type": "STRING",  "description": "UI element type filter: button | input | link | checkbox | tab | menu | combo | any (default: any)"},
+                "click_type":  {"type": "STRING",  "description": "For ui_click: left | right | double (default: left)"},
+                "index":       {"type": "INTEGER", "description": "Index when multiple elements match (default: 0)"},
+                "filter":      {"type": "STRING",  "description": "Text filter for ui_list"},
                 "type":        {"type": "STRING",  "description": "Data type for random_data"},
                 "field":       {"type": "STRING",  "description": "Field for user_data: name|email|city"},
                 "clear_first": {"type": "BOOLEAN", "description": "Clear field before typing (default: true)"},

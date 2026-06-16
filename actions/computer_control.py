@@ -320,6 +320,349 @@ def _screen_find(description: str) -> tuple[int, int] | None:
         print(f"[ComputerControl] ⚠️ screen_find failed: {e}")
     return None
 
+
+# ─── UI Automation (find & click elements by name) ──────────────────
+
+def _ui_find_element(name: str, element_type: str = "any", index: int = 0) -> dict | None:
+    """Find a UI element by name using Windows UI Automation (COM).
+    Returns dict with name, type, x, y, width, height or None."""
+
+    os_name = _get_os()
+
+    if os_name == "windows":
+        return _ui_find_windows(name, element_type, index)
+
+    if os_name == "mac":
+        return _ui_find_mac(name, element_type, index)
+
+    if os_name == "linux":
+        return _ui_find_linux(name, element_type, index)
+
+    return None
+
+
+def _ui_find_windows(name: str, element_type: str, index: int) -> dict | None:
+    """Find UI element on Windows using UI Automation via PowerShell."""
+    try:
+        # Map element types to UI Automation control types
+        type_map = {
+            "button": "Button",
+            "btn": "Button",
+            "link": "Hyperlink",
+            "text": "Text",
+            "input": "Edit",
+            "field": "Edit",
+            "edit": "Edit",
+            "checkbox": "CheckBox",
+            "radio": "RadioButton",
+            "tab": "TabItem",
+            "menu": "MenuItem",
+            "tree": "TreeItem",
+            "list": "ListItem",
+            "combo": "ComboBox",
+            "dropdown": "ComboBox",
+            "any": "",
+        }
+        control_type = type_map.get(element_type.lower(), "")
+
+        # PowerShell script using UI Automation
+        ps_script = '''
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+Add-Type -AssemblyName System.Windows.Forms
+
+$root = [System.Windows.Automation.AutomationElement]::RootElement
+$cond = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::NameProperty, "%s"
+)
+$items = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
+
+if ($items.Count -eq 0) {
+    # Try partial match with Name containing the text
+    $cond2 = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::NameProperty, "%s",
+        [System.Windows.Automation.Condition]::True
+    )
+    $items = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond2)
+}
+
+if ($items.Count -eq 0) {
+    # Try AutomationId match
+    $cond3 = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty, "%s"
+    )
+    $items = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond3)
+}
+
+$idx = %d
+if ($items.Count -gt $idx) {
+    $item = $items[$idx]
+    $rect = $item.Current.BoundingRectangle
+    $cx = [int](($rect.Left + $rect.Right) / 2)
+    $cy = [int](($rect.Top + $rect.Bottom) / 2)
+    $w = [int]($rect.Right - $rect.Left)
+    $h = [int]($rect.Bottom - $rect.Top)
+    Write-Output "FOUND"
+    Write-Output $item.Current.Name
+    Write-Output $item.Current.ControlType.ProgrammaticName
+    Write-Output "$cx"
+    Write-Output "$cy"
+    Write-Output "$w"
+    Write-Output "$h"
+} else {
+    Write-Output "NOT_FOUND"
+    Write-Output $items.Count
+}
+''' % (name, name, name, index)
+
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            capture_output=True, text=True, timeout=15
+        )
+
+        lines = result.stdout.strip().splitlines()
+        if lines and lines[0] == "FOUND" and len(lines) >= 7:
+            return {
+                "name": lines[1],
+                "type": lines[2].replace("ControlType.", ""),
+                "x": int(lines[3]),
+                "y": int(lines[4]),
+                "width": int(lines[5]),
+                "height": int(lines[6]),
+            }
+
+    except subprocess.TimeoutExpired:
+        print("[ComputerControl] UI find timed out")
+    except Exception as e:
+        print(f"[ComputerControl] UI find (Windows) error: {e}")
+
+    return None
+
+
+def _ui_find_mac(name: str, element_type: str, index: int) -> dict | None:
+    """Find UI element on macOS using AppleScript/Accessibility."""
+    try:
+        script = f'''
+tell application "System Events"
+    set frontApp to first process whose frontmost is true
+    set allItems to every UI element of frontApp whose name contains "{name}"
+    if (count of allItems) > {index} then
+        set item to item {index + 1} of allItems
+        set pos to position of item
+        set sz to size of item
+        return "FOUND\\n" & (name of item) & "\\n" & ((item 1 of pos) as text) & "\\n" & ((item 2 of pos) as text) & "\\n" & ((item 1 of sz) as text) & "\\n" & ((item 2 of sz) as text)
+    end if
+end tell
+return "NOT_FOUND"
+'''
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=10
+        )
+        lines = result.stdout.strip().splitlines()
+        if lines and lines[0] == "FOUND" and len(lines) >= 6:
+            x = int(lines[2])
+            y = int(lines[3])
+            w = int(lines[4])
+            h = int(lines[5])
+            return {
+                "name": lines[1],
+                "type": element_type,
+                "x": x + w // 2,
+                "y": y + h // 2,
+                "width": w,
+                "height": h,
+            }
+    except Exception as e:
+        print(f"[ComputerControl] UI find (macOS) error: {e}")
+    return None
+
+
+def _ui_find_linux(name: str, element_type: str, index: int) -> dict | None:
+    """Find UI element on Linux using xdotool/wmctrl."""
+    try:
+        # Use xdotool to search for windows
+        result = subprocess.run(
+            ["xdotool", "search", "--name", name],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            # Get window geometry
+            wid = result.stdout.strip().splitlines()[0]
+            geo = subprocess.run(
+                ["xdotool", "getwindowgeometry", "--shell", wid],
+                capture_output=True, text=True, timeout=5
+            )
+            info = {}
+            for line in geo.stdout.strip().splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    info[k] = int(v)
+            if "X" in info and "Y" in info:
+                return {
+                    "name": name,
+                    "type": "window",
+                    "x": info["X"] + info.get("WIDTH", 0) // 2,
+                    "y": info["Y"] + info.get("HEIGHT", 0) // 2,
+                    "width": info.get("WIDTH", 0),
+                    "height": info.get("HEIGHT", 0),
+                }
+    except Exception as e:
+        print(f"[ComputerControl] UI find (Linux) error: {e}")
+    return None
+
+
+def _ui_click_element(name: str, element_type: str = "any", click_type: str = "left", index: int = 0) -> str:
+    """Find a UI element by name and click on it."""
+    elem = _ui_find_element(name, element_type, index)
+    if not elem:
+        # Fallback to AI vision
+        coords = _screen_find(name)
+        if coords:
+            time.sleep(0.2)
+            clicks = 2 if click_type == "double" else 1
+            btn = "right" if click_type == "right" else "left"
+            _click(x=coords[0], y=coords[1], button=btn, clicks=clicks)
+            return f"Clicked '{name}' at {coords} (AI vision fallback)"
+        return f"Element not found: '{name}'"
+
+    x, y = elem["x"], elem["y"]
+    clicks = 2 if click_type == "double" else 1
+    btn = "right" if click_type == "right" else "left"
+
+    time.sleep(0.2)
+    _click(x=x, y=y, button=btn, clicks=clicks)
+    return f"Clicked '{elem['name']}' ({elem['type']}) at ({x}, {y})"
+
+
+def _ui_type_in_field(name: str, text: str, clear_first: bool = True, index: int = 0) -> str:
+    """Find a text field by name, click it, and type text into it."""
+    # Try to find as Edit/input field first
+    elem = _ui_find_element(name, "edit", index)
+    if not elem:
+        # Try any element with that name
+        elem = _ui_find_element(name, "any", index)
+
+    if not elem:
+        # Fallback to AI vision
+        coords = _screen_find(name)
+        if coords:
+            time.sleep(0.2)
+            _click(x=coords[0], y=coords[1])
+            time.sleep(0.3)
+            if clear_first:
+                _clear_field()
+                time.sleep(0.1)
+            return _smart_type(text, clear_first=False)
+        return f"Field not found: '{name}'"
+
+    x, y = elem["x"], elem["y"]
+    _click(x=x, y=y)
+    time.sleep(0.3)
+
+    if clear_first:
+        _clear_field()
+        time.sleep(0.1)
+
+    return _smart_type(text, clear_first=False)
+
+
+def _ui_list_elements(element_type: str = "any", filter_text: str = "") -> str:
+    """List visible UI elements on screen (for discovery/debugging)."""
+    os_name = _get_os()
+
+    if os_name != "windows":
+        return "UI element listing is only supported on Windows currently."
+
+    try:
+        type_filter = ""
+        if element_type.lower() != "any":
+            type_map = {
+                "button": "Button", "btn": "Button", "link": "Hyperlink",
+                "input": "Edit", "field": "Edit", "edit": "Edit",
+                "checkbox": "CheckBox", "radio": "RadioButton",
+                "tab": "TabItem", "menu": "MenuItem", "list": "ListItem",
+                "combo": "ComboBox", "dropdown": "ComboBox",
+            }
+            ct = type_map.get(element_type.lower(), element_type)
+            type_filter = f'''
+$ctCond = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+    [System.Windows.Automation.ControlType]::{ct}
+)
+$cond = New-Object System.Windows.Automation.AndCondition($nameCond, $ctCond)
+'''
+        else:
+            type_filter = "$cond = $nameCond"
+
+        name_filter = f'''
+$nameCond = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::NameProperty, "{filter_text}",
+    [System.Windows.Automation.Condition]::True
+)
+''' if filter_text else '''
+$nameCond = [System.Windows.Automation.Condition]::TrueCondition
+'''
+
+        ps_script = f'''
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+
+$root = [System.Windows.Automation.AutomationElement]::RootElement
+{name_filter}
+{type_filter}
+$items = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
+
+$count = [Math]::Min($items.Count, 30)
+for ($i = 0; $i -lt $count; $i++) {{
+    $item = $items[$i]
+    $rect = $item.Current.BoundingRectangle
+    $cx = [int](($rect.Left + $rect.Right) / 2)
+    $cy = [int](($rect.Top + $rect.Bottom) / 2)
+    $nm = $item.Current.Name
+    $ct = $item.Current.ControlType.ProgrammaticName.Replace("ControlType.", "")
+    if ($nm -and $rect.Right - $rect.Left -gt 0 -and $rect.Bottom - $rect.Top -gt 0) {{
+        Write-Output "$i|$nm|$ct|$cx|$cy"
+    }}
+}}
+Write-Output "TOTAL:$($items.Count)"
+'''
+
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            capture_output=True, text=True, timeout=15
+        )
+
+        elements = []
+        total = 0
+        for line in result.stdout.strip().splitlines():
+            if line.startswith("TOTAL:"):
+                total = int(line.split(":")[1])
+                continue
+            parts = line.split("|")
+            if len(parts) >= 5:
+                elements.append({
+                    "index": parts[0],
+                    "name": parts[1],
+                    "type": parts[2],
+                    "x": parts[3],
+                    "y": parts[4],
+                })
+
+        if not elements:
+            return "No interactive elements found on screen."
+
+        lines = [f"Found {total} elements (showing {len(elements)}):"]
+        for e in elements:
+            lines.append(f"  [{e['index']}] {e['type']:12s}  '{e['name']}'  at ({e['x']}, {e['y']})")
+
+        return "\n".join(lines)
+
+    except subprocess.TimeoutExpired:
+        return "UI element listing timed out."
+    except Exception as e:
+        return f"UI element listing error: {e}"
+
 def computer_control(
     parameters: dict,
     response=None,
@@ -365,6 +708,10 @@ def computer_control(
       focus_window  — bring window to foreground
       screen_find   — AI element finder (returns x,y)
       screen_click  — AI element finder + click
+      ui_click      — Find & click UI element by name (button, link, etc.)
+      ui_type       — Find text field by name & type into it
+      ui_find       — Find UI element, return its position
+      ui_list       — List visible UI elements on screen
       random_data   — generate fake form data
       user_data     — pull real data from memory
     """
@@ -443,6 +790,38 @@ def computer_control(
                 _click(x=coords[0], y=coords[1])
                 return f"Clicked '{desc}' at {coords}"
             return f"Element not found on screen: '{desc}'"
+
+        if action == "ui_click":
+            return _ui_click_element(
+                name=params.get("name", params.get("description", "")),
+                element_type=params.get("element_type", "any"),
+                click_type=params.get("click_type", "left"),
+                index=int(params.get("index", 0)),
+            )
+
+        if action == "ui_type":
+            return _ui_type_in_field(
+                name=params.get("name", params.get("description", "")),
+                text=params.get("text", ""),
+                clear_first=params.get("clear_first", True),
+                index=int(params.get("index", 0)),
+            )
+
+        if action == "ui_find":
+            elem = _ui_find_element(
+                name=params.get("name", params.get("description", "")),
+                element_type=params.get("element_type", "any"),
+                index=int(params.get("index", 0)),
+            )
+            if elem:
+                return f"Found '{elem['name']}' ({elem['type']}) at ({elem['x']}, {elem['y']}) size {elem['width']}x{elem['height']}"
+            return f"Element not found: '{params.get('name', '')}'"
+
+        if action == "ui_list":
+            return _ui_list_elements(
+                element_type=params.get("element_type", "any"),
+                filter_text=params.get("filter", ""),
+            )
 
         if action == "wait":
             secs = float(params.get("seconds", 1.0))
