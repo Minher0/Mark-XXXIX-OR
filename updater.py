@@ -63,6 +63,9 @@ def _ok(msg: str = "OK") -> None:
 def _fail(msg: str = "FAILED") -> None:
     print(_red(f"✗ {msg}"))
 
+def _warn(msg: str = "WARNING") -> None:
+    print(_yellow(f"⚠ {msg}"))
+
 
 # ─── Helpers ─────────────────────────────────────────────────
 
@@ -147,21 +150,53 @@ def _backup_protected() -> dict[str, Path]:
     return backups
 
 
+def _rmtree_safe(path) -> None:
+    """Delete a directory tree, retrying on PermissionError (Windows file locks)."""
+    for attempt in range(5):
+        try:
+            shutil.rmtree(str(path))
+            return
+        except PermissionError:
+            if attempt < 4:
+                time.sleep(0.5 * (attempt + 1))
+            else:
+                # Last attempt: force-delete files individually
+                try:
+                    for root, dirs, files in os.walk(str(path), topdown=False):
+                        for f in files:
+                            try:
+                                os.remove(os.path.join(root, f))
+                            except Exception:
+                                pass
+                        for d in dirs:
+                            try:
+                                os.rmdir(os.path.join(root, d))
+                            except Exception:
+                                pass
+                    try:
+                        os.rmdir(str(path))
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+
 def _restore_protected(backups: dict[str, Path]) -> None:
     """Restore memory/ and config/ from backup after updating."""
     for name, backup_path in backups.items():
         dst = REPO_DIR / name
-        # Remove whatever git/zip put there
+        # Remove whatever git/zip put there (safe delete with retries)
         if dst.exists():
-            shutil.rmtree(str(dst))
+            _rmtree_safe(dst)
         # Restore our backup
-        shutil.copytree(str(backup_path), str(dst))
-        print(f"      Restored {name}/")
+        if backup_path.exists():
+            shutil.copytree(str(backup_path), str(dst))
+            print(f"      Restored {name}/")
 
     # Cleanup backup dir
     backup_root = APP_DIR / "_update_backup"
     if backup_root.exists():
-        shutil.rmtree(str(backup_root))
+        _rmtree_safe(backup_root)
 
 
 # ─── Update steps ────────────────────────────────────────────
