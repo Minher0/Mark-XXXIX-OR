@@ -1,6 +1,6 @@
 # auto_click.py — Smart multi-strategy auto-click action for Jarvis
-# Tries: UI Automation → AI Vision → Browser Smart Click
-# Supports: single click, repeated clicks, spatial positioning (grid mode)
+# Priority: Browser (instant) → UI Automation (fast) → AI Vision (slow, last resort)
+# Supports: single click, repeated clicks, spatial positioning
 
 import io
 import re
@@ -40,7 +40,6 @@ def _require_pyautogui():
 
 
 # ─── Spatial position mapping ──────────────────────────────────────
-# Maps position keywords to grid indices (row, col) in a conceptual 3x3 grid
 
 _POSITION_GRID = {
     # Numeric indices
@@ -69,27 +68,42 @@ _POSITION_GRID = {
     "bl": (2, 0), "bc": (2, 1), "br": (2, 2),
 }
 
+# ─── Target → Playwright selector hints ────────────────────────────
+# Maps common target descriptions to Playwright locator strategies
+# These are tried FIRST because they're instant (no screenshot, no VLM)
+
+_TARGET_SELECTORS = {
+    # Videos / thumbnails (YouTube, etc.)
+    "video":       ["ytd-thumbnail", "ytd-video-renderer", "ytd-grid-video-renderer",
+                    "ytd-compact-video-renderer", "video", "[data-testid='video-card']"],
+    "thumbnail":   ["ytd-thumbnail", "ytd-grid-video-renderer",
+                    "img[src*='ytimg']", "[data-testid='thumbnail']"],
+    # Links / buttons
+    "link":        ["a"],
+    "button":      ["button", "[role='button']", "input[type='submit']"],
+    "image":       ["img"],
+    "tab":         ["[role='tab']", ".tab"],
+    "menu item":   ["[role='menuitem']", "li"],
+    "card":        ["[class*='card']", "[data-testid*='card']"],
+    "search":      ["input[type='search']", "[role='searchbox']", "input[name*='search']",
+                    "input[placeholder*='Search']", "input[placeholder*='search']"],
+    "input":       ["input[type='text']", "input:not([type])", "textarea",
+                    "[contenteditable='true']"],
+    "checkbox":    ["input[type='checkbox']", "[role='checkbox']"],
+    "dropdown":    ["select", "[role='listbox']", "[role='combobox']"],
+}
+
 
 def _resolve_position(position: str, total_items: int) -> int | None:
-    """Resolve a position string to a 0-based index among total_items.
-
-    Supports:
-      - Numeric: "1" to "9" (1-based → 0-based)
-      - Spatial: "top-left", "center", "bottom-right", etc.
-      - Ordinal: "first", "3rd", "deuxieme", etc.
-      - Auto-layout: maps grid position to linear index based on item count
-    """
+    """Resolve a position string to a 0-based index among total_items."""
     pos = position.strip().lower()
 
-    # Direct numeric index (1-based)
     if pos.isdigit():
         idx = int(pos) - 1
         return idx if 0 <= idx < total_items else None
 
-    # Grid position mapping
     grid_pos = _POSITION_GRID.get(pos)
     if grid_pos is None:
-        # Try to extract ordinal number: "3rd", "2nd", "1st"
         ordinal_match = re.match(r'(\d+)(?:st|nd|rd|th)', pos)
         if ordinal_match:
             idx = int(ordinal_match.group(1)) - 1
@@ -98,50 +112,201 @@ def _resolve_position(position: str, total_items: int) -> int | None:
 
     row, col = grid_pos
 
-    # Determine grid dimensions based on total items
     if total_items <= 1:
         return 0
     elif total_items <= 3:
-        # 1 row layout: items go left to right
         cols = total_items
         idx = col if col < cols else cols - 1
         return idx
     elif total_items <= 4:
-        # 2x2 grid
         ncols = 2
         idx = row * ncols + col
-        # Adjust for items that don't fill the grid
         return idx if idx < total_items else total_items - 1
     elif total_items <= 6:
-        # 2x3 or 3x2 grid — use 2 rows, 3 cols for 6 items
         ncols = 3
         idx = row * ncols + col
-        # If 2-row layout, only rows 0-1 are valid
         if row >= 2:
-            # Remap to bottom row
             idx = 1 * ncols + col
         return idx if idx < total_items else total_items - 1
     elif total_items <= 9:
-        # 3x3 grid
         ncols = 3
         idx = row * ncols + col
         return idx if idx < total_items else total_items - 1
     else:
-        # More than 9 items: use row-based layout with 3 cols
         ncols = 3
-        nrows = (total_items + ncols - 1) // ncols
         idx = row * ncols + col
         return min(idx, total_items - 1)
 
 
-# ─── Vision Grid: find ALL matching elements on screen ─────────────
+def _is_positional(pos: str) -> bool:
+    """Check if a string is a recognizable position keyword."""
+    if not pos:
+        return False
+    p = pos.strip().lower()
+    return (
+        p in _POSITION_GRID
+        or p.isdigit()
+        or re.match(r'\d+(?:st|nd|rd|th)', p) is not None
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STRATEGY 1: Browser Spatial Click — INSTANT (no screenshot, no VLM)
+# ═══════════════════════════════════════════════════════════════════
+
+def _try_browser_spatial_click(target: str, position: str = "", click_type: str = "left") -> str | None:
+    """Find all matching elements in the browser DOM and click the Nth one.
+
+    Uses Playwright locators — no screenshot, no VLM, instant.
+    Tries multiple selector strategies based on the target description.
+    """
+    try:
+        from actions.browser_control import _bt, _ensure_started
+        _ensure_started()
+
+        page = _bt.run(_bt._get_page(), timeout=10)
+        if not page:
+            return None
+
+        # Build list of selectors to try
+        selectors = _TARGET_SELECTORS.get(target.lower(), [])
+
+        # Also try text/role-based matching as additional selectors
+        extra_selectors = [
+            # Get by text (most flexible)
+            f"text={target}",
+        ]
+        # Don't add extras if target is too generic
+        if target.lower() not in _TARGET_SELECTORS:
+            selectors = extra_selectors
+        else:
+            selectors = selectors + extra_selectors
+
+        for selector in selectors:
+            try:
+                locator = page.locator(selector)
+                count = locator.count()
+
+                if count == 0:
+                    continue
+
+                # Resolve position
+                idx = 0
+                if position:
+                    idx = _resolve_position(position, count)
+                    if idx is None:
+                        idx = 0
+
+                if idx >= count:
+                    idx = count - 1
+
+                # Click the Nth element
+                element = locator.nth(idx)
+                element.click(timeout=5000)
+
+                label = f"'{target}' ({selector})"
+                if position:
+                    return f"[Browser] Clicked #{idx+1} {label} (out of {count} found)"
+                return f"[Browser] Clicked {label}"
+
+            except Exception:
+                continue
+
+    except Exception as e:
+        print(f"[AutoClick] Browser spatial failed: {e}")
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STRATEGY 2: UI Automation — FAST (OS-level, no screenshot)
+# ═══════════════════════════════════════════════════════════════════
+
+def _try_ui_click(target: str, element_type: str = "any", click_type: str = "left", index: int = 0) -> str | None:
+    """Try to click using UI Automation (Windows/macOS/Linux). ~0.5s."""
+    try:
+        from actions.computer_control import _ui_click_element
+        result = _ui_click_element(
+            name=target,
+            element_type=element_type,
+            click_type=click_type,
+            index=index,
+        )
+        if result and "not found" not in result.lower():
+            return f"[UI Automation] {result}"
+    except Exception as e:
+        print(f"[AutoClick] UI Automation failed: {e}")
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STRATEGY 3: Browser Smart Click — FAST (Playwright, no VLM)
+# ═══════════════════════════════════════════════════════════════════
+
+def _try_browser_click(target: str) -> str | None:
+    """Try to click using Playwright browser smart_click. ~1s."""
+    try:
+        from actions.browser_control import browser_control
+        result = browser_control(parameters={
+            "action": "smart_click",
+            "description": target,
+        })
+        if result and "could not find" not in result.lower():
+            return f"[Browser] {result}"
+    except Exception as e:
+        print(f"[AutoClick] Browser click failed: {e}")
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STRATEGY 4: AI Vision — SLOW (last resort only)
+# ═══════════════════════════════════════════════════════════════════
+
+def _try_vision_click(target: str, click_type: str = "left") -> str | None:
+    """Try to click using AI vision. 3-8s. LAST RESORT."""
+    try:
+        from actions.computer_control import _screen_find, _click
+        coords = _screen_find(target)
+        if coords:
+            time.sleep(0.15)
+            clicks = 2 if click_type == "double" else 1
+            btn = "right" if click_type == "right" else "left"
+            _click(x=coords[0], y=coords[1], button=btn, clicks=clicks)
+            return f"[AI Vision] Clicked '{target}' at {coords}"
+    except Exception as e:
+        print(f"[AutoClick] AI Vision failed: {e}")
+    return None
+
+
+def _try_vision_spatial_click(target: str, position: str, click_type: str = "left") -> str | None:
+    """Find ALL instances via VLM, then click the one at the specified position. 5-10s. LAST RESORT."""
+    items = _vision_find_all(target)
+    if not items:
+        return None
+
+    total = len(items)
+    idx = _resolve_position(position, total)
+    if idx is None:
+        return f"Position '{position}' is out of range. Found {total} items — use 1 to {total}."
+
+    item = items[idx]
+
+    try:
+        from actions.computer_control import _click
+        time.sleep(0.15)
+        clicks = 2 if click_type == "double" else 1
+        btn = "right" if click_type == "right" else "left"
+        _click(x=item["x"], y=item["y"], button=btn, clicks=clicks)
+    except Exception as e:
+        return f"[Vision Spatial] Found item but click failed: {e}"
+
+    return (
+        f"[Vision Spatial] Clicked #{idx+1} '{item['label']}' at ({item['x']}, {item['y']}) "
+        f"out of {total} found"
+    )
+
 
 def _vision_find_all(target: str) -> list[dict] | None:
-    """Use AI vision to find ALL instances of a target element on screen.
-
-    Returns a list of dicts: [{"index": 0, "x": 123, "y": 456, "label": "..."}, ...]
-    Sorted left-to-right, top-to-bottom.
-    """
+    """Use AI vision to find ALL instances of a target element on screen."""
     try:
         import base64
         from or_client import client
@@ -170,9 +335,7 @@ def _vision_find_all(target: str) -> list[dict] | None:
             system="You are a precise UI element locator. Return ONLY the JSON array, no markdown, no explanation.",
         )
 
-        # Parse JSON from VLM response
         clean = text.strip()
-        # Strip markdown fences if present
         if clean.startswith("```"):
             parts = clean.split("```")
             clean = parts[1] if len(parts) > 1 else clean
@@ -184,7 +347,6 @@ def _vision_find_all(target: str) -> list[dict] | None:
         if not isinstance(items, list) or len(items) == 0:
             return None
 
-        # Validate and normalize items
         results = []
         for i, item in enumerate(items):
             if not isinstance(item, dict):
@@ -200,18 +362,15 @@ def _vision_find_all(target: str) -> list[dict] | None:
                 "label": item.get("label", f"{target} #{i+1}"),
             })
 
-        # Sort by position: top-to-bottom, then left-to-right
         results.sort(key=lambda el: (el["y"], el["x"]))
 
-        # Re-index after sorting
         for i, el in enumerate(results):
             el["index"] = i
 
         return results if results else None
 
-    except json.JSONDecodeError as e:
-        print(f"[AutoClick] Vision grid JSON parse failed: {e}")
-        # Fallback: try to extract coordinates from free-text response
+    except json.JSONDecodeError:
+        # Fallback to single-element find
         return _vision_find_all_fallback(target)
     except Exception as e:
         print(f"[AutoClick] Vision grid find failed: {e}")
@@ -219,7 +378,7 @@ def _vision_find_all(target: str) -> list[dict] | None:
 
 
 def _vision_find_all_fallback(target: str) -> list[dict] | None:
-    """Fallback: use the existing _screen_find and return a single-item list."""
+    """Fallback: use _screen_find and return a single-item list."""
     try:
         from actions.computer_control import _screen_find
         coords = _screen_find(target)
@@ -230,102 +389,9 @@ def _vision_find_all_fallback(target: str) -> list[dict] | None:
     return None
 
 
-# ─── Strategy 1: UI Automation ──────────────────────────────────────
-
-def _try_ui_click(target: str, element_type: str = "any", click_type: str = "left", index: int = 0) -> str | None:
-    """Try to click using UI Automation (Windows/macOS/Linux)."""
-    try:
-        from actions.computer_control import _ui_click_element
-        result = _ui_click_element(
-            name=target,
-            element_type=element_type,
-            click_type=click_type,
-            index=index,
-        )
-        if result and "not found" not in result.lower():
-            return f"[UI Automation] {result}"
-    except Exception as e:
-        print(f"[AutoClick] UI Automation failed: {e}")
-    return None
-
-
-# ─── Strategy 2: AI Vision (screenshot → find → click) ─────────────
-
-def _try_vision_click(target: str, click_type: str = "left") -> str | None:
-    """Try to click using AI vision — screenshot + VLM to find element."""
-    try:
-        from actions.computer_control import _screen_find, _click
-        coords = _screen_find(target)
-        if coords:
-            time.sleep(0.2)
-            clicks = 2 if click_type == "double" else 1
-            btn = "right" if click_type == "right" else "left"
-            _click(x=coords[0], y=coords[1], button=btn, clicks=clicks)
-            return f"[AI Vision] Clicked '{target}' at {coords}"
-    except Exception as e:
-        print(f"[AutoClick] AI Vision failed: {e}")
-    return None
-
-
-# ─── Strategy 3: Browser Smart Click (Playwright) ──────────────────
-
-def _try_browser_click(target: str) -> str | None:
-    """Try to click using Playwright browser smart_click."""
-    try:
-        from actions.browser_control import browser_control
-        result = browser_control(parameters={
-            "action": "smart_click",
-            "description": target,
-        })
-        if result and "could not find" not in result.lower():
-            return f"[Browser] {result}"
-    except Exception as e:
-        print(f"[AutoClick] Browser click failed: {e}")
-    return None
-
-
-# ─── Spatial Click — Vision Grid Mode ──────────────────────────────
-
-def _try_spatial_click(target: str, position: str, click_type: str = "left") -> str | None:
-    """Find ALL instances of target, then click the one at the specified position.
-
-    Uses AI vision to locate all matching elements, sorts them in reading order,
-    then selects the one at the given position (index or spatial keyword).
-    """
-    items = _vision_find_all(target)
-    if not items:
-        return None
-
-    total = len(items)
-    idx = _resolve_position(position, total)
-
-    if idx is None:
-        return f"Position '{position}' is out of range. Found {total} items — use 1 to {total}."
-
-    item = items[idx]
-
-    # Click the selected item
-    try:
-        from actions.computer_control import _click
-        time.sleep(0.2)
-        clicks = 2 if click_type == "double" else 1
-        btn = "right" if click_type == "right" else "left"
-        _click(x=item["x"], y=item["y"], button=btn, clicks=clicks)
-    except Exception as e:
-        return f"[Spatial] Found item but click failed: {e}"
-
-    # Build summary
-    found_summary = ", ".join(
-        f"#{i+1}: {el['label']} ({el['x']},{el['y']})"
-        for i, el in enumerate(items)
-    )
-    return (
-        f"[Spatial] Clicked #{idx+1} '{item['label']}' at ({item['x']}, {item['y']}) "
-        f"out of {total} found: [{found_summary}]"
-    )
-
-
-# ─── Repeated Click Logic ──────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# REPEATED CLICK LOGIC
+# ═══════════════════════════════════════════════════════════════════
 
 def _repeat_click(
     target: str,
@@ -335,11 +401,14 @@ def _repeat_click(
     click_type: str = "left",
     index: int = 0,
     strategy: str = "auto",
+    position: str = "",
 ) -> str:
     """Click a target multiple times with interval between clicks."""
     results = []
     last_method = None
     last_coords = None
+    last_selector = None
+    last_idx = None
 
     for i in range(count):
         if i > 0:
@@ -347,7 +416,8 @@ def _repeat_click(
 
         clicked = False
 
-        if last_coords and last_method in ("ui_automation", "vision", "spatial"):
+        # Reuse coords for fast repeat clicks (UI Automation / Vision)
+        if last_coords and last_method in ("ui_automation", "vision", "vision_spatial"):
             try:
                 from actions.computer_control import _click
                 clicks = 2 if click_type == "double" else 1
@@ -358,6 +428,20 @@ def _repeat_click(
             except Exception:
                 last_coords = None
 
+        # Reuse browser selector for fast repeat clicks
+        elif last_method == "browser" and last_selector and last_idx is not None:
+            try:
+                from actions.browser_control import _bt
+                page = _bt.run(_bt._get_page(), timeout=5)
+                if page:
+                    locator = page.locator(last_selector)
+                    if locator.count() > last_idx:
+                        locator.nth(last_idx).click(timeout=3000)
+                        results.append(f"[{i+1}] browser repeat")
+                        clicked = True
+            except Exception:
+                pass
+
         if not clicked:
             result = _auto_click_single(
                 target=target,
@@ -365,28 +449,37 @@ def _repeat_click(
                 click_type=click_type,
                 index=index,
                 strategy=strategy,
+                position=position,
             )
             results.append(f"[{i+1}] {result}")
 
+            # Cache for repeat clicks
             coord_match = re.search(r'\((\d+)\s*,\s*(\d+)\)', result)
             if coord_match:
                 last_coords = (int(coord_match.group(1)), int(coord_match.group(2)))
                 if "[UI Automation]" in result:
                     last_method = "ui_automation"
-                elif "[AI Vision]" in result:
+                elif "[Vision Spatial]" in result or "[AI Vision]" in result:
                     last_method = "vision"
-                elif "[Spatial]" in result:
-                    last_method = "spatial"
-                elif "[Browser]" in result:
-                    last_method = "browser"
-                    last_coords = None
+            elif "[Browser]" in result:
+                last_method = "browser"
+                last_coords = None
+                # Try to extract the selector used
+                for sel_list in _TARGET_SELECTORS.values():
+                    for sel in sel_list:
+                        if sel in result:
+                            last_selector = sel
+                            last_idx = 0
+                            break
 
     summary = f"Auto-clicked '{target}' {count}x (interval: {interval}s)\n"
     summary += "\n".join(results)
     return summary
 
 
-# ─── Single Click — Strategy Chain ─────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# SINGLE CLICK — STRATEGY CHAIN (ordered by speed)
+# ═══════════════════════════════════════════════════════════════════
 
 def _auto_click_single(
     target: str,
@@ -396,40 +489,50 @@ def _auto_click_single(
     strategy: str = "auto",
     position: str = "",
 ) -> str:
-    """Execute a single auto-click using the specified strategy.
+    """Execute a single auto-click.
 
-    If `position` is provided, uses spatial grid mode (AI vision finds all
-    instances, then selects the one at the given position).
+    Strategy priority (when position is set):
+      1. Browser Spatial  — INSTANT (Playwright DOM query, .nth(idx).click())
+      2. UI Automation    — FAST   (OS-level element find)
+      3. Vision Spatial   — SLOW   (screenshot + VLM, last resort)
+
+    Strategy priority (when NO position):
+      1. Browser Smart Click — FAST (Playwright role/text/placeholder)
+      2. UI Automation       — FAST (OS-level)
+      3. AI Vision           — SLOW (screenshot + VLM)
     """
     strategy = strategy.lower().strip()
+    has_position = bool(position) and _is_positional(position)
 
-    # ─── Spatial mode: position parameter triggers grid search ────
-    if position:
-        pos_lower = position.strip().lower()
-        # Check if it's a recognizable position keyword
-        is_positional = (
-            pos_lower in _POSITION_GRID
-            or pos_lower.isdigit()
-            or re.match(r'\d+(?:st|nd|rd|th)', pos_lower)
-            or pos_lower in ("first", "second", "third", "fourth", "fifth",
-                             "sixth", "seventh", "eighth", "ninth",
-                             "premier", "deuxieme", "troisieme", "quatrieme",
-                             "cinquieme", "sixieme", "septieme", "huitieme", "neuvieme")
-        )
+    # ─── Positional mode: prefer browser DOM queries (instant) ──────
+    if has_position:
+        # 1) Browser spatial — instant, no screenshot
+        result = _try_browser_spatial_click(target, position, click_type)
+        if result:
+            return result
 
-        if is_positional:
-            # Spatial grid mode: vision finds all, then we pick by position
-            result = _try_spatial_click(target, position, click_type)
-            if result:
-                return result
-            return f"Failed to click '{target}' at position '{position}' — could not locate elements on screen"
+        # 2) UI Automation — fast, no screenshot
+        idx = _resolve_position(position, 20) or 0
+        result = _try_ui_click(target, element_type, click_type, idx)
+        if result:
+            return result
 
-    # ─── Normal strategy chain ────────────────────────────────────
+        # 3) Vision spatial — slow, last resort
+        result = _try_vision_spatial_click(target, position, click_type)
+        if result:
+            return result
+
+        return f"Failed to click '{target}' at position '{position}'"
+
+    # ─── Non-positional mode: standard strategy chain ──────────────
     if strategy == "auto":
+        # 1) Browser — instant for web pages
+        # 2) UI Automation — fast for desktop apps
+        # 3) Vision — slow, last resort
         chain = [
+            ("browser",       lambda: _try_browser_click(target)),
             ("ui_automation", lambda: _try_ui_click(target, element_type, click_type, index)),
             ("vision",        lambda: _try_vision_click(target, click_type)),
-            ("browser",       lambda: _try_browser_click(target)),
         ]
     elif strategy == "ui":
         chain = [
@@ -449,11 +552,13 @@ def _auto_click_single(
             ("vision",        lambda: _try_vision_click(target, click_type)),
         ]
     elif strategy == "spatial":
-        # Force spatial mode even without position (clicks first found)
-        result = _try_spatial_click(target, position or "1", click_type)
+        result = _try_browser_spatial_click(target, position or "1", click_type)
         if result:
             return result
-        return f"Failed to click '{target}' in spatial mode — could not locate elements on screen"
+        result = _try_vision_spatial_click(target, position or "1", click_type)
+        if result:
+            return result
+        return f"Failed to click '{target}' in spatial mode"
     else:
         return f"Unknown strategy: '{strategy}'. Use: auto | ui | vision | browser | ui_vision | spatial"
 
@@ -467,7 +572,9 @@ def _auto_click_single(
     return f"Failed to click '{target}' — tried: {', '.join(attempted)}"
 
 
-# ─── Public API ──────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# PUBLIC API
+# ═══════════════════════════════════════════════════════════════════
 
 def auto_click(
     parameters: dict = None,
@@ -476,26 +583,25 @@ def auto_click(
     session_memory=None,
 ) -> str:
     """
-    Smart auto-click action that tries multiple strategies to find and click
-    a UI element. Supports single/repeated clicks and spatial positioning.
+    Smart auto-click — fast first, VLM last.
+
+    Priority: Browser (instant) → UI Automation (fast) → AI Vision (slow)
 
     parameters:
-        target       : Description or name of the element to click (required)
-        position     : Position among multiple matches: 1-9, "3rd", "top-left",
-                       "center", "bottom-right", "deuxieme", etc.
-                       Triggers spatial grid mode (AI vision finds all instances).
+        target       : Element to click (required)
+        position     : Which instance: '1'-'9', 'first', '3rd', 'top-left', 'deuxieme', etc.
         strategy     : auto | ui | vision | browser | ui_vision | spatial (default: auto)
         click_type   : left | right | double (default: left)
         element_type : button | link | input | checkbox | tab | menu | any (default: any)
         index        : Index when multiple elements match (default: 0)
-        count        : Number of times to click (default: 1)
+        count        : Number of clicks (default: 1, max: 100)
         interval     : Seconds between repeated clicks (default: 1.0)
     """
     params = parameters or {}
     target = params.get("target", params.get("description", "")).strip()
 
     if not target:
-        return "No target specified. Use 'target' parameter with element name or description."
+        return "No target specified. Use 'target' parameter."
 
     strategy     = params.get("strategy", "auto").strip().lower()
     click_type   = params.get("click_type", "left").strip().lower()
@@ -505,13 +611,12 @@ def auto_click(
     interval     = float(params.get("interval", 1.0))
     position     = params.get("position", "").strip()
 
-    # Clamp values
     count    = max(1, min(count, 100))
     interval = max(0.1, min(interval, 30.0))
 
     if player:
-        pos_info = f" | Position: {position}" if position else ""
-        player.write_log(f"[auto_click] Target: '{target}'{pos_info} | Strategy: {strategy} | Count: {count}")
+        pos_info = f" | Pos: {position}" if position else ""
+        player.write_log(f"[auto_click] '{target}'{pos_info} | {strategy} | x{count}")
 
     try:
         if count == 1:
@@ -532,6 +637,7 @@ def auto_click(
                 click_type=click_type,
                 index=index,
                 strategy=strategy,
+                position=position,
             )
     except Exception as e:
         result = f"auto_click failed: {e}"
