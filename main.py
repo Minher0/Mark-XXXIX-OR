@@ -34,6 +34,7 @@ from actions.cmd_control       import cmd_control
 from actions.game_updater      import game_updater
 from actions.discord_control   import discord_control
 from actions.media_control     import media_control
+from actions.auto_click        import auto_click
 
 
 def get_base_dir():
@@ -446,6 +447,30 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "auto_click",
+        "description": (
+            "Smart auto-click that finds and clicks a UI element using multiple strategies automatically. "
+            "Tries UI Automation first, then AI vision (screenshot analysis), then browser smart click. "
+            "Supports repeated clicking with intervals. "
+            "Use when user asks to click something by name/description, or to auto-click repeatedly. "
+            "More reliable than computer_control's screen_click or ui_click alone because it chains fallbacks. "
+            "For simple coordinate clicks, use computer_control instead."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "target":       {"type": "STRING",  "description": "Name or description of the element to click (e.g. 'Save button', 'Submit', 'Accept cookies')"},
+                "strategy":     {"type": "STRING",  "description": "Click strategy: auto | ui | vision | browser | ui_vision (default: auto). 'auto' tries all in order."},
+                "click_type":   {"type": "STRING",  "description": "Click type: left | right | double (default: left)"},
+                "element_type": {"type": "STRING",  "description": "Element type filter: button | link | input | checkbox | tab | menu | any (default: any)"},
+                "index":        {"type": "INTEGER", "description": "Index when multiple elements match (default: 0)"},
+                "count":        {"type": "INTEGER", "description": "Number of times to click (default: 1, max: 100)"},
+                "interval":     {"type": "NUMBER",  "description": "Seconds between repeated clicks (default: 1.0, range: 0.1-30)"},
+            },
+            "required": ["target"]
+        }
+    },
+    {
         "name": "cmd_control",
         "description": (
             "Executes terminal/CMD commands, opens files, opens memory, manages apps, AND can modify Jarvis's own source code. "
@@ -844,6 +869,10 @@ class JarvisLive:
 
             elif name == "computer_control":
                 r = await loop.run_in_executor(None, lambda: computer_control(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "auto_click":
+                r = await loop.run_in_executor(None, lambda: auto_click(parameters=args, player=self.ui))
                 result = r or "Done."
 
             elif name == "cmd_control":
