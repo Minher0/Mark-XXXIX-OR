@@ -354,6 +354,217 @@ def _read_channel(server_name: str, channel_name: str, limit: int = 10) -> str:
     return header + "\n".join(lines)
 
 
+# ─── DM reading ──────────────────────────────────────────
+
+def _find_dm_channel(receiver: str) -> dict | None:
+    """Find an existing DM channel with a user.
+
+    Tries (1) numeric ID direct, (2) existing DM channels list,
+    (3) creates one if we already know the user_id via _find_user_id.
+
+    Returns the DM channel dict (containing 'id' and 'recipients'), or None.
+    """
+    # 1. If receiver is numeric, it could be a user ID or a channel ID.
+    #    Try existing DM channels first to disambiguate.
+    dm_channels = _api_get("/users/@me/channels")
+    if dm_channels:
+        # Direct match by channel ID (rare but possible)
+        for ch in dm_channels:
+            if ch.get("type") == 1 and ch.get("id") == receiver:
+                return ch
+        # Match by recipient
+        search = receiver.lower().replace("#", "")
+        for ch in dm_channels:
+            if ch.get("type") != 1:  # 1 = DM
+                continue
+            for r in ch.get("recipients", []):
+                username = (r.get("username") or "").lower()
+                global_name = (r.get("global_name") or "").lower()
+                discriminator = r.get("discriminator") or "0"
+                full_name = f"{username}#{discriminator}" if discriminator != "0" else username
+                if (search in username or
+                    search in global_name or
+                    search in full_name.replace("#", "") or
+                    r.get("id") == receiver):
+                    return ch
+
+    # 2. Try to resolve user_id via the full search (relationships + DMs + guilds)
+    user_id = _find_user_id(receiver)
+    if user_id:
+        # Create or fetch the DM channel
+        dm_channel = _api_post("/users/@me/channels", {"recipient_id": user_id})
+        if dm_channel and dm_channel.get("id"):
+            return dm_channel
+
+    return None
+
+
+def _read_dm(receiver: str, limit: int = 10) -> str:
+    """Read recent DM messages with a specific user.
+
+    Args:
+        receiver: Username, global name, user ID, or channel ID of the DM partner.
+        limit:    Number of messages to fetch (1-50, default 10).
+    """
+    if not receiver:
+        return "Please specify whose DMs to read."
+
+    limit = max(1, min(50, int(limit)))
+
+    channel = _find_dm_channel(receiver)
+    if not channel:
+        # Build a helpful failure message with known DM contacts
+        known = set()
+        dm_channels = _api_get("/users/@me/channels")
+        if dm_channels:
+            for ch in dm_channels:
+                if ch.get("type") != 1:
+                    continue
+                for r in ch.get("recipients", []):
+                    name = r.get("username") or ""
+                    disc = r.get("discriminator") or "0"
+                    gname = r.get("global_name") or ""
+                    display = f"{name}#{disc}" if disc != "0" else name
+                    if gname and gname != name:
+                        display = f"{gname} ({name})"
+                    if display:
+                        known.add(display)
+        if known:
+            return f"No DM found with '{receiver}'. Your DM contacts: {', '.join(list(known)[:15])}"
+        return f"No DM found with '{receiver}'. Try their exact Discord username or numeric ID."
+
+    messages = _api_get(f"/channels/{channel['id']}/messages", params={"limit": limit})
+    if not messages:
+        return f"No messages found in DM with '{receiver}'."
+
+    # Identify the partner for the header
+    recipients = channel.get("recipients", [])
+    partner_name = "Unknown"
+    if recipients:
+        r = recipients[0]
+        uname = r.get("username") or "?"
+        disc = r.get("discriminator") or "0"
+        gname = r.get("global_name") or ""
+        if disc != "0":
+            partner_name = f"{uname}#{disc}"
+        else:
+            partner_name = uname
+        if gname and gname != uname:
+            partner_name = f"{gname} ({uname})"
+
+    me = _api_get("/users/@me")
+    my_id = me.get("id") if me else None
+
+    lines = []
+    for msg in reversed(messages):  # oldest first
+        author = msg.get("author", {})
+        author_name = author.get("username", "Unknown")
+        author_id = author.get("id")
+        # Mark our own messages clearly
+        if my_id and author_id == my_id:
+            author_name = "You"
+        content = msg.get("content", "") or ""
+        # Handle attachments and embeds when content is empty
+        if not content:
+            attachments = msg.get("attachments", [])
+            embeds = msg.get("embeds", [])
+            if attachments:
+                content = f"(attachment: {attachments[0].get('filename', 'file')})"
+            elif embeds:
+                content = "(embed)"
+            else:
+                content = "(empty)"
+        timestamp_str = msg.get("timestamp", "")
+        try:
+            dt = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+            time_fmt = dt.strftime("%H:%M")
+        except Exception:
+            time_fmt = "?"
+        lines.append(f"[{time_fmt}] {author_name}: {content}")
+
+    header = f"Last {len(lines)} DM messages with {partner_name}:\n"
+    return header + "\n".join(lines)
+
+
+def _list_dms(limit_per_dm: int = 1) -> str:
+    """List all DM conversations with their most recent message.
+
+    Args:
+        limit_per_dm: How many recent messages to show per conversation (default 1).
+    """
+    dm_channels = _api_get("/users/@me/channels")
+    if not dm_channels:
+        return "No DM conversations found."
+
+    # Keep only 1:1 DMs (type 1) and group DMs (type 3)
+    dms = [ch for ch in dm_channels if ch.get("type") in (1, 3)]
+    if not dms:
+        return "No DM conversations found."
+
+    # Sort by last_message_id (snowflake — bigger = more recent) descending
+    def _last_id(ch: dict) -> int:
+        try:
+            return int(ch.get("last_message_id") or "0")
+        except (TypeError, ValueError):
+            return 0
+    dms.sort(key=_last_id, reverse=True)
+
+    me = _api_get("/users/@me")
+    my_id = me.get("id") if me else None
+
+    lines = [f"You have {len(dms)} DM conversation(s). Most recent first:\n"]
+    for i, ch in enumerate(dms[:20], 1):  # Cap at 20 to keep response readable
+        recipients = ch.get("recipients", [])
+        if recipients:
+            r = recipients[0]
+            uname = r.get("username") or "?"
+            disc = r.get("discriminator") or "0"
+            gname = r.get("global_name") or ""
+            if disc != "0":
+                name = f"{uname}#{disc}"
+            else:
+                name = uname
+            if gname and gname != uname:
+                name = f"{gname} ({uname})"
+        else:
+            name = ch.get("name") or "Group DM"
+
+        # Fetch the most recent message(s) for this DM
+        try:
+            msgs = _api_get(
+                f"/channels/{ch['id']}/messages",
+                params={"limit": max(1, min(5, limit_per_dm))}
+            ) or []
+        except Exception:
+            msgs = []
+
+        if msgs:
+            # msgs come newest first; show the latest
+            last = msgs[0]
+            author = last.get("author", {})
+            author_name = "You" if (my_id and author.get("id") == my_id) else author.get("username", "?")
+            content = (last.get("content") or "").strip()
+            if not content:
+                if last.get("attachments"):
+                    content = "(attachment)"
+                elif last.get("embeds"):
+                    content = "(embed)"
+                else:
+                    content = "(empty)"
+            timestamp_str = last.get("timestamp", "")
+            try:
+                dt = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+                time_fmt = dt.strftime("%b %d, %H:%M")
+            except Exception:
+                time_fmt = "?"
+            preview = content[:80] + ("…" if len(content) > 80 else "")
+            lines.append(f"{i}. {name} — last [{time_fmt}] {author_name}: {preview}")
+        else:
+            lines.append(f"{i}. {name} — (no messages)")
+
+    return "\n".join(lines)
+
+
 # ─── Public API (called from main.py) ────────────────────
 
 def discord_control(parameters: dict, player=None) -> str:
@@ -361,8 +572,8 @@ def discord_control(parameters: dict, player=None) -> str:
     Main entry point for Jarvis tool dispatch.
 
     parameters:
-        action      : send_dm | send_channel | read_channel | list_servers | list_channels | list_friends | status
-        receiver    : Username or user ID for send_dm
+        action      : send_dm | send_channel | read_channel | read_dm | list_servers | list_channels | list_friends | list_dms | status
+        receiver    : Username or user ID for send_dm / read_dm
         message     : Message text to send
         server      : Server name for send_channel / read_channel / list_channels
         channel     : Channel name for send_channel / read_channel
@@ -406,6 +617,17 @@ def discord_control(parameters: dict, player=None) -> str:
             if not channel:
                 return "Please specify a channel name."
             result = _read_channel(server, channel, limit)
+
+        elif action == "read_dm":
+            receiver = params.get("receiver", "").strip()
+            limit = int(params.get("limit", 10))
+            if not receiver:
+                return "Please specify whose DMs to read."
+            result = _read_dm(receiver, limit)
+
+        elif action == "list_dms":
+            limit_per_dm = int(params.get("limit", 1))
+            result = _list_dms(limit_per_dm)
 
         elif action == "list_servers":
             result = _list_servers()
@@ -471,7 +693,7 @@ def discord_control(parameters: dict, player=None) -> str:
         else:
             result = (
                 f"Unknown Discord action: '{action}'. "
-                "Available: send_dm, send_channel, read_channel, list_servers, list_channels, list_friends, status"
+                "Available: send_dm, send_channel, read_channel, read_dm, list_servers, list_channels, list_friends, list_dms, status"
             )
 
     except ValueError as e:

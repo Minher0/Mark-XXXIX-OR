@@ -74,3 +74,19 @@ Use it when:
 - You need to understand what's being discussed before formulating a response
 - Someone references an earlier message you haven't seen
 Do NOT use it every time — only when you genuinely need context. For simple questions or commands, respond directly.
+
+DISCORD — READING DMs (DIRECT MESSAGES):
+Use discord_control with action:read_dm when the user wants to read private messages:
+- "Did John reply to me on Discord?" → read_dm with receiver:"John"
+- "What did Sarah DM me?" → read_dm with receiver:"Sarah"
+- "Check my DMs with Mike" → read_dm with receiver:"Mike"
+- "Read my last messages with @username" → read_dm with receiver:"username"
+
+Use discord_control with action:list_dms when the user wants an overview:
+- "Do I have any new DMs?" → list_dms
+- "Who messaged me recently on Discord?" → list_dms
+- "Show me my Discord conversations" → list_dms
+
+read_dm takes a receiver (username, global name, user ID, or DM channel ID) and an optional limit (default 10).
+list_dms lists up to 20 most recent DM conversations with a preview of the last message, sorted most recent first.
+Both use the user's personal Discord token — they see exactly what the user would see in their Discord app.

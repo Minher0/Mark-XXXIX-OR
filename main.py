@@ -215,19 +215,19 @@ TOOL_DECLARATIONS = [
         "name": "discord_control",
         "description": (
             "Controls the user's personal Discord account. Can send DMs, send messages in server channels, "
-            "read channel messages, list servers, list channels, list friends, and check connection status. "
-            "Use for ANY Discord action. "
+            "read channel messages, read DM messages, list servers, list channels, list friends, list all DM "
+            "conversations, and check connection status. Use for ANY Discord action. "
             "NOT for WhatsApp/Telegram — use send_message for those."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":   {"type": "STRING", "description": "send_dm | send_channel | read_channel | list_servers | list_channels | list_friends | status (default: status)"},
-                "receiver": {"type": "STRING", "description": "Username or user ID (for send_dm)"},
+                "action":   {"type": "STRING", "description": "send_dm | send_channel | read_channel | read_dm | list_servers | list_channels | list_friends | list_dms | status (default: status)"},
+                "receiver": {"type": "STRING", "description": "Username, global name, user ID, or DM channel ID (for send_dm, read_dm)"},
                 "server":   {"type": "STRING", "description": "Server name (for send_channel, read_channel, list_channels)"},
                 "channel":  {"type": "STRING", "description": "Channel name (for send_channel, read_channel)"},
                 "message":  {"type": "STRING", "description": "Message text to send (for send_dm, send_channel)"},
-                "limit":    {"type": "INTEGER", "description": "Number of messages to read (for read_channel, default: 10)"}
+                "limit":    {"type": "INTEGER", "description": "Number of messages to read (for read_channel and read_dm, default: 10). For list_dms, number of recent messages to preview per conversation (default: 1)."}
             },
             "required": ["action"]
         }
