@@ -67,7 +67,8 @@ If you're not sure of the exact app name, use action:list_installed_apps first w
 
 DISCORD BOT — READING CHANNEL HISTORY:
 When running as a Discord bot, you have access to read_channel_history.
-This tool reads the last N messages from the current channel (using the bot's own access, NOT the user's personal token).
+This tool reads the last N messages from the current channel using the user's personal Discord token (same as discord_control), NOT the bot's token.
+This means you can read messages in any channel the user has access to, even if the bot itself can't see them.
 Use it when:
 - The user asks you to "respond to someone" or "answer this person" and you need conversation context
 - You need to understand what's being discussed before formulating a response

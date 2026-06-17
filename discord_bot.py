@@ -18,6 +18,7 @@ import os
 import sys
 import time
 import traceback
+from datetime import datetime
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -72,12 +73,13 @@ def _load_system_prompt() -> str:
 class GeminiChat:
     """Lightweight Gemini chat for Discord — no audio, just text + tools."""
 
-    # Discord-specific tool declarations (uses discord.py, not user token)
+    # Discord-specific tool declarations (uses user's personal token, not bot token)
     DISCORD_BOT_TOOLS = [
         {
             "name": "read_channel_history",
             "description": (
-                "Reads recent messages from the current Discord channel to get conversation context. "
+                "Reads recent messages from the current Discord channel to get conversation context, "
+                "using the user's personal Discord account (not the bot account). "
                 "Use this when you need to understand what people are talking about before responding, "
                 "for example when asked to 'respond to someone' or 'answer this person'. "
                 "Returns the last N messages with author names and timestamps. "
@@ -102,10 +104,11 @@ class GeminiChat:
         self.system_prompt = _load_system_prompt()
         # Per-channel conversation history
         self._histories: dict[str, list] = {}
-        # Reference to the current Discord channel (set per-request)
-        self._current_channel = None
-        # Reference to the Discord bot user (to exclude own messages from history)
-        self._bot_user = None
+        # Current Discord channel info (set per-request)
+        self._current_channel_id: str | None = None
+        self._current_channel_name: str | None = None
+        self._current_guild_name: str | None = None
+        self._bot_user_id: str | None = None
         # Load tool declarations
         self.tools = []
         self._load_tools()
@@ -132,46 +135,61 @@ class GeminiChat:
             self._histories[channel_id] = hist[-MAX_HISTORY:]
 
     async def read_channel_messages(self, limit: int = READ_HISTORY_DEFAULT) -> str:
-        """Read recent messages from the current Discord channel using discord.py."""
-        if not self._current_channel:
+        """Read recent messages from the current Discord channel using user token (raw HTTP API)."""
+        if not self._current_channel_id:
             return "No Discord channel available."
 
         try:
-            limit = min(max(1, limit), READ_HISTORY_MAX)
-            messages = []
-            async for msg in self._current_channel.history(limit=limit + 5):
-                # Skip bot's own messages
-                if self._bot_user and msg.author == self._bot_user:
-                    continue
-                messages.append(msg)
-                if len(messages) >= limit:
-                    break
+            from actions.discord_control import _api_get, _get_token
+            # Verify the user token is configured
+            try:
+                _get_token()
+            except (ValueError, FileNotFoundError) as e:
+                return f"Cannot read channel history: {e}"
 
-            if not messages:
+            limit = min(max(1, limit), READ_HISTORY_MAX)
+
+            # Fetch messages via Discord HTTP API (user token)
+            raw_messages = await asyncio.to_thread(
+                _api_get,
+                f"/channels/{self._current_channel_id}/messages",
+                {"limit": limit}
+            )
+
+            if not raw_messages:
+                return "No messages found or could not read channel."
+
+            # Format messages chronologically (oldest first — API returns newest first)
+            lines = []
+            for msg in reversed(raw_messages):
+                author = msg.get("author", {}).get("username", "Unknown")
+                global_name = msg.get("author", {}).get("global_name")
+                if global_name:
+                    author = f"{global_name} ({author})"
+                # Skip bot's own messages
+                author_id = msg.get("author", {}).get("id", "")
+                if self._bot_user_id and author_id == self._bot_user_id:
+                    continue
+                content = msg.get("content", "") or "(embed/attachment)"
+                # Add timestamp
+                timestamp_str = msg.get("timestamp", "")
+                try:
+                    dt = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+                    time_fmt = dt.strftime("%H:%M")
+                except Exception:
+                    time_fmt = "?"
+                lines.append(f"[{time_fmt}] {author}: {content}")
+
+            if not lines:
                 return "No messages found in this channel."
 
-            # Format messages chronologically (oldest first)
-            messages.reverse()
-            lines = []
-            for msg in messages:
-                author = msg.author.display_name or msg.author.name
-                content = msg.content or "(embed/attachment)"
-                # Add timestamp
-                time_fmt = msg.created_at.strftime("%H:%M") if msg.created_at else "?"
-                # Add reply reference if present
-                reply_info = ""
-                if msg.reference and msg.reference.resolved:
-                    replied_author = msg.reference.resolved.author.display_name or msg.reference.resolved.author.name
-                    replied_content = (msg.reference.resolved.content or "")[:50]
-                    reply_info = f" (reply to {replied_author}: {replied_content}...)"
-                lines.append(f"[{time_fmt}] {author}: {content}{reply_info}")
-
-            channel_name = getattr(self._current_channel, 'name', 'DM')
-            guild_name = getattr(self._current_channel, 'guild', None)
-            server_info = f" ({guild_name.name})" if guild_name else ""
+            channel_name = self._current_channel_name or "DM"
+            server_info = f" ({self._current_guild_name})" if self._current_guild_name else ""
             header = f"Last {len(lines)} messages in #{channel_name}{server_info}:\n"
             return header + "\n".join(lines)
 
+        except ValueError as e:
+            return f"Discord auth error: {e}"
         except Exception as e:
             return f"Error reading channel history: {e}"
 
@@ -181,12 +199,15 @@ class GeminiChat:
         Args:
             text: The user's message text
             channel_id: Channel ID string for history tracking
-            discord_channel: The discord.Channel object (needed for read_channel_history tool)
-            bot_user: The bot's discord.User object (to exclude from channel history reads)
+            discord_channel: The discord.Channel object (to get channel name/guild info)
+            bot_user: The bot's discord.User object (to get bot user ID for filtering)
         """
-        # Store channel reference for tool execution
-        self._current_channel = discord_channel
-        self._bot_user = bot_user
+        # Store channel info for read_channel_history tool (uses user token, not bot)
+        self._current_channel_id = channel_id
+        self._current_channel_name = getattr(discord_channel, 'name', None) if discord_channel else None
+        guild = getattr(discord_channel, 'guild', None) if discord_channel else None
+        self._current_guild_name = guild.name if guild else None
+        self._bot_user_id = str(bot_user.id) if bot_user else None
         try:
             import google.genai as genai
             from google.genai import types
@@ -307,7 +328,7 @@ class GeminiChat:
     async def _execute_tool(self, name: str, args: dict) -> str:
         """Execute a tool and return the result."""
         try:
-            # Discord-specific tool: read_channel_history (uses discord.py, not user token)
+            # Discord-specific tool: read_channel_history (uses user token via HTTP API)
             if name == "read_channel_history":
                 limit = int(args.get("limit", READ_HISTORY_DEFAULT))
                 result = await self.read_channel_messages(limit)
