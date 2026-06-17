@@ -486,12 +486,15 @@ def _read_dm(receiver: str, limit: int = 10) -> str:
     return header + "\n".join(lines)
 
 
-def _list_dms(limit_per_dm: int = 1) -> str:
-    """List all DM conversations with their most recent message.
+def _list_dms(limit_per_dm: int = 5) -> str:
+    """List DM conversations with their most recent messages.
 
     Args:
-        limit_per_dm: How many recent messages to show per conversation (default 1).
+        limit_per_dm: How many recent messages to show per conversation
+                      (default 5, capped to range 1-10).
     """
+    limit_per_dm = max(1, min(10, int(limit_per_dm)))
+
     dm_channels = _api_get("/users/@me/channels")
     if not dm_channels:
         return "No DM conversations found."
@@ -512,8 +515,15 @@ def _list_dms(limit_per_dm: int = 1) -> str:
     me = _api_get("/users/@me")
     my_id = me.get("id") if me else None
 
-    lines = [f"You have {len(dms)} DM conversation(s). Most recent first:\n"]
-    for i, ch in enumerate(dms[:20], 1):  # Cap at 20 to keep response readable
+    # Cap the number of conversations to keep the response readable.
+    # When showing several messages per DM, fewer conversations fit naturally.
+    max_conversations = 10 if limit_per_dm >= 3 else 20
+
+    lines = [
+        f"You have {len(dms)} DM conversation(s). "
+        f"Showing top {min(max_conversations, len(dms))} with {limit_per_dm} recent message(s) each:\n"
+    ]
+    for i, ch in enumerate(dms[:max_conversations], 1):
         recipients = ch.get("recipients", [])
         if recipients:
             r = recipients[0]
@@ -533,36 +543,52 @@ def _list_dms(limit_per_dm: int = 1) -> str:
         try:
             msgs = _api_get(
                 f"/channels/{ch['id']}/messages",
-                params={"limit": max(1, min(5, limit_per_dm))}
+                params={"limit": limit_per_dm}
             ) or []
         except Exception:
             msgs = []
 
-        if msgs:
-            # msgs come newest first; show the latest
-            last = msgs[0]
-            author = last.get("author", {})
+        if not msgs:
+            lines.append(f"{i}. {name} — (no messages)")
+            lines.append("")
+            continue
+
+        # msgs come newest first; reverse for chronological display
+        msgs_chrono = list(reversed(msgs))
+
+        # Header line with conversation name + last activity time
+        last = msgs[-1]  # newest
+        last_ts = last.get("timestamp", "")
+        try:
+            dt_last = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+            last_fmt = dt_last.strftime("%b %d, %H:%M")
+        except Exception:
+            last_fmt = "?"
+        lines.append(f"{i}. {name} — last activity {last_fmt}")
+
+        for msg in msgs_chrono:
+            author = msg.get("author", {})
             author_name = "You" if (my_id and author.get("id") == my_id) else author.get("username", "?")
-            content = (last.get("content") or "").strip()
+            content = (msg.get("content") or "").strip()
             if not content:
-                if last.get("attachments"):
+                if msg.get("attachments"):
                     content = "(attachment)"
-                elif last.get("embeds"):
+                elif msg.get("embeds"):
                     content = "(embed)"
                 else:
                     content = "(empty)"
-            timestamp_str = last.get("timestamp", "")
+            timestamp_str = msg.get("timestamp", "")
             try:
                 dt = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
-                time_fmt = dt.strftime("%b %d, %H:%M")
+                time_fmt = dt.strftime("%b %d %H:%M")
             except Exception:
                 time_fmt = "?"
-            preview = content[:80] + ("…" if len(content) > 80 else "")
-            lines.append(f"{i}. {name} — last [{time_fmt}] {author_name}: {preview}")
-        else:
-            lines.append(f"{i}. {name} — (no messages)")
+            preview = content[:120] + ("…" if len(content) > 120 else "")
+            lines.append(f"   [{time_fmt}] {author_name}: {preview}")
 
-    return "\n".join(lines)
+        lines.append("")  # blank line between conversations
+
+    return "\n".join(lines).rstrip()
 
 
 # ─── Public API (called from main.py) ────────────────────
@@ -626,7 +652,7 @@ def discord_control(parameters: dict, player=None) -> str:
             result = _read_dm(receiver, limit)
 
         elif action == "list_dms":
-            limit_per_dm = int(params.get("limit", 1))
+            limit_per_dm = int(params.get("limit", 5))
             result = _list_dms(limit_per_dm)
 
         elif action == "list_servers":

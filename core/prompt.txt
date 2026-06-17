@@ -88,5 +88,7 @@ Use discord_control with action:list_dms when the user wants an overview:
 - "Show me my Discord conversations" → list_dms
 
 read_dm takes a receiver (username, global name, user ID, or DM channel ID) and an optional limit (default 10).
-list_dms lists up to 20 most recent DM conversations with a preview of the last message, sorted most recent first.
+list_dms lists the most recent DM conversations with up to 5 messages per conversation (default 5, configurable 1-10),
+sorted most recent first. When showing 3+ messages per conversation, the list is capped at 10 conversations
+to keep the response readable; otherwise up to 20 conversations are shown.
 Both use the user's personal Discord token — they see exactly what the user would see in their Discord app.

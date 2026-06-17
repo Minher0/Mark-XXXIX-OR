@@ -227,7 +227,7 @@ TOOL_DECLARATIONS = [
                 "server":   {"type": "STRING", "description": "Server name (for send_channel, read_channel, list_channels)"},
                 "channel":  {"type": "STRING", "description": "Channel name (for send_channel, read_channel)"},
                 "message":  {"type": "STRING", "description": "Message text to send (for send_dm, send_channel)"},
-                "limit":    {"type": "INTEGER", "description": "Number of messages to read (for read_channel and read_dm, default: 10). For list_dms, number of recent messages to preview per conversation (default: 1)."}
+                "limit":    {"type": "INTEGER", "description": "Number of messages to read (for read_channel and read_dm, default: 10). For list_dms, number of recent messages to show per conversation (default: 5, max: 10). When >= 3, only the 10 most recent conversations are listed to keep the response readable."}
             },
             "required": ["action"]
         }
