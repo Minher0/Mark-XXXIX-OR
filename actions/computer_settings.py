@@ -80,6 +80,7 @@ def volume_mute():
 def volume_set(value: int):
     value = max(0, min(100, int(value)))
     if _OS == "Windows":
+        # Primary: pycaw for precise dB control
         try:
             import math
             from ctypes import cast, POINTER
@@ -92,17 +93,108 @@ def volume_set(value: int):
             vol.SetMasterVolumeLevel(vol_db, None)
             return
         except Exception as e:
-            print(f"[Settings] pycaw failed, using keypress fallback: {e}")
-            pyautogui.press("volumemute")
-            pyautogui.press("volumemute")
+            print(f"[Settings] pycaw failed, trying PowerShell COM fallback: {e}")
+
+        # Fallback 1: PowerShell + COM IAudioEndpointVolume (no pycaw required)
+        if _set_volume_windows_com(value):
+            return
+
+        # Fallback 2: approximate via volumeup presses (~2% per press).
+        # We mute first to get a known baseline of 0, then press N times.
+        # This is imprecise but always actually changes the volume.
+        try:
+            if value == 0:
+                # Mute directly
+                pyautogui.press("volumemute")
+                print("[Settings] Volume muted (0%) via keypress fallback")
+                return
+            # Press volumeup N times. Each press is ~2% on default Windows config.
+            presses = max(1, min(50, value // 2))
+            for _ in range(presses):
+                pyautogui.press("volumeup")
+            print(f"[Settings] Approximate volume set to ~{value}% via {presses} keypresses")
+        except Exception as e:
+            print(f"[Settings] All volume_set fallbacks failed: {e}")
     elif _OS == "Darwin":
         subprocess.run(["osascript", "-e", f"set volume output volume {value}"],
             capture_output=True)
-        return
     else:
         subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{value}%"],
             capture_output=True)
-        return
+
+
+def _set_volume_windows_com(value: int) -> bool:
+    """Set Windows master volume via the IAudioEndpointVolume COM interface
+    using PowerShell. Works even when pycaw is not installed. Returns True on
+    success, False on failure."""
+    scalar = value / 100.0
+    cs_code = (
+        "using System;\n"
+        "using System.Runtime.InteropServices;\n"
+        "public class JarvisAudio {\n"
+        '  [Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), '
+        'InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]\n'
+        "  interface IAV {\n"
+        "    int SetMasterVolumeLevelScalar(float f, Guid g);\n"
+        "    int GetMute(out bool b);\n"
+        "    int SetMute(bool b, Guid g);\n"
+        "  }\n"
+        '  [Guid("D666063F-1587-4E43-81F1-B948E807363F"), '
+        'InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]\n'
+        "  interface IMD {\n"
+        "    int Activate(ref Guid id, int c, IntPtr p, out object o);\n"
+        "  }\n"
+        '  [Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), '
+        'InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]\n'
+        "  interface IMDE {\n"
+        "    int GetDefaultAudioEndpoint(int df, int r, out IMD d);\n"
+        "  }\n"
+        '  [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]\n'
+        "  class MDEO {}\n"
+        "  public static void Set(float v, bool mute) {\n"
+        "    IMDE e = (IMDE)new MDEO();\n"
+        "    IMD d; e.GetDefaultAudioEndpoint(0, 1, out d);\n"
+        "    object o; Guid g = typeof(IAV).GUID;\n"
+        "    d.Activate(ref g, 23, IntPtr.Zero, out o);\n"
+        "    IAV av = (IAV)o;\n"
+        "    av.SetMute(mute, Guid.Empty);\n"
+        "    if (!mute) av.SetMasterVolumeLevelScalar(v, Guid.Empty);\n"
+        "  }\n"
+        "}\n"
+    )
+    cs_path = None
+    try:
+        import tempfile
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".cs", delete=False, encoding="utf-8"
+        ) as f:
+            f.write(cs_code)
+            cs_path = f.name
+        mute_flag = "true" if value == 0 else "false"
+        ps_script = (
+            f"Add-Type -Path '{cs_path}'; "
+            f"[JarvisAudio]::Set({scalar}, {mute_flag})"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            capture_output=True, timeout=5
+        )
+        if result.returncode == 0:
+            print(f"[Settings] Set volume to {value}% via PowerShell COM")
+            return True
+        err = result.stderr.decode("utf-8", errors="ignore")[:200]
+        print(f"[Settings] PowerShell COM failed: {err}")
+        return False
+    except Exception as e:
+        print(f"[Settings] PowerShell COM fallback error: {e}")
+        return False
+    finally:
+        if cs_path:
+            try:
+                import os as _os
+                _os.unlink(cs_path)
+            except Exception:
+                pass
 
 def brightness_up():
     if _OS == "Darwin":

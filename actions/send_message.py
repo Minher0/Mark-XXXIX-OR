@@ -11,15 +11,13 @@ pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.08
 
 def _open_app(app_name: str) -> bool:
-    """Opens an app via Windows search."""
+    """Opens an app via the shared open_app module (cross-OS, with fallbacks)."""
     try:
-        pyautogui.press("win")
-        time.sleep(0.4)
-        pyautogui.write(app_name, interval=0.04)
-        time.sleep(0.5)
-        pyautogui.press("enter")
-        time.sleep(2.0)  
-        return True
+        from actions.open_app import open_app
+        result = open_app(parameters={"app_name": app_name}, player=None)
+        lowered = result.lower()
+        # open_app returns a success message containing "opened" or "successfully"
+        return "successfully" in lowered or "opened" in lowered
     except Exception as e:
         print(f"[SendMessage] Could not open {app_name}: {e}")
         return False

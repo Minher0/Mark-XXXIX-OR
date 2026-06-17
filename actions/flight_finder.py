@@ -55,7 +55,8 @@ def _parse_date(raw: str) -> str:
     for key, val in relative.items():
         if key in lower:
             return val.strftime("%Y-%m-%d")
-# replace the try/except genai block with:
+
+    # LLM-based date conversion for natural language expressions
     try:
         from or_client import client
         result = client.chat(
