@@ -31,7 +31,17 @@ def get_base_dir():
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 
-LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+# Default Live API model for the vision session.
+# Reads the same "live_model" field as main.py for consistency, with the same
+# fallback chain in case the primary model is deprecated (1008 policy violation).
+LIVE_MODEL_DEFAULT = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+LIVE_MODEL_FALLBACKS = [
+    "models/gemini-2.5-flash-native-audio-preview-12-2025",
+    "models/gemini-live-2.5-flash-preview",
+    "models/gemini-2.0-flash-live-001",
+    "models/gemini-2.0-flash-exp-native-audio",
+]
+
 CHANNELS            = 1
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
@@ -61,6 +71,19 @@ def _get_api_key() -> str:
         return key
     except Exception as e:
         raise RuntimeError(f"Could not load API key: {e}")
+
+
+def _load_live_model() -> str:
+    """Read the Live API model from config. Falls back to default if missing."""
+    try:
+        with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        model = (data.get("live_model") or "").strip()
+        if not model:
+            return LIVE_MODEL_DEFAULT
+        return model if model.startswith("models/") else f"models/{model}"
+    except Exception:
+        return LIVE_MODEL_DEFAULT
 
 
 def _get_camera_index() -> int:
@@ -185,34 +208,79 @@ class _LiveSession:
             http_options={"api_version": "v1beta"}
         )
 
-        config = types.LiveConnectConfig(
-            response_modalities=["AUDIO"],
-            output_audio_transcription={},
-            system_instruction=SYSTEM_PROMPT,
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name="Charon"
+        # Build config — output_audio_transcription is kept because the vision
+        # session uses the transcribed text for logging. If a model rejects it
+        # with 1008, we'll retry below with a stripped-down config.
+        def _build_config(minimal: bool = False) -> types.LiveConnectConfig:
+            kwargs = dict(
+                response_modalities=["AUDIO"],
+                system_instruction=SYSTEM_PROMPT,
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name="Charon"
+                        )
                     )
-                )
-            ),
-        )
+                ),
+            )
+            if not minimal:
+                kwargs["output_audio_transcription"] = {}
+            return types.LiveConnectConfig(**kwargs)
+
+        failed_models: set[str] = set()
+        current_model: str = _load_live_model()
+        use_minimal: bool = False
 
         while True:
+            # Pick a model that hasn't failed yet
+            if current_model in failed_models:
+                candidates = [current_model] + [
+                    m for m in LIVE_MODEL_FALLBACKS if m != current_model
+                ]
+                next_model = next(
+                    (m for m in candidates if m not in failed_models), None
+                )
+                if next_model is None:
+                    # All models failed — reset and wait before retrying
+                    print("[ScreenProcess] 🔴 All vision models exhausted — resetting and waiting 30s")
+                    failed_models.clear()
+                    use_minimal = False
+                    self._session = None
+                    self._ready.clear()
+                    await asyncio.sleep(30)
+                    continue
+                current_model = next_model
+                use_minimal = False  # Reset minimal flag for the new model
+
             try:
-                print("[ScreenProcess] 🔌 Vision session connecting...")
-                async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
+                cfg_kind = "minimal" if use_minimal else "full"
+                print(f"[ScreenProcess] 🔌 Vision session connecting (model={current_model}, config={cfg_kind})...")
+                config = _build_config(minimal=use_minimal)
+                async with client.aio.live.connect(model=current_model, config=config) as session:
                     self._session = session
                     self._ready.set()
-                    print("[ScreenProcess] ✅ Vision session connected")
+                    print(f"[ScreenProcess] ✅ Vision session connected (model={current_model})")
                     async with asyncio.TaskGroup() as tg:
                         tg.create_task(self._send_loop())
                         tg.create_task(self._recv_loop())
                         tg.create_task(self._play_loop())
             except Exception as e:
+                err_str = str(e)
                 print(f"[ScreenProcess] ⚠️ Disconnected: {e} — reconnecting...")
                 self._session = None
                 self._ready.clear()
+
+                # 1008 policy violation — same recovery strategy as main.py:
+                # try minimal config first, then move on to the next model
+                if "1008" in err_str:
+                    if not use_minimal:
+                        print("[ScreenProcess]    Retrying with minimal config (no transcription)...")
+                        use_minimal = True
+                    else:
+                        print(f"[ScreenProcess]    Marking model '{current_model}' as failed.")
+                        failed_models.add(current_model)
+                        use_minimal = False
+
                 await asyncio.sleep(2)
                 self._ready.set()
 

@@ -46,7 +46,23 @@ def get_base_dir():
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
-LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+
+# Default Live API model — preview audio model that supports realtime voice.
+# Can be overridden via the "live_model" field in config/api_keys.json
+# (with or without the "models/" prefix).
+LIVE_MODEL_DEFAULT  = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+
+# Fallback chain — if the primary model is rejected (e.g. 1008 policy violation
+# because the preview was deprecated), Jarvis tries each of these in order.
+# The last known-good model is sticky: once one succeeds, it's reused on
+# reconnects until it fails.
+LIVE_MODEL_FALLBACKS = [
+    "models/gemini-2.5-flash-native-audio-preview-12-2025",
+    "models/gemini-live-2.5-flash-preview",
+    "models/gemini-2.0-flash-live-001",
+    "models/gemini-2.0-flash-exp-native-audio",
+]
+
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
@@ -56,6 +72,24 @@ CHUNK_SIZE          = 1024
 def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)["gemini_api_key"]
+
+
+def _load_live_model() -> str:
+    """Load the Live API model name from config/api_keys.json.
+
+    Falls back to LIVE_MODEL_DEFAULT if missing or unreadable.
+    The "models/" prefix is added automatically if the user typed just the
+    model slug.
+    """
+    try:
+        with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        model = (data.get("live_model") or "").strip()
+        if not model:
+            return LIVE_MODEL_DEFAULT
+        return model if model.startswith("models/") else f"models/{model}"
+    except Exception:
+        return LIVE_MODEL_DEFAULT
 
 
 def _load_system_prompt() -> str:
@@ -669,6 +703,15 @@ class JarvisLive:
         self._speaking_lock = threading.Lock()
         self.ui.on_text_command = self._on_text_command
 
+        # Live model selection state
+        # _live_model: the model that will be tried on the next connect()
+        # _failed_models: models that 1008'd and should be skipped
+        # _minimal_config_tried: True if we already tried the minimal config
+        #                        with the current model — avoids infinite loops
+        self._live_model: str          = _load_live_model()
+        self._failed_models: set[str]  = set()
+        self._minimal_config_tried: bool = False
+
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
             return
@@ -704,7 +747,15 @@ class JarvisLive:
         self.ui.write_log(f"ERR: {tool_name} — {short}")
         self.speak(f"Sir, {tool_name} encountered an error. {short}")
 
-    def _build_config(self) -> types.LiveConnectConfig:
+    def _build_config(self, minimal: bool = False) -> types.LiveConnectConfig:
+        """Build the Live API connection config.
+
+        Args:
+            minimal: When True, drops optional features (audio transcription,
+                     tools) to maximise compatibility with models that reject
+                     the full config. Used as a last-resort fallback when the
+                     primary config triggers 1008 policy violations.
+        """
         from datetime import datetime
 
         memory     = load_memory()
@@ -724,13 +775,14 @@ class JarvisLive:
             parts.append(mem_str)
         parts.append(sys_prompt)
 
-        return types.LiveConnectConfig(
+        # NOTE: `session_resumption=types.SessionResumptionConfig()` was removed.
+        # Passing an empty SessionResumptionConfig requests the session-resumption
+        # feature without a handle, which some preview models reject with
+        # "1008 policy violation — Operation is not implemented, or supported,
+        # or enabled". Only enable it explicitly when we actually want to resume.
+        kwargs = dict(
             response_modalities=["AUDIO"],
-            output_audio_transcription={},
-            input_audio_transcription={},
             system_instruction="\n".join(parts),
-            tools=[{"function_declarations": TOOL_DECLARATIONS}],
-            session_resumption=types.SessionResumptionConfig(),
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
@@ -739,6 +791,15 @@ class JarvisLive:
                 )
             ),
         )
+
+        if not minimal:
+            # Transcription enables text mirroring of audio in/out — useful for
+            # logging and memory extraction, but not supported on all models.
+            kwargs["output_audio_transcription"] = {}
+            kwargs["input_audio_transcription"]  = {}
+            kwargs["tools"] = [{"function_declarations": TOOL_DECLARATIONS}]
+
+        return types.LiveConnectConfig(**kwargs)
 
     def _intercept_memory_open(self, name: str, args: dict) -> dict:
         """Redirect any memory-opening request to cmd_control open_memory."""
@@ -1045,6 +1106,23 @@ class JarvisLive:
             stream.stop()
             stream.close()
 
+    def _pick_next_model(self) -> str | None:
+        """Pick the next model to try, skipping failed ones.
+
+        Iterates over LIVE_MODEL_FALLBACKS (which includes the user-configured
+        model first via _load_live_model when it's also the default). Returns
+        None if every model in the chain has been marked failed.
+        """
+        # Build an ordered candidate list starting with the configured model,
+        # then appending any fallbacks not already in the list.
+        candidates = [self._live_model] + [
+            m for m in LIVE_MODEL_FALLBACKS if m != self._live_model
+        ]
+        for m in candidates:
+            if m not in self._failed_models:
+                return m
+        return None
+
     async def run(self):
         client = genai.Client(
             api_key=_get_api_key(),
@@ -1055,13 +1133,30 @@ class JarvisLive:
         max_delay = 30
 
         while True:
-            try:
-                print("[JARVIS] 🔌 Connecting...")
+            # Pick the model to try this round
+            model = self._pick_next_model()
+            if model is None:
+                # Every model has failed — reset and wait longer before retrying
+                print("[JARVIS] 🔴 All Live models exhausted. Resetting failed list and waiting 60s.")
+                self._failed_models.clear()
+                self._minimal_config_tried = False
                 self.ui.set_state("THINKING")
-                config = self._build_config()
+                await asyncio.sleep(60)
+                continue
+
+            # Decide whether to use minimal config: only when the current model
+            # has already failed once with the full config (i.e. it's in the
+            # failed list) AND we haven't tried minimal yet for this round.
+            use_minimal = self._minimal_config_tried
+
+            try:
+                cfg_kind = "minimal" if use_minimal else "full"
+                print(f"[JARVIS] 🔌 Connecting with model={model} config={cfg_kind}")
+                self.ui.set_state("THINKING")
+                config = self._build_config(minimal=use_minimal)
 
                 async with (
-                    client.aio.live.connect(model=LIVE_MODEL, config=config) as session,
+                    client.aio.live.connect(model=model, config=config) as session,
                     asyncio.TaskGroup() as tg,
                 ):
                     self.session        = session
@@ -1069,37 +1164,67 @@ class JarvisLive:
                     self.audio_in_queue = asyncio.Queue()
                     self.out_queue      = asyncio.Queue(maxsize=10)
 
-                    print("[JARVIS] ✅ Connected.")
+                    print(f"[JARVIS] ✅ Connected (model={model}, config={cfg_kind}).")
                     self.ui.set_state("LISTENING")
                     self.ui.write_log("SYS: JARVIS online.")
                     reconnect_delay = 3  # Reset on successful connection
+
+                    # Sticky success — remember the working model for next reconnect
+                    self._live_model = model
+                    self._minimal_config_tried = False
+                    self._failed_models.discard(model)
 
                     tg.create_task(self._send_realtime())
                     tg.create_task(self._listen_audio())
                     tg.create_task(self._receive_audio())
                     tg.create_task(self._play_audio())
-                    
+
             except BaseException as e:
                 err_str = str(e)
 
-                # ExceptionGroup from TaskGroup contains sub-exceptions
+                # Extract sub-exceptions from TaskGroup if present
+                sub_errors = [str(sub) for sub in e.exceptions] if isinstance(e, ExceptionGroup) else []
+                all_errs = " | ".join([err_str] + sub_errors)
+
                 if isinstance(e, ExceptionGroup):
                     for sub in e.exceptions:
                         print(f"[JARVIS] ⚠️ TaskGroup sub-error: {sub}")
-                        sub_str = str(sub)
-                        if "1011" in sub_str:
-                            print("[JARVIS] 🔴 Gemini API 1011 internal error — server-side issue, retrying...")
                 else:
                     print(f"[JARVIS] ⚠️ {e}")
                     traceback.print_exc()
 
-                # Log specific error type for debugging
-                if "1011" in err_str:
+                # ── 1008 policy violation — model rejected or unsupported feature ──
+                # Two-pronged recovery:
+                #   1. If we were on full config, try minimal config with the same model
+                #      (in case transcription/tools were the culprit).
+                #   2. If we were already on minimal config, mark the model as failed
+                #      and move on to the next one in the fallback chain.
+                if "1008" in all_errs:
+                    print("[JARVIS] 🔴 1008 policy violation — model or feature rejected by Gemini Live API")
+                    if not use_minimal:
+                        # First failure on full config → retry same model with minimal config
+                        self._minimal_config_tried = True
+                        print(f"[JARVIS]    Retrying {model} with minimal config (no transcription, no tools)...")
+                        reconnect_delay = 1  # Quick retry — same model, different config
+                    else:
+                        # Minimal config also failed → mark model and move on
+                        print(f"[JARVIS]    Marking model '{model}' as failed. Trying next fallback.")
+                        self._failed_models.add(model)
+                        self._minimal_config_tried = False
+                        reconnect_delay = 2
+                # ── 1011 internal error — server-side, just retry ──
+                elif "1011" in all_errs:
                     print("[JARVIS] 🔴 Gemini API 1011 internal error — server-side issue, retrying...")
-                elif "429" in err_str:
-                    print("[JARVIS] 🔴 Rate limited by Gemini API")
-                elif "quota" in err_str.lower():
-                    print("[JARVIS] 🔴 Quota exceeded")
+                # ── 401 / invalid API key — auth issue ──
+                elif "401" in all_errs or "API key not valid" in all_errs:
+                    print("[JARVIS] 🔴 Invalid Gemini API key — fix config/api_keys.json and restart Jarvis.")
+                    self.ui.set_state("THINKING")
+                    await asyncio.sleep(30)
+                    continue
+                # ── 429 / quota — rate limited, wait longer ──
+                elif "429" in all_errs or "quota" in all_errs.lower():
+                    print("[JARVIS] 🔴 Rate limited / quota exceeded by Gemini API")
+                    reconnect_delay = max(reconnect_delay, 30)
 
             self.set_speaking(False)
             self.session = None
