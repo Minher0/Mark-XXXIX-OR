@@ -33,6 +33,8 @@ MEMORY_PATH = BASE_DIR / "memory" / "long_term.json"
 MAX_HISTORY = 30          # Max messages per channel context
 MAX_RESPONSE = 2000       # Discord message limit
 RESPONSE_COOLDOWN = 2     # Seconds between responses per channel
+READ_HISTORY_DEFAULT = 15 # Default number of messages to read from channel history
+READ_HISTORY_MAX = 50     # Max number of messages to read from channel history
 
 
 def _load_keys() -> dict:
@@ -70,12 +72,40 @@ def _load_system_prompt() -> str:
 class GeminiChat:
     """Lightweight Gemini chat for Discord — no audio, just text + tools."""
 
+    # Discord-specific tool declarations (uses discord.py, not user token)
+    DISCORD_BOT_TOOLS = [
+        {
+            "name": "read_channel_history",
+            "description": (
+                "Reads recent messages from the current Discord channel to get conversation context. "
+                "Use this when you need to understand what people are talking about before responding, "
+                "for example when asked to 'respond to someone' or 'answer this person'. "
+                "Returns the last N messages with author names and timestamps. "
+                "You don't need to use this every time — only when you need context about the ongoing conversation."
+            ),
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "limit": {
+                        "type": "INTEGER",
+                        "description": f"Number of recent messages to read (default: {READ_HISTORY_DEFAULT}, max: {READ_HISTORY_MAX})"
+                    }
+                },
+                "required": []
+            }
+        }
+    ]
+
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.model = "gemini-2.5-flash-preview-05-20"
         self.system_prompt = _load_system_prompt()
         # Per-channel conversation history
         self._histories: dict[str, list] = {}
+        # Reference to the current Discord channel (set per-request)
+        self._current_channel = None
+        # Reference to the Discord bot user (to exclude own messages from history)
+        self._bot_user = None
         # Load tool declarations
         self.tools = []
         self._load_tools()
@@ -83,10 +113,13 @@ class GeminiChat:
     def _load_tools(self):
         try:
             from main import TOOL_DECLARATIONS
-            # Convert to Gemini API format
-            self.tools = [{"function_declarations": TOOL_DECLARATIONS}]
+            # Merge main tools + Discord-specific tools
+            all_declarations = TOOL_DECLARATIONS + self.DISCORD_BOT_TOOLS
+            self.tools = [{"function_declarations": all_declarations}]
         except ImportError:
             print("[DiscordBot] ⚠️ Could not load tool declarations")
+            # Still add Discord-specific tools
+            self.tools = [{"function_declarations": self.DISCORD_BOT_TOOLS}]
 
     def _get_history(self, channel_id: str) -> list:
         if channel_id not in self._histories:
@@ -98,8 +131,62 @@ class GeminiChat:
         if len(hist) > MAX_HISTORY:
             self._histories[channel_id] = hist[-MAX_HISTORY:]
 
-    async def chat(self, text: str, channel_id: str) -> str:
-        """Send a message and get a response using Gemini API."""
+    async def read_channel_messages(self, limit: int = READ_HISTORY_DEFAULT) -> str:
+        """Read recent messages from the current Discord channel using discord.py."""
+        if not self._current_channel:
+            return "No Discord channel available."
+
+        try:
+            limit = min(max(1, limit), READ_HISTORY_MAX)
+            messages = []
+            async for msg in self._current_channel.history(limit=limit + 5):
+                # Skip bot's own messages
+                if self._bot_user and msg.author == self._bot_user:
+                    continue
+                messages.append(msg)
+                if len(messages) >= limit:
+                    break
+
+            if not messages:
+                return "No messages found in this channel."
+
+            # Format messages chronologically (oldest first)
+            messages.reverse()
+            lines = []
+            for msg in messages:
+                author = msg.author.display_name or msg.author.name
+                content = msg.content or "(embed/attachment)"
+                # Add timestamp
+                time_fmt = msg.created_at.strftime("%H:%M") if msg.created_at else "?"
+                # Add reply reference if present
+                reply_info = ""
+                if msg.reference and msg.reference.resolved:
+                    replied_author = msg.reference.resolved.author.display_name or msg.reference.resolved.author.name
+                    replied_content = (msg.reference.resolved.content or "")[:50]
+                    reply_info = f" (reply to {replied_author}: {replied_content}...)"
+                lines.append(f"[{time_fmt}] {author}: {content}{reply_info}")
+
+            channel_name = getattr(self._current_channel, 'name', 'DM')
+            guild_name = getattr(self._current_channel, 'guild', None)
+            server_info = f" ({guild_name.name})" if guild_name else ""
+            header = f"Last {len(lines)} messages in #{channel_name}{server_info}:\n"
+            return header + "\n".join(lines)
+
+        except Exception as e:
+            return f"Error reading channel history: {e}"
+
+    async def chat(self, text: str, channel_id: str, discord_channel=None, bot_user=None) -> str:
+        """Send a message and get a response using Gemini API.
+        
+        Args:
+            text: The user's message text
+            channel_id: Channel ID string for history tracking
+            discord_channel: The discord.Channel object (needed for read_channel_history tool)
+            bot_user: The bot's discord.User object (to exclude from channel history reads)
+        """
+        # Store channel reference for tool execution
+        self._current_channel = discord_channel
+        self._bot_user = bot_user
         try:
             import google.genai as genai
             from google.genai import types
@@ -134,19 +221,70 @@ class GeminiChat:
                 config=config,
             )
 
-            # Check for tool calls
+            # Check for tool calls — may need multiple rounds
             if response.candidates and response.candidates[0].content.parts:
+                # Collect all function calls and text parts
+                function_calls = []
                 result_text = ""
                 for part in response.candidates[0].content.parts:
                     if part.function_call:
-                        # Execute tool
-                        tool_result = await self._execute_tool(
-                            part.function_call.name,
-                            dict(part.function_call.args) if part.function_call.args else {}
-                        )
-                        result_text += f"🔧 **{part.function_call.name}**: {tool_result[:500]}\n"
+                        function_calls.append(part.function_call)
                     elif part.text:
                         result_text += part.text
+
+                # Execute function calls and feed results back to Gemini
+                if function_calls:
+                    # Add the model's response (with function calls) to history
+                    history.append({"role": "model", "content": response.candidates[0].content.parts})
+
+                    for fc in function_calls:
+                        # Execute the tool
+                        tool_result = await self._execute_tool(
+                            fc.name,
+                            dict(fc.args) if fc.args else {}
+                        )
+
+                        # For read_channel_history, feed the result back to Gemini
+                        # so it can use the context to generate a proper response
+                        if fc.name == "read_channel_history":
+                            # Add tool result as a function response, then continue conversation
+                            history.append({"role": "user", "content": f"[Channel History Result]\n{tool_result}"})
+
+                            # Re-call Gemini with the channel context now available
+                            contents = []
+                            for msg in history:
+                                if isinstance(msg.get("content"), list):
+                                    # Model response with function calls — reconstruct
+                                    parts = []
+                                    for p in msg["content"]:
+                                        if hasattr(p, 'text') and p.text:
+                                            parts.append(types.Part.from_text(text=p.text))
+                                        elif hasattr(p, 'function_call') and p.function_call:
+                                            parts.append(types.Part.from_function_call(
+                                                name=p.function_call.name,
+                                                args=dict(p.function_call.args) if p.function_call.args else {}
+                                            ))
+                                    contents.append(types.Content(role=msg["role"], parts=parts))
+                                else:
+                                    contents.append(types.Content(
+                                        role=msg["role"],
+                                        parts=[types.Part.from_text(text=msg["content"])]
+                                    ))
+
+                            followup_response = await asyncio.to_thread(
+                                client.models.generate_content,
+                                model=self.model,
+                                contents=contents,
+                                config=config,
+                            )
+
+                            if followup_response.text:
+                                history.append({"role": "model", "content": followup_response.text})
+                                self._trim_history(channel_id)
+                                return followup_response.text
+                            return "Je n'ai pas pu générer de réponse après avoir lu l'historique."
+                        else:
+                            result_text += f"🔧 **{fc.name}**: {tool_result[:500]}\n"
 
                 if result_text.strip():
                     history.append({"role": "model", "content": result_text})
@@ -169,6 +307,12 @@ class GeminiChat:
     async def _execute_tool(self, name: str, args: dict) -> str:
         """Execute a tool and return the result."""
         try:
+            # Discord-specific tool: read_channel_history (uses discord.py, not user token)
+            if name == "read_channel_history":
+                limit = int(args.get("limit", READ_HISTORY_DEFAULT))
+                result = await self.read_channel_messages(limit)
+                return str(result)
+
             # Import tool dispatch from local_mode or main
             # We'll use a simplified version here
             from actions.web_search import web_search as web_search_action
@@ -296,8 +440,12 @@ async def run_discord_bot():
 
         # Show typing indicator
         async with message.channel.typing():
-            # Get Gemini response
-            response = await gemini.chat(text, channel_id)
+            # Get Gemini response (pass channel & bot user for read_channel_history tool)
+            response = await gemini.chat(
+                text, channel_id,
+                discord_channel=message.channel,
+                bot_user=bot.user
+            )
 
         # Discord has a 2000 char limit
         if len(response) > MAX_RESPONSE:
@@ -352,7 +500,8 @@ async def run_discord_bot():
             "• `!jarvis clear` — Effacer la mémoire\n"
             "• `!jarvis servers` — Liste des serveurs\n"
             "• `!jarvis help` — Ce message\n\n"
-            "Je peux aussi utiliser des outils: recherche web, météo, contrôler Discord, etc."
+            "Je peux aussi utiliser des outils: recherche web, météo, contrôler Discord, etc.\n"
+            "Si tu me demandes de répondre à quelqu'un, je peux lire les derniers messages du salon pour avoir le contexte."
         )
 
     print("[DiscordBot] 🚀 Starting...")
