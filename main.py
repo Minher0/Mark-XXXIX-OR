@@ -181,10 +181,14 @@ TOOL_DECLARATIONS = [
         "description": (
             "Controls media playback on the system. Works system-wide regardless of which app is focused. "
             "Use for: play/pause music or videos, skip to next track, go back to previous track, "
-            "stop playback, seek forward or backward, and check what's currently playing. "
+            "stop playback, seek forward or backward, check what's currently playing, AND adjust the "
+            "volume of the currently playing media app (per-app, NOT system-wide). "
             "Supports Spotify, YouTube Music, Apple Music, VLC, and any media app. "
             "Use this when the user says: pause, play, skip, next, previous, what's playing, "
-            "qu'est-ce qui joue, met pause, passe, reviens, etc."
+            "qu'est-ce qui joue, met pause, passe, reviens, baisse la musique, monte le son de Spotify, etc. "
+            "For SYSTEM-WIDE volume, use computer_settings volume_set instead. "
+            "For per-app volume targeting a SPECIFIC app by name (not necessarily the playing one), "
+            "use computer_settings set_app_volume."
         ),
         "parameters": {
             "type": "OBJECT",
@@ -192,13 +196,21 @@ TOOL_DECLARATIONS = [
                 "action": {
                     "type": "STRING",
                     "description": (
-                        "play_pause | next | previous | stop | seek | now_playing  "
+                        "play_pause | next | previous | stop | seek | now_playing | volume  "
                         "(default: play_pause)"
                     )
                 },
                 "seconds": {
                     "type": "INTEGER",
                     "description": "Seconds to seek forward (positive) or backward (negative). Default: 10"
+                },
+                "value": {
+                    "type": "INTEGER",
+                    "description": "For volume action: target volume 0-100 (only used when mode=set)."
+                },
+                "mode": {
+                    "type": "STRING",
+                    "description": "Sub-action for volume: set (default if value given) | up | down | mute | unmute."
                 },
             },
             "required": []
@@ -329,14 +341,17 @@ TOOL_DECLARATIONS = [
             "Controls the computer: volume, brightness, window management, keyboard shortcuts, "
             "typing text on screen, closing apps, fullscreen, dark mode, WiFi, restart, shutdown, "
             "scrolling, tab management, zoom, screenshots, lock screen, refresh/reload page. "
+            "Volume actions: volume_set (system-wide master 0-100), set_app_volume (per-app Volume "
+            "Mixer slider, requires app_name + value 0-100). "
             "Use for ANY single computer control command. NEVER route to agent_task."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "The action to perform"},
-                "description": {"type": "STRING", "description": "Natural language description of what to do"},
-                "value":       {"type": "STRING", "description": "Optional value: volume level, text to type, etc."}
+                "action":      {"type": "STRING", "description": "The action to perform. Volume-related: volume_set, set_app_volume. See ACTION_MAP in source for full list."},
+                "description": {"type": "STRING", "description": "Natural language description of what to do (used for LLM intent routing when 'action' is empty)"},
+                "value":       {"type": "STRING", "description": "Optional value: volume level (0-100), text to type, etc."},
+                "app_name":    {"type": "STRING", "description": "For set_app_volume: target application name (e.g. 'Spotify', 'Discord', 'chrome'). Match is case-insensitive and partial."}
             },
             "required": []
         }

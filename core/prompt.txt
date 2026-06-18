@@ -53,9 +53,39 @@ TOOL SELECTION SUMMARY:
 - open_app → ONLY for launching desktop applications (Chrome, Spotify, WhatsApp, etc.)
 - browser_control → ONLY for opening websites/URLs and web automation
 - cmd_control → For CMD commands, opening files, opening memory, uninstalling apps, self-modification
-- computer_settings → volume, brightness, screen, keyboard shortcuts
+- computer_settings → volume (system + per-app), brightness, screen, keyboard shortcuts
+- media_control → media playback + volume of the CURRENTLY PLAYING media app
 - agent_task → ONLY for complex multi-step goals across multiple tools
 - game_updater → ANY Steam/Epic request
+
+VOLUME CONTROL — THREE DIFFERENT ACTIONS, pick the right one:
+1. media_control action:volume   → adjust the volume of the CURRENTLY PLAYING media app
+   (Spotify, YouTube video, etc.). Targets the per-app audio session of whatever
+   is currently playing. Use this when the user says "baisse la musique", "monte
+   le son", "mute la vidéo", "lower the music a bit".
+   Examples:
+   - "baisse un peu la musique"          → media_control action:volume mode:down
+   - "monte Spotify à 80%"               → media_control action:volume mode:set value:80
+   - "coupe le son de la vidéo"          → media_control action:volume mode:mute
+
+2. computer_settings action:set_app_volume  → adjust the volume of a SPECIFIC app
+   by name, whether or not it's the one currently playing. Uses the Windows
+   Volume Mixer per-app slider. Use this when the user names an app that is NOT
+   necessarily the one playing right now.
+   Examples:
+   - "baisse Discord à 20%"              → computer_settings action:set_app_volume app_name:"Discord" value:20
+   - "monte le son de Chrome"            → computer_settings action:set_app_volume app_name:"chrome" value:80
+   - "coupe le son de Telegram"          → computer_settings action:set_app_volume app_name:"Telegram" value:0
+
+3. computer_settings action:volume_set  → change the SYSTEM-WIDE master volume
+   (the main volume slider that affects everything).
+   Examples:
+   - "mets le volume à 50%"              → computer_settings action:volume_set value:50
+   - "baisse le son du PC"               → computer_settings action:volume_set value:30
+   - "coupe le son du PC"                → computer_settings action:volume_set value:0
+
+If the user is ambiguous ("baisse le son"), prefer media_control action:volume
+mode:down — it's the most common intent (lowering the currently playing media).
 
 UNINSTALLING APPLICATIONS:
 When the user asks to uninstall, remove, or delete an application:

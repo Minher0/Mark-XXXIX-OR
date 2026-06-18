@@ -196,6 +196,129 @@ def _set_volume_windows_com(value: int) -> bool:
             except Exception:
                 pass
 
+
+def set_app_volume(app_name: str, value: int) -> str:
+    """Set the per-application volume (Volume Mixer slider on Windows).
+
+    Args:
+        app_name: Process name (e.g. "Spotify", "Discord", "chrome"). Match is
+                  case-insensitive, partial, and extension-agnostic
+                  (".exe" is stripped automatically).
+        value:    Target volume 0-100 (percentage).
+
+    Returns a status string. On macOS/Linux, per-app volume control is
+    limited; we fall back to playerctl on Linux and AppleScript on macOS
+    (Spotify/Music only).
+    """
+    value = max(0, min(100, int(value)))
+    app_query = (app_name or "").lower().replace(".exe", "").strip()
+    if not app_query:
+        return "Please specify an application name."
+
+    # ── Windows: pycaw per-session ISimpleAudioVolume ──
+    if _OS == "Windows":
+        try:
+            from ctypes import cast, POINTER
+            from comtypes import CLSCTX_ALL
+            from pycaw.pycaw import AudioUtilities, IAudioSessionManager2, ISimpleAudioVolume
+            import psutil
+
+            devices   = AudioUtilities.GetSpeakers()
+            interface = devices.Activate(IAudioSessionManager2._iid_, CLSCTX_ALL, None)
+            manager   = cast(interface, POINTER(IAudioSessionManager2))
+            sessions  = manager.GetSessionEnumerator()
+
+            matches = []
+            for i in range(sessions.GetCount()):
+                sess = sessions.GetSession(i)
+                try:
+                    pid = sess.ProcessId
+                    if pid == 0:
+                        continue
+                    try:
+                        proc_name = psutil.Process(pid).name().lower().replace(".exe", "")
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+                    # Partial match in either direction
+                    if app_query in proc_name or proc_name in app_query:
+                        matches.append((sess, proc_name, pid))
+                except Exception:
+                    continue
+
+            if not matches:
+                return f"No audio session found for '{app_name}'. Is the app running?"
+
+            scalar = value / 100.0
+            results = []
+            for sess, proc_name, pid in matches:
+                try:
+                    vol = sess._ctl.QueryInterface(ISimpleAudioVolume)
+                    vol.SetMasterVolume(scalar, None)
+                    # Also unmute so the new volume is audible
+                    vol.SetMute(False, None)
+                    results.append(f"{proc_name} → {value}%")
+                except Exception as e:
+                    results.append(f"{proc_name} → failed ({e})")
+
+            return "App volume set: " + ", ".join(results)
+
+        except ImportError:
+            return (
+                "pycaw is not installed. Install with: pip install pycaw comtypes. "
+                "Per-app volume control requires these packages on Windows."
+            )
+        except Exception as e:
+            return f"Could not set app volume: {e}"
+
+    # ── macOS: only Spotify/Music support sound volume via AppleScript ──
+    if _OS == "Darwin":
+        # Map common app names to their AppleScript target
+        as_map = {
+            "spotify": ("Spotify", "Spotify"),
+            "music": ("Music", "Apple Music"),
+            "apple music": ("Music", "Apple Music"),
+            "itunes": ("Music", "Apple Music"),
+        }
+        target = None
+        for key, val in as_map.items():
+            if key in app_query:
+                target = val
+                break
+        if not target:
+            return (
+                f"Per-app volume for '{app_name}' is not supported on macOS. "
+                "Only Spotify and Apple Music expose volume control via AppleScript."
+            )
+        app, label = target
+        try:
+            subprocess.run([
+                "osascript", "-e",
+                f'tell application "{app}" to set sound volume to {value}'
+            ], capture_output=True, timeout=5)
+            return f"{label} volume set to {value}%."
+        except Exception as e:
+            return f"Could not set {label} volume: {e}"
+
+    # ── Linux: limited support via playerctl ──
+    if _OS == "Linux":
+        # playerctl controls the active player's volume, not per-app
+        try:
+            v = value / 100.0
+            subprocess.run(["playerctl", "volume", f"{v}"],
+                           capture_output=True, timeout=5)
+            return (
+                f"Set active media player volume to {value}%. "
+                f"Note: Linux doesn't expose per-app volume control — this only "
+                f"affects the currently active playerctl player."
+            )
+        except FileNotFoundError:
+            return "Install 'playerctl' for media volume control: sudo apt install playerctl"
+        except Exception as e:
+            return f"Could not set media volume: {e}"
+
+    return f"Per-app volume control is not supported on {_OS}."
+
+
 def brightness_up():
     if _OS == "Darwin":
         subprocess.run(["osascript", "-e",
@@ -658,14 +781,17 @@ def _detect_action(description: str) -> dict:
     from or_client import client
 
     available = ", ".join(sorted(ACTION_MAP.keys())) + \
-                ", volume_set, type_text, press_key, reload_n"
+                ", volume_set, set_app_volume, type_text, press_key, reload_n"
 
     prompt = f"""You are an intent detector for a computer control assistant.
 The user issued a command (possibly in any language): "{description}"
 Available actions: {available}
-Return ONLY a valid JSON object: {{"action": "action_name", "value": null_or_value}}
+Return ONLY a valid JSON object: {{"action": "action_name", "value": null_or_value, "app_name": null_or_app_name}}
 Rules:
-- For volume_set: value is an integer 0-100.
+- For volume_set: value is an integer 0-100 (system-wide master volume).
+- For set_app_volume: value is an integer 0-100, app_name is the target process name
+  (e.g. "Spotify", "Discord", "chrome"). Use this when the user wants to change
+  the volume of a SPECIFIC app rather than the whole system.
 - For type_text: value is the exact text to type.
 - For press_key: value is the key name (e.g. "f5", "tab", "enter").
 - For reload_n: value is an integer.
@@ -697,6 +823,10 @@ def computer_settings(
         raw_action = detected.get("action", "")
         if value is None:
             value = detected.get("value")
+        # Propagate app_name from the detector (used by set_app_volume)
+        if not params.get("app_name") and detected.get("app_name"):
+            params = dict(params)  # don't mutate caller's dict
+            params["app_name"] = detected["app_name"]
 
     action = raw_action.lower().strip().replace(" ", "_").replace("-", "_")
 
@@ -718,9 +848,19 @@ def computer_settings(
     if action == "volume_set":
         try:
             volume_set(int(value or 50))
-            return f"Volume set to {value}%."
+            return f"System volume set to {value}%."
         except Exception as e:
             return f"Could not set volume: {e}"
+
+    if action in ("set_app_volume", "app_volume", "per_app_volume"):
+        app_name = str(params.get("app_name") or params.get("application") or "").strip()
+        if not app_name:
+            return "Please specify the app name (e.g. app_name='Spotify')."
+        try:
+            vol_value = int(value if value is not None else params.get("volume", 50))
+        except (ValueError, TypeError):
+            return f"Invalid volume value: {value}. Must be 0-100."
+        return set_app_volume(app_name, vol_value)
 
     if action in ("type_text", "write_on_screen", "type", "write"):
         text = str(value or params.get("text", "")).strip()

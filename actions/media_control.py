@@ -554,6 +554,248 @@ def _now_playing_linux() -> str:
         return f"Could not get media info: {e}"
 
 
+# ─── Volume (per-media / per-app) ───────────────────────────
+
+def _volume_windows(value: int | None, mode: str) -> str:
+    """Control the volume of the currently playing media on Windows.
+
+    Strategy:
+      1. Identify the currently playing app via the SMTC API (same as
+         _now_playing_windows). Returns the SourceAppUserModelId.
+      2. Use pycaw to find the audio session matching that app's process
+         and call ISimpleAudioVolume.SetMasterVolume(scalar, None).
+      3. Fallback: if no app is currently playing, return a helpful message.
+
+    `mode` is one of: "set", "up", "down", "mute", "unmute".
+    `value` is 0-100 when mode is "set", ignored otherwise.
+    """
+    # Step 1: find which app is currently playing media
+    app_name = _get_current_media_app_windows()
+    if not app_name:
+        return "No media is currently playing. Use volume_set on computer_settings for system volume."
+
+    # Step 2: use pycaw to control that app's audio session volume
+    try:
+        from ctypes import cast, POINTER
+        from comtypes import CLSCTX_ALL
+        from pycaw.pycaw import AudioUtilities, IAudioSessionManager2
+
+        devices   = AudioUtilities.GetSpeakers()
+        interface = devices.Activate(IAudioSessionManager2._iid_, CLSCTX_ALL, None)
+        manager   = cast(interface, POINTER(IAudioSessionManager2))
+        sessions  = manager.GetSessionEnumerator()
+
+        target_session = None
+        for i in range(sessions.GetCount()):
+            sess = sessions.GetSession(i)
+            try:
+                proc_id = sess.ProcessId
+                if proc_id == 0:
+                    continue
+                import psutil
+                try:
+                    proc_name = psutil.Process(proc_id).name().lower()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+                # Match against the SMTC app identifier (heuristic)
+                if _app_name_matches(app_name, proc_name):
+                    target_session = sess
+                    break
+            except Exception:
+                continue
+
+        # If no exact match, fall back to the loudest/active session
+        if target_session is None:
+            for i in range(sessions.GetCount()):
+                sess = sessions.GetSession(i)
+                try:
+                    if sess.ProcessId and sess.State == 1:  # AudioSessionStateActive
+                        target_session = sess
+                        break
+                except Exception:
+                    continue
+
+        if target_session is None:
+            return f"Could not find an active audio session for {app_name}."
+
+        vol = target_session._ctl.QueryInterface(
+            __import__("pycaw").pycaw.ISimpleAudioVolume
+        )
+
+        if mode == "mute":
+            vol.SetMute(True, None)
+            return f"Muted {app_name}."
+        if mode == "unmute":
+            vol.SetMute(False, None)
+            return f"Unmuted {app_name}."
+
+        # Get current scalar (0.0 - 1.0)
+        current = vol.GetMasterVolume()
+        if mode == "up":
+            new_scalar = min(1.0, current + 0.1)
+        elif mode == "down":
+            new_scalar = max(0.0, current - 0.1)
+        else:  # "set"
+            new_scalar = max(0.0, min(1.0, (value or 0) / 100.0))
+
+        vol.SetMasterVolume(new_scalar, None)
+        return f"{app_name} volume set to {int(new_scalar * 100)}%."
+
+    except ImportError:
+        return (
+            "pycaw is not installed. Install with: pip install pycaw comtypes "
+            "— or use computer_settings volume_set for system-wide volume."
+        )
+    except Exception as e:
+        return f"Could not control {app_name} volume: {e}"
+
+
+def _volume_macos(value: int | None, mode: str) -> str:
+    """Control media app volume on macOS via AppleScript.
+
+    Spotify and Apple Music both expose a 'sound volume' property (0-100).
+    """
+    # Try Spotify first
+    for app, label in [("Spotify", "Spotify"), ("Music", "Apple Music")]:
+        try:
+            if mode == "set":
+                v = max(0, min(100, int(value or 50)))
+                subprocess.run([
+                    "osascript", "-e",
+                    f'tell application "{app}" to set sound volume to {v}'
+                ], capture_output=True, timeout=5)
+                return f"{label} volume set to {v}%."
+            if mode == "mute":
+                subprocess.run([
+                    "osascript", "-e",
+                    f'tell application "{app}" to set sound volume to 0'
+                ], capture_output=True, timeout=5)
+                return f"Muted {label}."
+            if mode == "unmute":
+                # Restore to 50% since we don't know the previous value
+                subprocess.run([
+                    "osascript", "-e",
+                    f'tell application "{app}" to set sound volume to 50'
+                ], capture_output=True, timeout=5)
+                return f"Unmuted {label} (restored to 50%)."
+            # Relative modes
+            script = f'set v to sound volume of application "{app}"'
+            r = subprocess.run(["osascript", "-e", script],
+                               capture_output=True, text=True, timeout=5)
+            if r.returncode == 0 and r.stdout.strip().isdigit():
+                current = int(r.stdout.strip())
+                if mode == "up":
+                    new_v = min(100, current + 10)
+                else:  # down
+                    new_v = max(0, current - 10)
+                subprocess.run([
+                    "osascript", "-e",
+                    f'tell application "{app}" to set sound volume to {new_v}'
+                ], capture_output=True, timeout=5)
+                return f"{label} volume set to {new_v}%."
+        except Exception:
+            continue
+
+    return "No supported media app (Spotify, Music) is currently running."
+
+
+def _volume_linux(value: int | None, mode: str) -> str:
+    """Control media volume on Linux via playerctl."""
+    try:
+        if mode == "set":
+            v = max(0.0, min(1.0, (value or 0) / 100.0))
+            subprocess.run(["playerctl", "volume", f"{v}"],
+                           capture_output=True, timeout=5)
+            return f"Media volume set to {int(v * 100)}%."
+        if mode == "mute":
+            subprocess.run(["playerctl", "volume", "0.0"],
+                           capture_output=True, timeout=5)
+            return "Media muted."
+        if mode == "unmute":
+            subprocess.run(["playerctl", "volume", "0.5"],
+                           capture_output=True, timeout=5)
+            return "Media unmuted (restored to 50%)."
+        # Relative modes — playerctl accepts "0.1+" / "0.1-"
+        delta = "0.1+" if mode == "up" else "0.1-"
+        subprocess.run(["playerctl", "volume", delta],
+                       capture_output=True, timeout=5)
+        # Read back the new value
+        r = subprocess.run(["playerctl", "volume"],
+                           capture_output=True, text=True, timeout=5)
+        new_val = r.stdout.strip() if r.returncode == 0 else "?"
+        return f"Media volume adjusted ({new_val})."
+    except FileNotFoundError:
+        return "Install 'playerctl' to control media volume: sudo apt install playerctl"
+    except Exception as e:
+        return f"Could not control media volume: {e}"
+
+
+def _get_current_media_app_windows() -> str | None:
+    """Identify the app currently playing media via the SMTC API.
+
+    Returns a cleaned-up app name (e.g. "Spotify", "Chrome") or None if no
+    media is playing.
+    """
+    ps_script = r'''
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
+
+public static class CurrentMediaApp {
+    public static string Get() {
+        try {
+            var t = Task.Run(async () => {
+                var manager = await Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager.RequestAsync();
+                var session = manager.GetCurrentSession();
+                if (session == null) return "";
+                return session.SourceAppUserModelId ?? "";
+            });
+            t.Wait(TimeSpan.FromSeconds(4));
+            return t.Result;
+        } catch {
+            return "";
+        }
+    }
+}
+"@ -ReferencedAssemblies System.Runtime, System.Threading, System.Threading.Tasks -Language CSharp
+
+$result = [CurrentMediaApp]::Get()
+Write-Output $result
+'''
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            capture_output=True, text=True, timeout=8
+        )
+        raw = result.stdout.strip()
+        if not raw:
+            return None
+        # Clean up app identifiers like "SpotifyAB.SpotifyMusic_zpdnekdrzrew0!Spotify"
+        clean = raw.split("!")[-1] if "!" in raw else raw
+        clean = clean.replace("_", " ").split(".")[0] if "." in clean else clean
+        return clean.strip() or None
+    except Exception:
+        return None
+
+
+def _app_name_matches(smtc_app: str, proc_name: str) -> bool:
+    """Heuristic match between SMTC app identifier and a process name.
+
+    Both arguments are compared lowercased with non-alphanumerics stripped
+    to handle cases like 'Spotify' (SMTC) vs 'spotify.exe' (process).
+    """
+    import re
+    def _norm(s: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+    a = _norm(smtc_app)
+    b = _norm(proc_name)
+    if not a or not b:
+        return False
+    return a in b or b in a
+
+
 # ─── OS Dispatch Maps ────────────────────────────────────────
 
 _PLAY_PAUSE = {"Windows": _play_pause_windows, "Darwin": _play_pause_macos, "Linux": _play_pause_linux}
@@ -562,6 +804,7 @@ _PREV_TRACK = {"Windows": _previous_track_windows, "Darwin": _previous_track_mac
 _STOP = {"Windows": _stop_windows, "Darwin": _stop_macos, "Linux": _stop_linux}
 _SEEK = {"Windows": _seek_windows, "Darwin": _seek_macos, "Linux": _seek_linux}
 _NOW_PLAYING = {"Windows": _now_playing_windows, "Darwin": _now_playing_macos, "Linux": _now_playing_linux}
+_VOLUME = {"Windows": _volume_windows, "Darwin": _volume_macos, "Linux": _volume_linux}
 
 
 # ─── Main Entry Point ────────────────────────────────────────
@@ -581,12 +824,19 @@ def media_control(
       - stop         : Stop playback
       - seek         : Seek forward/backward by N seconds (use 'seconds' param)
       - now_playing  : Get info about currently playing media
+      - volume       : Control the volume of the currently playing media app.
+                       Use 'value' (0-100) to set, or sub-action via 'mode':
+                       "set" (default, requires value), "up", "down",
+                       "mute", "unmute".
+                       On Windows this targets the per-app audio session
+                       (Volume Mixer slider), independent of system volume.
+                       For SYSTEM-WIDE volume, use computer_settings volume_set.
     """
     params = parameters or {}
     action = params.get("action", "").strip().lower().replace(" ", "_").replace("-", "_")
 
     if not action:
-        return "Please specify a media action: play_pause, next, previous, stop, seek, now_playing."
+        return "Please specify a media action: play_pause, next, previous, stop, seek, now_playing, volume."
 
     print(f"[media_control] Action: {action}  OS: {_OS}")
     if player:
@@ -632,7 +882,47 @@ def media_control(
         fn = _NOW_PLAYING.get(_OS)
         return fn() if fn else "Unsupported OS."
 
+    # ── volume ──
+    if action in ("volume", "media_volume", "app_volume", "set_volume", "media_volume_set"):
+        # Determine the sub-mode:
+        #   - explicit "mode" param wins
+        #   - else if value provided → "set"
+        #   - else default to "up" (safe no-op-ish toggle)
+        mode = (params.get("mode") or "").strip().lower()
+        value = params.get("value")
+        try:
+            value_int = int(value) if value is not None else None
+        except (ValueError, TypeError):
+            value_int = None
+
+        if not mode:
+            if value_int is not None:
+                mode = "set"
+            else:
+                return (
+                    "Please specify a volume mode: set (with value 0-100), up, down, mute, or unmute. "
+                    "Example: action=volume, value=50  →  set to 50%."
+                )
+
+        if mode in ("set", "set_volume", "to"):
+            if value_int is None:
+                return "Volume 'set' mode requires a value (0-100)."
+            mode = "set"
+        elif mode in ("up", "increase", "louder", "+"):
+            mode = "up"
+        elif mode in ("down", "decrease", "lower", "quieter", "-"):
+            mode = "down"
+        elif mode in ("mute", "silence", "0"):
+            mode = "mute"
+        elif mode in ("unmute", "restore"):
+            mode = "unmute"
+        else:
+            return f"Unknown volume mode: '{mode}'. Use set/up/down/mute/unmute."
+
+        fn = _VOLUME.get(_OS)
+        return fn(value_int, mode) if fn else "Unsupported OS."
+
     return (
         f"Unknown media action: '{action}'. "
-        f"Available: play_pause, next, previous, stop, seek, now_playing."
+        f"Available: play_pause, next, previous, stop, seek, now_playing, volume."
     )
