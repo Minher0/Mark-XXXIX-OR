@@ -469,186 +469,6 @@ def install_deps() -> bool:
     return True  # Continue anyway — some deps are optional
 
 
-def install_ollama() -> None:
-    """Install Ollama (local LLM backend) and pull the default model.
-
-    On Windows: download OllamaSetup.exe from ollama.com and run it silently.
-    On macOS:   use `brew install ollama` if Homebrew is available.
-    On Linux:   curl the official install script.
-
-    After install, pulls the default model (llama3.2:3b) so first launch is fast.
-    Non-fatal: if install fails, Jarvis will still launch and try to use Ollama
-    if it's already installed.
-    """
-    print("      Checking for existing Ollama install...")
-
-    # Quick check: is ollama already on PATH?
-    ollama_cmd = shutil.which("ollama")
-    if ollama_cmd:
-        print(_green("      OK (Ollama already installed)"))
-        # Make sure it's running
-        try:
-            subprocess.run(
-                [ollama_cmd, "--version"],
-                capture_output=True, timeout=5
-            )
-        except Exception:
-            pass
-    else:
-        print("      Ollama not found — installing...")
-        installed = False
-
-        if os.name == "nt":
-            # Windows: download OllamaSetup.exe
-            try:
-                setup_url = "https://ollama.com/download/OllamaSetup.exe"
-                setup_path = APP_DIR / "OllamaSetup.exe"
-                print(f"      Downloading {setup_url}...")
-                urllib.request.urlretrieve(setup_url, str(setup_path))
-                print("      Running OllamaSetup.exe (silent install)...")
-                result = subprocess.run(
-                    [str(setup_path), "/S"],
-                    capture_output=True, timeout=300
-                )
-                if result.returncode == 0:
-                    print(_green("      OK (Ollama installed)"))
-                    installed = True
-                else:
-                    err = result.stderr.decode("utf-8", errors="ignore")[:200] if result.stderr else ""
-                    print(_red(f"      FAILED ({err})"))
-                # Clean up
-                try:
-                    setup_path.unlink()
-                except Exception:
-                    pass
-            except Exception as e:
-                print(_red(f"      FAILED ({e})"))
-
-        elif sys.platform == "darwin":
-            # macOS: try Homebrew
-            brew = shutil.which("brew")
-            if brew:
-                try:
-                    result = subprocess.run(
-                        [brew, "install", "ollama"],
-                        capture_output=True, timeout=300
-                    )
-                    if result.returncode == 0:
-                        print(_green("      OK (Ollama installed via brew)"))
-                        installed = True
-                    else:
-                        print(_red("      brew install failed"))
-                except Exception as e:
-                    print(_red(f"      FAILED ({e})"))
-            else:
-                print(_yellow("      Homebrew not found — please install Ollama manually from https://ollama.com/download"))
-
-        else:
-            # Linux: curl install script
-            try:
-                result = subprocess.run(
-                    ["sh", "-c", "curl -fsSL https://ollama.com/install.sh | sh"],
-                    capture_output=True, timeout=300
-                )
-                if result.returncode == 0:
-                    print(_green("      OK (Ollama installed)"))
-                    installed = True
-                else:
-                    print(_red("      install.sh failed"))
-            except Exception as e:
-                print(_red(f"      FAILED ({e})"))
-
-        if not installed:
-            _warn("Ollama install failed — Jarvis will prompt you on first launch.")
-            _warn("You can install it manually from https://ollama.com/download")
-            return
-
-    # Refresh PATH for this process (Windows: ollama installs to %LOCALAPPDATA%\Programs\Ollama)
-    ollama_cmd = shutil.which("ollama")
-    if not ollama_cmd and os.name == "nt":
-        # Try the default install location
-        candidates = [
-            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama.exe",
-            Path("C:/Program Files/Ollama/ollama.exe"),
-            Path(os.environ.get("USERPROFILE", "")) / "AppData" / "Local" / "Programs" / "Ollama" / "ollama.exe",
-        ]
-        for c in candidates:
-            if c.exists():
-                ollama_cmd = str(c)
-                break
-
-    if not ollama_cmd:
-        _warn("Could not find ollama executable — please add it to PATH and restart Jarvis.")
-        return
-
-    # Start Ollama serve in background (Windows: it may already be running as a service)
-    print("      Starting Ollama service...")
-    try:
-        if os.name == "nt":
-            subprocess.Popen(
-                [ollama_cmd, "serve"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
-            )
-        else:
-            subprocess.Popen(
-                [ollama_cmd, "serve"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-    except Exception as e:
-        _warn(f"Could not start ollama serve: {e}")
-
-    # Wait for the service to be reachable
-    import time as _time
-    for _ in range(15):
-        _time.sleep(1)
-        try:
-            import urllib.request as _urllib_req
-            req = _urllib_req.urlopen("http://localhost:11434/api/tags", timeout=2)
-            if req.status == 200:
-                break
-        except Exception:
-            continue
-    else:
-        _warn("Ollama service did not respond within 15s — first launch may be slow.")
-        return
-
-    # Pull the default text model
-    default_text_model = "llama3.2:3b"
-    print(f"      Pulling model '{default_text_model}' (~2GB, may take a while)...")
-    try:
-        result = subprocess.run(
-            [ollama_cmd, "pull", default_text_model],
-            timeout=3600,  # 1 hour max
-        )
-        if result.returncode == 0:
-            print(_green(f"      OK (model '{default_text_model}' pulled)"))
-        else:
-            _warn(f"Pull failed (code {result.returncode}) — model will be pulled on first launch.")
-    except subprocess.TimeoutExpired:
-        _warn("Pull timed out — model will be pulled on first launch.")
-    except Exception as e:
-        _warn(f"Pull failed: {e} — model will be pulled on first launch.")
-
-    # Pull the vision model in the background (non-blocking — it's large)
-    default_vision_model = "llava:7b"
-    print(f"      Scheduling background pull of '{default_vision_model}' (for vision features)...")
-    try:
-        subprocess.Popen(
-            [ollama_cmd, "pull", default_vision_model],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
-            start_new_session=(os.name != "nt"),
-        )
-        print(_green("      OK (background pull started)"))
-    except Exception as e:
-        _warn(f"Could not start background pull of vision model: {e}")
-
-
 def create_shortcut() -> bool:
     """Create a desktop shortcut and a start menu entry for Jarvis."""
     success = False
@@ -818,7 +638,7 @@ def main():
     # ── Slow path: first-time setup ──
     print(_bold("  First-time setup detected. Installing Jarvis...\n"))
 
-    TOTAL_STEPS = 8
+    TOTAL_STEPS = 7
 
     # Step 1: Check Python
     _step(1, TOTAL_STEPS, "Checking Python...")
@@ -890,12 +710,8 @@ def main():
     _step(6, TOTAL_STEPS, "Installing dependencies (this may take a minute)...")
     install_deps()
 
-    # Step 7: Install Ollama (local LLM backend)
-    _step(7, TOTAL_STEPS, "Setting up Ollama (local AI)...")
-    install_ollama()
-
-    # Step 8: Create shortcut & config
-    _step(8, TOTAL_STEPS, "Finishing setup...")
+    # Step 7: Create shortcut & config
+    _step(7, TOTAL_STEPS, "Finishing setup...")
     create_config_if_needed()
     create_shortcut()
     _ok()

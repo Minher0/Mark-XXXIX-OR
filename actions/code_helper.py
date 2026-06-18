@@ -2,16 +2,14 @@
 # AI-powered code assistant — writes, edits, explains, runs, builds, debugs, and optimizes code.
 #
 # Actions:
-#   write        → Describe what you want, LLM writes it, saves to file
+#   write        → Describe what you want, Gemini writes it, saves to file
 #   edit         → Read existing file, apply natural language change
 #   explain      → Explain what a piece of code or file does
 #   run          → Execute a script file, return output
 #   build        → Write → Run → Fix loop (max 3 attempts), speaks when done
-#   screen_debug → Screenshot, analyze code/error with local VLM, fix it
-#   optimize     → Optimize code (performance, readability, best practices)
+#   screen_debug → Screenshot al, ekrandaki kodu/hatayı Gemini ile analiz et ve düzelt
+#   optimize     → Mevcut kodu Gemini ile optimize et (performans, okunabilirlik, best practices)
 #   auto         → (default) Intent auto-detected from context
-#
-# Backend: local Ollama LLM (via local_llm.client) — replaces Gemini.
 
 import subprocess
 import sys
@@ -30,46 +28,18 @@ BASE_DIR           = get_base_dir()
 API_CONFIG_PATH    = BASE_DIR / "config" / "api_keys.json"
 DESKTOP            = Path.home() / "Desktop"
 MAX_BUILD_ATTEMPTS = 3
+GEMINI_MODEL       = "gemini-2.5-flash"
 
 
 def _get_api_key() -> str:
-    """Legacy compat — returns empty string in local mode."""
-    try:
-        with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f).get("gemini_api_key", "")
-    except Exception:
-        return ""
+    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)["gemini_api_key"]
 
 
-class _GeminiCompatResponse:
-    """Mimics the Gemini GenerateContentResponse for backward compat."""
-    def __init__(self, text: str):
-        self.text = text
-
-
-class _GeminiCompatModel:
-    """Mimics genai.GenerativeModel — routes .generate_content() to local LLM."""
-    def __init__(self, model_name: str = "", system_instruction: str = ""):
-        self.model_name = model_name
-        self.system_instruction = system_instruction
-
-    def generate_content(self, prompt, **kwargs):
-        from local_llm import client as llm_client
-        text = llm_client.chat(
-            str(prompt),
-            system=self.system_instruction or "You are a helpful AI assistant.",
-            temperature=0.2,
-            max_tokens=4096,
-        )
-        return _GeminiCompatResponse(text)
-
-
-def _get_gemini(model: str = ""):
-    """Return a compat wrapper that routes to local_llm.
-
-    The model name is ignored — local_llm uses its configured model.
-    """
-    return _GeminiCompatModel(model)
+def _get_gemini(model: str = GEMINI_MODEL):
+    import google.generativeai as genai
+    genai.configure(api_key=_get_api_key())
+    return genai.GenerativeModel(model)
 
 
 def _clean_code(text: str) -> str:
@@ -485,7 +455,10 @@ def _screen_debug_action(description, file_path, player, speak=None) -> str:
             print(f"[Code] ⚠️ Could not read file: {err}")
 
     try:
-        from local_llm import client as llm_client
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=_get_api_key())
 
         image_bytes  = screenshot_path.read_bytes()
         image_base64 = _image_to_base64(screenshot_path)
@@ -508,14 +481,17 @@ Please:
 
 Be specific and actionable. If you see an error message, quote it exactly."""
 
-        analysis = llm_client.vision_from_bytes(
-            prompt=analysis_prompt,
-            image_bytes=image_bytes,
-            system="You are an expert programmer and debugger. Be specific and actionable.",
-            temperature=0.2,
-            max_tokens=2048,
+        contents = [
+            types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+            analysis_prompt,
+        ]
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=contents,
         )
-        analysis = (analysis or "").strip()
+
+        analysis = response.text.strip()
         print(f"[Code] ✅ Screen analysis complete")
 
         try:

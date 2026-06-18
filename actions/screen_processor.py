@@ -1,33 +1,51 @@
-"""
-screen_processor.py — Local vision module using Ollama VLM (llava).
-
-Replaces the Gemini Live API vision session. Now much simpler:
-  1. Capture screenshot (mss) or webcam frame (OpenCV)
-  2. Send to local VLM (llava) via local_llm.client.vision_from_bytes()
-  3. TTS the response via local_tts
-
-No more WebSocket sessions, no more Live API, no more 1008/1011 errors.
-"""
-
+import asyncio
 import base64
 import io
 import json
+import re
+import os
 import sys
-import threading
 import time
+import threading
+import cv2
+import mss
+import mss.tools
+import sounddevice as sd
+import numpy as np
 from pathlib import Path
 
-from config import is_windows, is_mac, is_linux
+try:
+    import PIL.Image
+    _PIL_OK = True
+except ImportError:
+    _PIL_OK = False
 
+from google import genai
+from google.genai import types
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
     return Path(__file__).resolve().parent.parent
 
-
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
+
+# Default Live API model for the vision session.
+# Reads the same "live_model" field as main.py for consistency, with the same
+# fallback chain in case the primary model is deprecated (1008 policy violation)
+# or crashes at runtime (1011 internal error).
+LIVE_MODEL_DEFAULT = "models/gemini-live-2.5-flash-preview"
+LIVE_MODEL_FALLBACKS = [
+    "models/gemini-live-2.5-flash-preview",
+    "models/gemini-2.5-flash-native-audio-preview-12-2025",
+    "models/gemini-2.0-flash-live-001",
+    "models/gemini-2.0-flash-exp-native-audio",
+]
+
+CHANNELS            = 1
+RECEIVE_SAMPLE_RATE = 24000
+CHUNK_SIZE          = 1024
 
 IMG_MAX_W = 640
 IMG_MAX_H = 360
@@ -45,12 +63,28 @@ SYSTEM_PROMPT = (
 
 
 def _get_api_key() -> str:
-    """Legacy compat — returns empty string in local mode."""
     try:
         with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f).get("gemini_api_key", "")
+            keys = json.load(f)
+        key = keys.get("gemini_api_key", "")
+        if not key:
+            raise ValueError("gemini_api_key not found")
+        return key
+    except Exception as e:
+        raise RuntimeError(f"Could not load API key: {e}")
+
+
+def _load_live_model() -> str:
+    """Read the Live API model from config. Falls back to default if missing."""
+    try:
+        with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        model = (data.get("live_model") or "").strip()
+        if not model:
+            return LIVE_MODEL_DEFAULT
+        return model if model.startswith("models/") else f"models/{model}"
     except Exception:
-        return ""
+        return LIVE_MODEL_DEFAULT
 
 
 def _get_camera_index() -> int:
@@ -61,207 +95,387 @@ def _get_camera_index() -> int:
             return int(cfg["camera_index"])
     except Exception:
         pass
-    return 0
 
+    print("[Camera] 🔍 No camera index in config. Auto-detecting...")
+    best_index = 0
 
-# ─── Image capture ─────────────────────────────────────────
-
-def _capture_screenshot() -> bytes:
-    """Capture the primary display as compressed JPEG bytes."""
-    try:
-        import mss
-        from PIL import Image
-    except ImportError as e:
-        raise RuntimeError(f"mss or Pillow not installed: {e}")
-
-    with mss.mss() as sct:
-        monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
-        raw = sct.grab(monitor)
-        # Convert BGRA → RGB
-        img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
-        # Downscale for speed
-        img.thumbnail((IMG_MAX_W, IMG_MAX_H))
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=JPEG_Q)
-        return buf.getvalue()
-
-
-def _capture_camera() -> bytes:
-    """Capture a single frame from the webcam as JPEG bytes."""
-    try:
-        import cv2
-        from PIL import Image
-    except ImportError as e:
-        raise RuntimeError(f"opencv-python or Pillow not installed: {e}")
-
-    idx = _get_camera_index()
-    cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW if is_windows() else 0)
-    if not cap.isOpened():
-        # Try other indices
-        for try_idx in range(6):
-            cap = cv2.VideoCapture(try_idx, cv2.CAP_DSHOW if is_windows() else 0)
-            if cap.isOpened():
-                idx = try_idx
-                # Save for next time
-                try:
-                    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-                        cfg = json.load(f)
-                    cfg["camera_index"] = idx
-                    with open(API_CONFIG_PATH, "w", encoding="utf-8") as f:
-                        json.dump(cfg, f, indent=2)
-                except Exception:
-                    pass
-                break
+    for idx in range(6):
+        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            cap.release()
+            continue
+        for _ in range(5):
+            cap.read()
+        ret, frame = cap.read()
+        cap.release()
+        if ret and frame is not None and frame.mean() > 5:
+            best_index = idx
+            print(f"[Camera] ✅ Camera found at index {idx} — saving to config.")
+            break
         else:
-            raise RuntimeError("Could not open any webcam (tried indices 0-5)")
+            print(f"[Camera] ⚠️  Index {idx}: no valid frame.")
 
-    # Warm up
-    for _ in range(10):
-        cap.read()
-        time.sleep(0.02)
+    try:
+        cfg = {}
+        if API_CONFIG_PATH.exists():
+            with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        cfg["camera_index"] = best_index
+        with open(API_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=4)
+        print(f"[Camera] 💾 Camera index {best_index} saved to config.")
+    except Exception as e:
+        print(f"[Camera] ⚠️  Could not save camera index: {e}")
 
-    ret, frame = cap.read()
-    cap.release()
-    if not ret or frame is None:
-        raise RuntimeError("Webcam read failed")
+    return best_index
 
-    # BGR → RGB
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    img = Image.fromarray(frame_rgb)
-    img.thumbnail((IMG_MAX_W, IMG_MAX_H))
+
+def _to_jpeg(img_bytes: bytes) -> bytes:
+    if not _PIL_OK:
+        return img_bytes
+    img = PIL.Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    img.thumbnail([IMG_MAX_W, IMG_MAX_H], PIL.Image.BILINEAR)
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=JPEG_Q)
+    img.save(buf, format="JPEG", quality=JPEG_Q, optimize=False)
     return buf.getvalue()
 
 
-# ─── Vision analysis ───────────────────────────────────────
-
-def _analyze_image(image_bytes: bytes, user_text: str) -> str:
-    """Send image + question to local VLM (llava) and get response."""
-    from local_llm import client as llm_client
-    return llm_client.vision_from_bytes(
-        prompt=user_text,
-        image_bytes=image_bytes,
-        system=SYSTEM_PROMPT,
-        temperature=0.2,
-        max_tokens=300,
-    )
+def _capture_screenshot() -> bytes:
+    with mss.mss() as sct:
+        shot      = sct.grab(sct.monitors[1])
+        png_bytes = mss.tools.to_png(shot.rgb, shot.size)
+    return _to_jpeg(png_bytes)
 
 
-# ─── Public entry point (called from main.py) ──────────────
+def _capture_camera() -> bytes:
+    camera_index = _get_camera_index()
+    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        raise RuntimeError(f"Camera could not be opened: index {camera_index}")
+    for _ in range(10):
+        cap.read()
+    ret, frame = cap.read()
+    cap.release()
+    if not ret or frame is None:
+        raise RuntimeError("Could not capture camera frame.")
+    if _PIL_OK:
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = PIL.Image.fromarray(rgb)
+        img.thumbnail([IMG_MAX_W, IMG_MAX_H], PIL.Image.BILINEAR)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=JPEG_Q, optimize=False)
+        return buf.getvalue()
+    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_Q])
+    return buf.tobytes()
+
+
+class _LiveSession:
+
+    def __init__(self):
+        self._loop:      asyncio.AbstractEventLoop | None = None
+        self._thread:    threading.Thread | None          = None
+        self._session                                     = None
+        self._out_queue: asyncio.Queue | None             = None
+        self._audio_in:  asyncio.Queue | None             = None
+        self._ready:     threading.Event                  = threading.Event()
+        self._player                                      = None
+        self._send_lock: asyncio.Lock | None              = None
+
+    def start(self, player=None):
+        if self._thread and self._thread.is_alive():
+            return
+        self._player = player
+        self._thread = threading.Thread(
+            target=self._run_loop, daemon=True, name="VisionSessionThread"
+        )
+        self._thread.start()
+        ok = self._ready.wait(timeout=20)
+        if not ok:
+            raise RuntimeError("Vision session did not start within 20s.")
+        print("[ScreenProcess] ✅ Vision session ready (no mic)")
+
+    def _run_loop(self):
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_until_complete(self._main())
+
+    async def _main(self):
+        self._out_queue = asyncio.Queue(maxsize=30)
+        self._audio_in  = asyncio.Queue()
+        self._send_lock = asyncio.Lock()
+
+        client = genai.Client(
+            api_key=_get_api_key(),
+            http_options={"api_version": "v1beta"}
+        )
+
+        # Build config — output_audio_transcription is kept because the vision
+        # session uses the transcribed text for logging. If a model rejects it
+        # with 1008, we'll retry below with a stripped-down config.
+        def _build_config(minimal: bool = False) -> types.LiveConnectConfig:
+            kwargs = dict(
+                response_modalities=["AUDIO"],
+                system_instruction=SYSTEM_PROMPT,
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name="Charon"
+                        )
+                    )
+                ),
+            )
+
+            # ── CRITICAL: disable "thinking" mode ──
+            # Same rationale as main.py — without thinking_budget=0 the 2.5
+            # Flash preview emits 'thought' parts that the Live API can't
+            # stream, causing 1008 policy violations after the first response.
+            # Set the field DIRECTLY on LiveConnectConfig (not nested under
+            # generation_config, which is deprecated).
+            thinking_set = False
+            try:
+                kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+                thinking_set = True
+            except (AttributeError, TypeError):
+                pass
+            if not thinking_set:
+                try:
+                    kwargs["thinking_config"] = {"thinking_budget": 0}
+                    thinking_set = True
+                except Exception:
+                    pass
+
+            if not minimal:
+                kwargs["output_audio_transcription"] = {}
+            return types.LiveConnectConfig(**kwargs)
+
+        failed_models: set[str] = set()
+        current_model: str = _load_live_model()
+        use_minimal: bool = False
+        last_connect_succeeded: bool = False
+        counts_1011: dict[str, int] = {}
+
+        while True:
+            # Pick a model that hasn't failed yet
+            if current_model in failed_models:
+                candidates = [current_model] + [
+                    m for m in LIVE_MODEL_FALLBACKS if m != current_model
+                ]
+                next_model = next(
+                    (m for m in candidates if m not in failed_models), None
+                )
+                if next_model is None:
+                    # All models failed — reset and wait before retrying
+                    print("[ScreenProcess] 🔴 All vision models exhausted — resetting and waiting 30s")
+                    failed_models.clear()
+                    counts_1011.clear()
+                    use_minimal = False
+                    self._session = None
+                    self._ready.clear()
+                    await asyncio.sleep(30)
+                    continue
+                current_model = next_model
+                use_minimal = False  # Reset minimal flag for the new model
+
+            try:
+                cfg_kind = "minimal" if use_minimal else "full"
+                print(f"[ScreenProcess] 🔌 Vision session connecting (model={current_model}, config={cfg_kind})...")
+                config = _build_config(minimal=use_minimal)
+                async with client.aio.live.connect(model=current_model, config=config) as session:
+                    self._session = session
+                    self._ready.set()
+                    last_connect_succeeded = True
+                    counts_1011[current_model] = 0  # reset on success
+                    print(f"[ScreenProcess] ✅ Vision session connected (model={current_model})")
+                    async with asyncio.TaskGroup() as tg:
+                        tg.create_task(self._send_loop())
+                        tg.create_task(self._recv_loop())
+                        tg.create_task(self._play_loop())
+            except Exception as e:
+                err_str = str(e)
+                print(f"[ScreenProcess] ⚠️ Disconnected: {e} — reconnecting...")
+                self._session = None
+                self._ready.clear()
+
+                runtime_failure = last_connect_succeeded
+
+                # 1008 policy violation — same recovery strategy as main.py
+                if "1008" in err_str:
+                    if runtime_failure:
+                        print(f"[ScreenProcess]    Runtime 1008 — marking '{current_model}' as failed.")
+                        failed_models.add(current_model)
+                        use_minimal = False
+                    elif not use_minimal:
+                        print("[ScreenProcess]    Retrying with minimal config (no transcription)...")
+                        use_minimal = True
+                    else:
+                        print(f"[ScreenProcess]    Marking model '{current_model}' as failed.")
+                        failed_models.add(current_model)
+                        use_minimal = False
+                # 1011 internal error — track and move on after 2 consecutive
+                elif "1011" in err_str:
+                    if runtime_failure:
+                        count = counts_1011.get(current_model, 0) + 1
+                        counts_1011[current_model] = count
+                        if count >= 2:
+                            print(f"[ScreenProcess]    1011 x{count} on '{current_model}' — marking as failed.")
+                            failed_models.add(current_model)
+                            use_minimal = False
+                            counts_1011[current_model] = 0
+                        else:
+                            print(f"[ScreenProcess]    1011 attempt {count}/2 on '{current_model}' — retrying.")
+                    else:
+                        print(f"[ScreenProcess]    Connection-time 1011 on '{current_model}' — retrying.")
+
+                last_connect_succeeded = False
+                await asyncio.sleep(2)
+                self._ready.set()
+
+    async def _send_loop(self):
+        while True:
+            item = await self._out_queue.get()
+            if self._session:
+                image_bytes, mime_type, user_text = item
+                try:
+                    b64 = base64.b64encode(image_bytes).decode("utf-8")
+                    await self._session.send_client_content(
+                        turns={
+                            "parts": [
+                                {"inline_data": {"mime_type": mime_type, "data": b64}},
+                                {"text": user_text}
+                            ]
+                        },
+                        turn_complete=True
+                    )
+                    print("[ScreenProcess] ✅ Image sent")
+                except Exception as e:
+                    print(f"[ScreenProcess] ⚠️ Send error: {e}")
+
+    async def _recv_loop(self):
+        transcript_buf: list[str] = []
+        try:
+            async for response in self._session.receive():
+                if response.data:
+                    await self._audio_in.put(response.data)
+                sc = response.server_content
+                if not sc:
+                    continue
+                if sc.output_transcription and sc.output_transcription.text:
+                    chunk = sc.output_transcription.text.strip()
+                    if chunk:
+                        transcript_buf.append(chunk)
+                if sc.turn_complete:
+                    if transcript_buf and self._player:
+                        full = re.sub(r'\s+', ' ', " ".join(transcript_buf)).strip()
+                        if full:
+                            self._player.write_log(f"Jarvis: {full}")
+                            print(f"[ScreenProcess] 💬 {full}")
+                    transcript_buf = []
+        except Exception as e:
+            print(f"[ScreenProcess] ⚠️ Recv error: {e}")
+            transcript_buf = []
+            await asyncio.sleep(0.3)
+
+    async def _play_loop(self):
+        stream = sd.RawOutputStream(
+            samplerate=RECEIVE_SAMPLE_RATE,
+            channels=CHANNELS,
+            dtype="int16",
+            blocksize=CHUNK_SIZE,
+        )
+        stream.start()
+        try:
+            while True:
+                chunk = await self._audio_in.get()
+                await asyncio.to_thread(stream.write, chunk)
+        except Exception as e:
+            print(f"[ScreenProcess] ❌ Play error: {e}")
+            raise
+        finally:
+            stream.stop()
+            stream.close()
+
+    def analyze(self, image_bytes: bytes, mime_type: str, user_text: str):
+        if not self._loop:
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._out_queue.put((image_bytes, mime_type, user_text)),
+            self._loop
+        )
+
+    def is_ready(self) -> bool:
+        return self._session is not None
+
+
+_live       = _LiveSession()
+_started    = False
+_start_lock = threading.Lock()
+
+
+def _ensure_started(player=None):
+    global _started
+    with _start_lock:
+        if not _started:
+            _live.start(player=player)
+            _started = True
+        elif player is not None:
+            _live._player = player
+
 
 def screen_process(
-    parameters: dict,
-    response=None,
+    parameters:     dict,
+    response:       str | None = None,
     player=None,
     session_memory=None,
 ) -> bool:
-    """Capture screen/camera, analyze with local VLM, TTS the response.
-
-    Args:
-        parameters: {text: str, angle: 'screen' | 'camera'}
-        player:     JarvisUI instance (for logging)
-    Returns:
-        True on success
-    """
-    params = parameters or {}
-    user_text = (params.get("text") or params.get("user_text") or "").strip()
-    angle = (params.get("angle") or "screen").strip().lower()
-
+    user_text = (parameters or {}).get("text") or (parameters or {}).get("user_text", "")
+    user_text = (user_text or "").strip()
     if not user_text:
-        if player:
-            player.write_log("[vision] No question provided")
+        print("[ScreenProcess] ⚠️ No user_text provided.")
         return False
 
-    print(f"[ScreenProcess] 📷 Capturing {angle}...")
-    if player:
-        player.write_log(f"[vision] analyzing {angle}...")
+    angle = (parameters or {}).get("angle", "screen").lower().strip()
+    print(f"[ScreenProcess] angle={angle!r}  text={user_text!r}")
+
+    _ensure_started(player=player)
 
     try:
         if angle == "camera":
             image_bytes = _capture_camera()
+            mime_type   = "image/jpeg"
+            print("[ScreenProcess] 📷 Camera captured")
         else:
             image_bytes = _capture_screenshot()
+            mime_type   = "image/jpeg" if _PIL_OK else "image/png"
+            print("[ScreenProcess] 🖥️ Screen captured")
     except Exception as e:
-        print(f"[ScreenProcess] ❌ Capture failed: {e}")
-        if player:
-            player.write_log(f"[vision] capture failed: {e}")
-        # Try to TTS the error
-        try:
-            from local_tts import LocalTTS
-            tts = LocalTTS()
-            tts.start()
-            tts.speak(f"Sir, I could not capture the {angle}. {str(e)[:80]}")
-            time.sleep(3)
-            tts.stop()
-        except Exception:
-            pass
+        import traceback; traceback.print_exc()
+        print(f"[ScreenProcess] ❌ Capture error: {e}")
         return False
 
-    print(f"[ScreenProcess] 🧠 Analyzing with local VLM...")
-    try:
-        result = _analyze_image(image_bytes, user_text)
-    except Exception as e:
-        print(f"[ScreenProcess] ❌ VLM analysis failed: {e}")
-        if player:
-            player.write_log(f"[vision] analysis failed: {e}")
-        return False
-
-    if not result or result.startswith("[local_llm error"):
-        print(f"[ScreenProcess] ⚠️ VLM returned error: {result[:200]}")
-        if player:
-            player.write_log(f"[vision] {result[:100]}")
-        return False
-
-    print(f"[ScreenProcess] ✅ {result[:200]}")
-    if player:
-        player.write_log(f"Jarvis: {result}")
-
-    # TTS the response
-    try:
-        from local_tts import LocalTTS
-        tts = LocalTTS()
-        tts.start()
-        tts.speak(result)
-        # Wait up to 30s for speech to finish
-        deadline = time.time() + 30
-        while tts.is_speaking and time.time() < deadline:
-            time.sleep(0.1)
-        time.sleep(0.5)
-        tts.stop()
-    except Exception as e:
-        print(f"[ScreenProcess] ⚠️ TTS failed: {e}")
-
+    print(f"[ScreenProcess] 📦 {len(image_bytes)} bytes → sending")
+    _live.analyze(image_bytes, mime_type, user_text)
     return True
 
 
-# ─── Background pre-warm (optional) ────────────────────────
-
-_warmup_done = False
-_warmup_lock = threading.Lock()
-
-
 def warmup_session(player=None):
-    """Pre-load the VLM model so the first real call is faster."""
-    global _warmup_done
-    with _warmup_lock:
-        if _warmup_done:
-            return
-        _warmup_done = True
     try:
-        from local_llm import _ensure_ollama_running, _ensure_model_pulled, _get_vision_model
-        if _ensure_ollama_running():
-            _ensure_model_pulled(_get_vision_model())
-            print("[ScreenProcess] ✅ VLM pre-warmed")
-        else:
-            print("[ScreenProcess] ⚠️ Ollama not running — vision will be slow on first use")
+        _ensure_started(player=player)
     except Exception as e:
-        print(f"[ScreenProcess] ⚠️ Warmup failed: {e}")
+        print(f"[ScreenProcess] ⚠️ Warmup error: {e}")
 
 
 if __name__ == "__main__":
-    print("=" * 55)
-    print("  MARK XXXIX-OR — Local Vision Self-Test")
-    print("=" * 55)
-    print("\nCapturing screen and asking 'What do you see?'\n")
-    screen_process(parameters={"text": "What do you see on the screen?", "angle": "screen"})
+    print("[TEST] screen_processor.py v8 — image-only session")
+    print("=" * 50)
+    mode    = input("screen / camera (default: screen): ").strip().lower() or "screen"
+    request = input("Question (Enter for default): ").strip() or "What do you see? Be brief."
+
+    t0 = time.perf_counter()
+    warmup_session()
+    print(f"Session ready — {time.perf_counter()-t0:.2f}s\n")
+
+    t1     = time.perf_counter()
+    result = screen_process({"angle": mode, "text": request}, player=None)
+    print(f"Sent — {time.perf_counter()-t1:.3f}s | audio incoming...")
+    time.sleep(8)
+    print(f"\n{'✅' if result else '❌'}")

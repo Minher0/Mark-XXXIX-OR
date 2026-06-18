@@ -19,23 +19,24 @@ def _get_api_key() -> str:
 
 
 def _gemini_search(query: str) -> str:
-    """Legacy function name — now uses the local LLM for the search-style response.
+    from google import genai
 
-    The Gemini grounded search is no longer available (Gemini API removed).
-    This function returns a chat-style answer; for real web results, see the
-    main web_search() dispatcher which uses OpenRouter + DuckDuckGo fallback.
-    """
-    from local_llm import client as llm_client
-    result = llm_client.chat(
-        query,
-        system="You are a web search assistant. Answer factually and concisely "
-               "based on your knowledge. Note that you do not have real-time web access.",
-        temperature=0.3,
-        max_tokens=2048,
+    client   = genai.Client(api_key=_get_api_key())
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=query,
+        config={"tools": [{"google_search": {}}]},
     )
-    if not result or result.startswith("[local_llm error"):
-        raise ValueError("Local LLM returned an empty or error response.")
-    return result
+
+    text = ""
+    for part in response.candidates[0].content.parts:
+        if hasattr(part, "text") and part.text:
+            text += part.text
+
+    text = text.strip()
+    if not text:
+        raise ValueError("Gemini returned an empty response.")
+    return text
 
 
 def _ddg_search(query: str, max_results: int = 6) -> list[dict]:

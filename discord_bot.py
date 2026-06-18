@@ -1,12 +1,12 @@
 """
-discord_bot.py — Jarvis as a Discord Bot (Local LLM Edition)
+discord_bot.py — Jarvis as a Discord Bot
 
 Run: python discord_bot.py
 Or: python main.py --discord
 
 Features:
 - Responds to mentions (@Jarvis) and DMs
-- Uses local Ollama LLM for smart responses
+- Uses Gemini API for smart responses
 - Supports text commands: !jarvis <question>
 - Can use all Jarvis tools (web search, weather, etc.)
 - Remembers conversation context per channel
@@ -67,11 +67,11 @@ def _load_system_prompt() -> str:
 
 
 # ═══════════════════════════════════════════════════════════
-# Local LLM Chat (replaces GeminiChat)
+# GEMINI CHAT (for Discord text responses)
 # ═══════════════════════════════════════════════════════════
 
-class LocalChat:
-    """Lightweight local LLM chat for Discord — no audio, just text + tools."""
+class GeminiChat:
+    """Lightweight Gemini chat for Discord — no audio, just text + tools."""
 
     # Discord-specific tool declarations (uses user's personal token, not bot token)
     DISCORD_BOT_TOOLS = [
@@ -98,7 +98,9 @@ class LocalChat:
         }
     ]
 
-    def __init__(self):
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.model = "gemini-2.5-flash-preview-05-20"
         self.system_prompt = _load_system_prompt()
         # Per-channel conversation history
         self._histories: dict[str, list] = {}
@@ -107,6 +109,20 @@ class LocalChat:
         self._current_channel_name: str | None = None
         self._current_guild_name: str | None = None
         self._bot_user_id: str | None = None
+        # Load tool declarations
+        self.tools = []
+        self._load_tools()
+
+    def _load_tools(self):
+        try:
+            from main import TOOL_DECLARATIONS
+            # Merge main tools + Discord-specific tools
+            all_declarations = TOOL_DECLARATIONS + self.DISCORD_BOT_TOOLS
+            self.tools = [{"function_declarations": all_declarations}]
+        except ImportError:
+            print("[DiscordBot] ⚠️ Could not load tool declarations")
+            # Still add Discord-specific tools
+            self.tools = [{"function_declarations": self.DISCORD_BOT_TOOLS}]
 
     def _get_history(self, channel_id: str) -> list:
         if channel_id not in self._histories:
@@ -178,113 +194,148 @@ class LocalChat:
             return f"Error reading channel history: {e}"
 
     async def chat(self, text: str, channel_id: str, discord_channel=None, bot_user=None) -> str:
-        """Send a message and get a response using the local Ollama LLM.
-
+        """Send a message and get a response using Gemini API.
+        
         Args:
             text: The user's message text
             channel_id: Channel ID string for history tracking
             discord_channel: The discord.Channel object (to get channel name/guild info)
             bot_user: The bot's discord.User object (to get bot user ID for filtering)
         """
-        # Store channel info for read_channel_history tool
+        # Store channel info for read_channel_history tool (uses user token, not bot)
         self._current_channel_id = channel_id
         self._current_channel_name = getattr(discord_channel, 'name', None) if discord_channel else None
         guild = getattr(discord_channel, 'guild', None) if discord_channel else None
         self._current_guild_name = guild.name if guild else None
         self._bot_user_id = str(bot_user.id) if bot_user else None
-
         try:
-            from local_llm import LocalLLM
+            import google.genai as genai
+            from google.genai import types
 
-            llm = LocalLLM()
-
-            # Load tool declarations from main.py + Discord-specific tools
-            try:
-                from main import TOOL_DECLARATIONS
-                all_tools = TOOL_DECLARATIONS + self.DISCORD_BOT_TOOLS
-            except ImportError:
-                all_tools = self.DISCORD_BOT_TOOLS
+            client = genai.Client(api_key=self.api_key)
 
             history = self._get_history(channel_id)
             history.append({"role": "user", "content": text})
 
-            # Build messages list with system prompt
-            messages = [{"role": "system", "content": self.system_prompt}] + list(history)
-
-            # Call local LLM with tools (up to 3 rounds of tool execution)
-            for round_num in range(3):
-                response = await asyncio.to_thread(
-                    llm.chat_with_tools,
-                    messages=messages,
-                    tools=all_tools,
-                    temperature=0.8,
-                    max_tokens=2048,
+            # Build contents for Gemini
+            contents = []
+            for msg in history:
+                contents.append(
+                    types.Content(
+                        role=msg["role"],
+                        parts=[types.Part.from_text(text=msg["content"])]
+                    )
                 )
 
-                content = response.get("content", "")
-                tool_calls = response.get("tool_calls", [])
+            # Call Gemini with tools
+            config = types.GenerateContentConfig(
+                system_instruction=self.system_prompt,
+                tools=self.tools if self.tools else None,
+                temperature=0.8,
+                max_output_tokens=2048,
+            )
 
-                if not tool_calls:
-                    # No more tool calls — return the text response
-                    if content.strip():
-                        history.append({"role": "model", "content": content})
-                        self._trim_history(channel_id)
-                        return content.strip()
-                    return "Je n'ai pas pu générer de réponse."
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model=self.model,
+                contents=contents,
+                config=config,
+            )
 
-                # Execute tool calls
-                messages.append({
-                    "role": "assistant",
-                    "content": content or "",
-                    "tool_calls": [
-                        {"id": f"call_{i}", "type": "function",
-                         "function": {"name": tc["name"], "arguments": tc["arguments"]}}
-                        for i, tc in enumerate(tool_calls)
-                    ],
-                })
+            # Check for tool calls — may need multiple rounds
+            if response.candidates and response.candidates[0].content.parts:
+                # Collect all function calls and text parts
+                function_calls = []
+                result_text = ""
+                for part in response.candidates[0].content.parts:
+                    if part.function_call:
+                        function_calls.append(part.function_call)
+                    elif part.text:
+                        result_text += part.text
 
-                for i, tc in enumerate(tool_calls):
-                    tool_name = tc["name"]
-                    tool_args = tc["arguments"]
-                    tool_result = await self._execute_tool(tool_name, tool_args)
+                # Execute function calls and feed results back to Gemini
+                if function_calls:
+                    # Add the model's response (with function calls) to history
+                    history.append({"role": "model", "content": response.candidates[0].content.parts})
 
-                    # Special case: read_channel_history → feed result back to LLM
-                    if tool_name == "read_channel_history":
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": f"call_{i}",
-                            "content": str(tool_result),
-                        })
-                    else:
-                        # Other tools: include result in the LLM context
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": f"call_{i}",
-                            "content": f"Tool {tool_name} result: {str(tool_result)[:500]}",
-                        })
+                    for fc in function_calls:
+                        # Execute the tool
+                        tool_result = await self._execute_tool(
+                            fc.name,
+                            dict(fc.args) if fc.args else {}
+                        )
 
-            # Hit max rounds — return last content
-            if content.strip():
-                history.append({"role": "model", "content": content})
+                        # For read_channel_history, feed the result back to Gemini
+                        # so it can use the context to generate a proper response
+                        if fc.name == "read_channel_history":
+                            # Add tool result as a function response, then continue conversation
+                            history.append({"role": "user", "content": f"[Channel History Result]\n{tool_result}"})
+
+                            # Re-call Gemini with the channel context now available
+                            contents = []
+                            for msg in history:
+                                if isinstance(msg.get("content"), list):
+                                    # Model response with function calls — reconstruct
+                                    parts = []
+                                    for p in msg["content"]:
+                                        if hasattr(p, 'text') and p.text:
+                                            parts.append(types.Part.from_text(text=p.text))
+                                        elif hasattr(p, 'function_call') and p.function_call:
+                                            parts.append(types.Part.from_function_call(
+                                                name=p.function_call.name,
+                                                args=dict(p.function_call.args) if p.function_call.args else {}
+                                            ))
+                                    contents.append(types.Content(role=msg["role"], parts=parts))
+                                else:
+                                    contents.append(types.Content(
+                                        role=msg["role"],
+                                        parts=[types.Part.from_text(text=msg["content"])]
+                                    ))
+
+                            followup_response = await asyncio.to_thread(
+                                client.models.generate_content,
+                                model=self.model,
+                                contents=contents,
+                                config=config,
+                            )
+
+                            if followup_response.text:
+                                history.append({"role": "model", "content": followup_response.text})
+                                self._trim_history(channel_id)
+                                return followup_response.text
+                            return "Je n'ai pas pu générer de réponse après avoir lu l'historique."
+                        else:
+                            result_text += f"🔧 **{fc.name}**: {tool_result[:500]}\n"
+
+                if result_text.strip():
+                    history.append({"role": "model", "content": result_text})
+                    self._trim_history(channel_id)
+                    return result_text.strip()
+
+            # Simple text response
+            if response.text:
+                history.append({"role": "model", "content": response.text})
                 self._trim_history(channel_id)
-                return content.strip()
-            return "Je n'ai pas pu générer de réponse après les appels d'outils."
+                return response.text
+
+            return "Je n'ai pas pu générer de réponse."
 
         except Exception as e:
-            print(f"[DiscordBot] ❌ Local LLM error: {e}")
+            print(f"[DiscordBot] ❌ Gemini error: {e}")
             traceback.print_exc()
-            return f"Erreur LLM local: {str(e)[:200]}"
+            return f"Erreur Gemini: {str(e)[:200]}"
 
     async def _execute_tool(self, name: str, args: dict) -> str:
         """Execute a tool and return the result."""
         try:
-            # Discord-specific tool: read_channel_history
+            # Discord-specific tool: read_channel_history (uses user token via HTTP API)
             if name == "read_channel_history":
                 limit = int(args.get("limit", READ_HISTORY_DEFAULT))
                 result = await self.read_channel_messages(limit)
                 return str(result)
 
-            # Generic tools — use the same dispatcher as main.py
+            # Import tool dispatch from local_mode or main
+            # We'll use a simplified version here
             from actions.web_search import web_search as web_search_action
             from actions.weather_report import weather_action
             from actions.reminder import reminder
@@ -325,6 +376,7 @@ async def run_discord_bot():
 
     keys = _load_keys()
     token = keys.get("discord_bot_token", "").strip()
+    gemini_key = keys.get("gemini_api_key", "").strip()
 
     if not token:
         print("[DiscordBot] ❌ Discord bot token not found!")
@@ -332,8 +384,13 @@ async def run_discord_bot():
         print("   Create a bot at: https://discord.com/developers/applications")
         return
 
-    # Setup local LLM
-    chat = LocalChat()
+    if not gemini_key:
+        print("[DiscordBot] ❌ Gemini API key not found!")
+        print("   Add 'gemini_api_key' to config/api_keys.json")
+        return
+
+    # Setup Gemini
+    gemini = GeminiChat(gemini_key)
 
     # Setup Discord bot
     intents = discord.Intents.default()
@@ -404,8 +461,8 @@ async def run_discord_bot():
 
         # Show typing indicator
         async with message.channel.typing():
-            # Get LLM response (pass channel & bot user for read_channel_history tool)
-            response = await chat.chat(
+            # Get Gemini response (pass channel & bot user for read_channel_history tool)
+            response = await gemini.chat(
                 text, channel_id,
                 discord_channel=message.channel,
                 bot_user=bot.user
@@ -442,8 +499,8 @@ async def run_discord_bot():
     async def clear_history(ctx):
         """Clear conversation history for this channel."""
         channel_id = str(ctx.channel.id)
-        if channel_id in chat._histories:
-            chat._histories[channel_id] = []
+        if channel_id in gemini._histories:
+            gemini._histories[channel_id] = []
         await ctx.reply("Mémoire effacée. 🧹")
 
     @bot.command(name="servers")
@@ -481,7 +538,7 @@ async def run_discord_bot():
 def main():
     """Entry point for standalone execution."""
     print("=" * 50)
-    print("  JARVIS — Discord Bot (Local LLM)")
+    print("  JARVIS — Discord Bot")
     print("=" * 50)
     asyncio.run(run_discord_bot())
 

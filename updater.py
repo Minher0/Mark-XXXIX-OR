@@ -455,11 +455,6 @@ def main():
     else:
         _ok("No changes needed")
 
-    # Verify Ollama is installed (local LLM backend)
-    if not shutil.which("ollama"):
-        _warn("Ollama is not installed. Jarvis needs it for local AI.")
-        _warn("Install from https://ollama.com/download or re-run Jarvis.exe (first-time setup).")
-
     # Step 4: Restart
     _step(4, TOTAL_STEPS, "Ready to launch...")
     _ok()
