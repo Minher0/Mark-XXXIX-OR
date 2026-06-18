@@ -1,8 +1,15 @@
 {
-    "gemini_api_key": "YOUR_GEMINI_API_KEY_HERE",
     "openrouter_api_key": "YOUR_OPENROUTER_API_KEY_HERE",
     "discord_bot_token": "YOUR_DISCORD_BOT_TOKEN_HERE",
     "discord_token": "YOUR_DISCORD_USER_TOKEN_HERE",
-    "live_model": "",
+    "local_model": "llama3.2:3b",
+    "local_vision_model": "llava:7b",
+    "ollama_host": "http://localhost:11434",
+    "whisper_model": "small",
+    "whisper_language": "",
+    "whisper_device": "auto",
+    "tts_voice": "",
+    "tts_rate": 175,
+    "tts_volume": 1.0,
     "os_system": ""
 }

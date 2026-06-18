@@ -1,18 +1,43 @@
+"""
+main.py — MARK XXXIX-OR (Local Edition)
+
+Entry point for the JARVIS voice assistant using LOCAL models:
+  - STT  : faster-whisper (local)
+  - LLM  : Ollama (local)
+  - TTS  : pyttsx3 (local, OS built-in voices)
+
+The Gemini Live API has been completely removed. All other integrations
+(OpenRouter, Discord, etc.) remain unchanged.
+
+Architecture:
+  Mic → VAD → Whisper STT → text
+                          ↓
+                      Ollama LLM (with tool declarations)
+                          ↓
+                  ┌─── tool_calls? ───┐
+                  ↓                   ↓
+              execute tools       TTS → speaker
+                  ↓
+          (loop back to LLM with tool results)
+"""
+
 import asyncio
-import threading
 import json
 import sys
+import threading
+import time
 import traceback
+from datetime import datetime
 from pathlib import Path
 
-import sounddevice as sd
-from google import genai
-from google.genai import types
 from ui import JarvisUI
 from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt,
     should_extract_memory, extract_memory
 )
+from local_llm import LocalLLM
+from local_stt import LocalSTT
+from local_tts import LocalTTS
 
 from actions.file_processor import file_processor
 from actions.flight_finder     import flight_finder
@@ -47,55 +72,18 @@ BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
 
-# Default Live API model — preview audio model that supports realtime voice.
-# Can be overridden via the "live_model" field in config/api_keys.json
-# (with or without the "models/" prefix).
-#
-# NOTE: gemini-live-2.5-flash-preview is the recommended default as of June 2026.
-# The "native-audio-preview-12-2025" model has been reported to crash with
-# 1011 Internal Error after successful connection (likely a server-side bug
-# with thinking_budget=0 on that specific preview). It's still listed in the
-# fallback chain so it can be tried if the primary fails.
-LIVE_MODEL_DEFAULT  = "models/gemini-live-2.5-flash-preview"
-
-# Fallback chain — if the primary model is rejected (e.g. 1008 policy violation
-# because the preview was deprecated), Jarvis tries each of these in order.
-# The last known-good model is sticky: once one succeeds, it's reused on
-# reconnects until it fails.
-LIVE_MODEL_FALLBACKS = [
-    "models/gemini-live-2.5-flash-preview",
-    "models/gemini-2.5-flash-native-audio-preview-12-2025",
-    "models/gemini-2.0-flash-live-001",
-    "models/gemini-2.0-flash-exp-native-audio",
-]
-
-CHANNELS            = 1
-SEND_SAMPLE_RATE    = 16000
-RECEIVE_SAMPLE_RATE = 24000
-CHUNK_SIZE          = 1024
-
 
 def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
+    """Kept for backward compatibility — returns empty string in local mode.
 
-
-def _load_live_model() -> str:
-    """Load the Live API model name from config/api_keys.json.
-
-    Falls back to LIVE_MODEL_DEFAULT if missing or unreadable.
-    The "models/" prefix is added automatically if the user typed just the
-    model slug.
+    Some legacy modules still call this. They've been migrated to local_llm,
+    but we keep the function to avoid ImportErrors during the transition.
     """
     try:
         with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        model = (data.get("live_model") or "").strip()
-        if not model:
-            return LIVE_MODEL_DEFAULT
-        return model if model.startswith("models/") else f"models/{model}"
+            return json.load(f).get("gemini_api_key", "")
     except Exception:
-        return LIVE_MODEL_DEFAULT
+        return ""
 
 
 def _load_system_prompt() -> str:
@@ -107,30 +95,11 @@ def _load_system_prompt() -> str:
             "Be concise, direct, and always use the provided tools to complete tasks. "
             "Never simulate or guess results — always call the appropriate tool."
         )
-    
-_last_memory_input = ""
 
-def _update_memory_async(user_text: str, jarvis_text: str) -> None:
-    global _last_memory_input
 
-    user_text   = (user_text   or "").strip()
-    jarvis_text = (jarvis_text or "").strip()
-
-    if len(user_text) < 5 or user_text == _last_memory_input:
-        return
-    _last_memory_input = user_text
-
-    try:
-        api_key = _get_api_key()
-        if not should_extract_memory(user_text, jarvis_text, api_key):
-            return
-        data = extract_memory(user_text, jarvis_text, api_key)
-        if data:
-            update_memory(data)
-            print(f"[Memory] ✅ {list(data.keys())}")
-    except Exception as e:
-        if "429" not in str(e):
-            print(f"[Memory] ⚠️ {e}")
+# ─── Tool declarations (kept identical to Gemini version) ───
+# These are now consumed by local_llm.py which converts them to the
+# OpenAI-compatible format expected by Ollama.
 
 TOOL_DECLARATIONS = [
     {
@@ -190,11 +159,8 @@ TOOL_DECLARATIONS = [
             "stop playback, seek forward or backward, check what's currently playing, AND adjust the "
             "volume of the currently playing media app (per-app, NOT system-wide). "
             "Supports Spotify, YouTube Music, Apple Music, VLC, and any media app. "
-            "Use this when the user says: pause, play, skip, next, previous, what's playing, "
-            "qu'est-ce qui joue, met pause, passe, reviens, baisse la musique, monte le son de Spotify, etc. "
             "For SYSTEM-WIDE volume, use computer_settings volume_set instead. "
-            "For per-app volume targeting a SPECIFIC app by name (not necessarily the playing one), "
-            "use computer_settings set_app_volume."
+            "For per-app volume targeting a SPECIFIC app by name, use computer_settings set_app_volume."
         ),
         "parameters": {
             "type": "OBJECT",
@@ -712,88 +678,42 @@ TOOL_DECLARATIONS = [
     },
 ]
 
-class JarvisLive:
+
+# ─── JarvisLocal: the main voice assistant loop ─────────────
+
+class JarvisLocal:
+    """Voice assistant using local STT + LLM + TTS.
+
+    The loop:
+      1. Listen for speech via VAD + Whisper STT
+      2. Send transcript to Ollama with conversation history + tools
+      3. If tool_calls → execute them → feed results back → goto 2
+      4. If text response → speak via TTS → goto 1
+
+    Barge-in: when TTS is playing, STT is paused. When speech is detected
+    during TTS, we stop TTS and start processing the new utterance.
+    """
+
+    MAX_TURNS = 20         # conversation history limit
+    MAX_TOOL_ROUNDS = 8    # safety: avoid infinite tool loops
 
     def __init__(self, ui: JarvisUI):
-        self.ui             = ui
-        self.session        = None
-        self.audio_in_queue = None
-        self.out_queue      = None
-        self._loop          = None
-        self._is_speaking   = False
-        self._speaking_lock = threading.Lock()
+        self.ui = ui
+        self.llm = LocalLLM()
+        self.stt = LocalSTT()
+        self.tts = LocalTTS()
+        self.conversation: list = []   # [{role, content}, ...]
+        self._running = False
+        self._processing = False  # True while LLM is thinking / tool executing
         self.ui.on_text_command = self._on_text_command
 
-        # Live model selection state
-        # _live_model: the model that will be tried on the next connect()
-        # _failed_models: models that 1008'd (or 1011'd twice) and should be skipped
-        # _minimal_config_tried: True if we already tried the minimal config
-        #                        with the current model — avoids infinite loops
-        # _last_connect_succeeded: True if the previous connect() call opened
-        #                          a session successfully. Used to distinguish
-        #                          "1008 at connect time" (config issue → retry
-        #                          with minimal config) from "1008 at runtime"
-        #                          (model issue → skip directly to next model).
-        # _1011_counts: per-model counter of consecutive 1011 errors. After 2
-        #               consecutive 1011s, the model is marked as failed and we
-        #               move on. Reset on successful connect or on model change.
-        self._live_model: str          = _load_live_model()
-        self._failed_models: set[str]  = set()
-        self._minimal_config_tried: bool = False
-        self._last_connect_succeeded: bool = False
-        self._1011_counts: dict[str, int] = {}
-
-    def _on_text_command(self, text: str):
-        if not self._loop or not self.session:
-            return
-        asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
-                turns={"parts": [{"text": text}]},
-                turn_complete=True
-            ),
-            self._loop
-        )
-
-    def set_speaking(self, value: bool):
-        with self._speaking_lock:
-            self._is_speaking = value
-        if value:
-            self.ui.set_state("SPEAKING")
-        elif not self.ui.muted:
-            self.ui.set_state("LISTENING")
-
-    def speak(self, text: str):
-        if not self._loop or not self.session:
-            return
-        asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
-                turns={"parts": [{"text": text}]},
-                turn_complete=True
-            ),
-            self._loop
-        )
-
-    def speak_error(self, tool_name: str, error: str):
-        short = str(error)[:120]
-        self.ui.write_log(f"ERR: {tool_name} — {short}")
-        self.speak(f"Sir, {tool_name} encountered an error. {short}")
-
-    def _build_config(self, minimal: bool = False) -> types.LiveConnectConfig:
-        """Build the Live API connection config.
-
-        Args:
-            minimal: When True, drops optional features (audio transcription,
-                     tools) to maximise compatibility with models that reject
-                     the full config. Used as a last-resort fallback when the
-                     primary config triggers 1008 policy violations.
-        """
-        from datetime import datetime
-
-        memory     = load_memory()
-        mem_str    = format_memory_for_prompt(memory)
+    def _build_system_prompt(self) -> str:
+        """Build the system prompt with current date/time + memory."""
+        memory = load_memory()
+        mem_str = format_memory_for_prompt(memory)
         sys_prompt = _load_system_prompt()
 
-        now      = datetime.now()
+        now = datetime.now()
         time_str = now.strftime("%A, %B %d, %Y — %I:%M %p")
         time_ctx = (
             f"[CURRENT DATE & TIME]\n"
@@ -805,542 +725,328 @@ class JarvisLive:
         if mem_str:
             parts.append(mem_str)
         parts.append(sys_prompt)
+        return "\n".join(parts)
 
-        # NOTE: `session_resumption=types.SessionResumptionConfig()` was removed.
-        # Passing an empty SessionResumptionConfig requests the session-resumption
-        # feature without a handle, which some preview models reject with
-        # "1008 policy violation — Operation is not implemented, or supported,
-        # or enabled". Only enable it explicitly when we actually want to resume.
-        kwargs = dict(
-            response_modalities=["AUDIO"],
-            system_instruction="\n".join(parts),
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name="Charon"
-                    )
-                )
-            ),
-        )
+    def _on_text_command(self, text: str):
+        """Handle text input from the UI (instead of voice)."""
+        if not text.strip():
+            return
+        threading.Thread(
+            target=self._process_user_input,
+            args=(text,),
+            daemon=True,
+        ).start()
 
-        # ── CRITICAL: disable "thinking" mode ──
-        # Gemini 2.5 Flash models enable internal reasoning ("thoughts") by
-        # default. The Live API in audio streaming mode cannot serialise these
-        # thought parts — the server sends them anyway, then closes the
-        # WebSocket with 1008 "Operation is not implemented, or supported, or
-        # enabled" right after the first response.
-        #
-        # Setting thinking_budget=0 disables the feature entirely.
-        #
-        # NOTE: the SDK used to accept thinking_config nested under
-        # generation_config, but that's now deprecated. We set the field
-        # DIRECTLY on LiveConnectConfig. We try the structured types first
-        # (google-genai ≥1.x) and fall back to a plain dict for older SDK
-        # versions or models that don't expose ThinkingConfig.
-        thinking_set = False
-        try:
-            kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
-            thinking_set = True
-        except (AttributeError, TypeError):
-            pass
-        if not thinking_set:
-            try:
-                kwargs["thinking_config"] = {"thinking_budget": 0}
-                thinking_set = True
-            except Exception:
-                pass  # SDK too old — accept the risk of runtime 1008
+    def _on_transcript(self, text: str):
+        """Called by STT when speech is transcribed."""
+        if not text or not text.strip():
+            return
+        if self._processing:
+            # Barge-in: user is interrupting
+            print(f"[JARVIS] ⏸️ Barge-in: '{text[:50]}'")
+            self.tts.stop_speaking()
+        # Process in a separate thread so STT can continue listening
+        threading.Thread(
+            target=self._process_user_input,
+            args=(text,),
+            daemon=True,
+        ).start()
 
-        if not minimal:
-            # Transcription enables text mirroring of audio in/out — useful for
-            # logging and memory extraction, but not supported on all models.
-            kwargs["output_audio_transcription"] = {}
-            kwargs["input_audio_transcription"]  = {}
-            kwargs["tools"] = [{"function_declarations": TOOL_DECLARATIONS}]
-
-        return types.LiveConnectConfig(**kwargs)
-
-    def _intercept_memory_open(self, name: str, args: dict) -> dict:
-        """Redirect any memory-opening request to cmd_control open_memory."""
-        if name == "cmd_control" and args.get("action", "").lower() == "open_memory":
-            return args  # Already correct
-
-        # Catch open_app trying to open memory
-        if name == "open_app":
-            app_name = args.get("app_name", "").lower()
-            memory_keywords = ["memory", "mémoire", "memoire", "long term",
-                               "long-term", "longterm", "long terme", "long-terme"]
-            if any(kw in app_name for kw in memory_keywords):
-                print("[JARVIS] 🔄 Intercepted memory request from open_app → cmd_control open_memory")
-                args = {"action": "open_memory"}
-                return args
-
-        return args
-
-    async def _execute_tool(self, fc) -> types.FunctionResponse:
-        name = fc.name
-        args = dict(fc.args or {})
-
-        # Intercept memory-opening requests
-        args = self._intercept_memory_open(name, args)
-        if args.get("action") == "open_memory" and name != "cmd_control":
-            name = "cmd_control"
-
-        print(f"[JARVIS] 🔧 {name}  {args}")
+    def _process_user_input(self, user_text: str):
+        """Process a user utterance: send to LLM, handle tools, speak response."""
+        if self._processing:
+            return  # already processing — ignore (barge-in case handled above)
+        self._processing = True
         self.ui.set_state("THINKING")
-        if name == "save_memory":
-            category = args.get("category", "notes")
-            key      = args.get("key", "")
-            value    = args.get("value", "")
-            if key and value:
-                update_memory({category: {key: {"value": value}}})
-                print(f"[Memory] 💾 save_memory: {category}/{key} = {value}")
-            if not self.ui.muted:
+        self.ui.write_log(f"You: {user_text}")
+        self.tts.pause()  # pause STT during processing
+        # Stop TTS in case it's still going
+        self.tts.stop_speaking()
+
+        try:
+            # Add user message to history
+            self.conversation.append({"role": "user", "content": user_text})
+            self._trim_history()
+
+            # Run the LLM + tool loop
+            self._run_llm_tool_loop()
+
+        except Exception as e:
+            print(f"[JARVIS] ❌ Processing error: {e}")
+            traceback.print_exc()
+            self.ui.write_log(f"ERR: {e}")
+            self.tts.speak(f"Sir, an error occurred. {str(e)[:120]}")
+        finally:
+            self._processing = False
+            self.tts.resume()
+            if not self.tts.is_speaking:
                 self.ui.set_state("LISTENING")
-            return types.FunctionResponse(
-                id=fc.id, name=name,
-                response={"result": "ok", "silent": True}
+
+    def _run_llm_tool_loop(self):
+        """Call the LLM, execute any tool calls, feed results back, repeat."""
+        system_prompt = self._build_system_prompt()
+
+        # Build the messages list (system + history)
+        messages = [{"role": "system", "content": system_prompt}] + self.conversation
+
+        for round_num in range(self.MAX_TOOL_ROUNDS):
+            print(f"[JARVIS] 🧠 LLM round {round_num + 1}...")
+            response = self.llm.chat_with_tools(
+                messages=messages,
+                tools=TOOL_DECLARATIONS,
+                temperature=0.7,
+                max_tokens=2048,
             )
 
-        loop   = asyncio.get_event_loop()
-        result = "Done."
+            content = response.get("content", "")
+            tool_calls = response.get("tool_calls", [])
 
+            # If the LLM produced text, append it to history + speak
+            if content:
+                self.conversation.append({"role": "assistant", "content": content})
+                self._trim_history()
+                print(f"[JARVIS] 🗣️ {content[:200]}")
+                self.ui.write_log(f"Jarvis: {content}")
+                # Speak in a separate thread so we can detect barge-in
+                self.ui.set_state("SPEAKING")
+                self.tts.speak(content)
+                # Wait for TTS to finish (with timeout in case it hangs)
+                self._wait_for_tts()
+
+            # Handle save_memory silently (don't speak)
+            silent_tools = {"save_memory", "shutdown_jarvis"}
+            spoken_tools = [tc for tc in tool_calls if tc["name"] not in silent_tools]
+
+            # If no tool calls, we're done
+            if not tool_calls:
+                break
+
+            # Execute tool calls
+            # Add the assistant's tool-calling message to history
+            messages.append({
+                "role": "assistant",
+                "content": content or "",
+                "tool_calls": [
+                    {"id": f"call_{i}", "type": "function",
+                     "function": {"name": tc["name"], "arguments": tc["arguments"]}}
+                    for i, tc in enumerate(tool_calls)
+                ],
+            })
+
+            for tc in tool_calls:
+                name = tc["name"]
+                args = tc["arguments"]
+                print(f"[JARVIS] 🔧 {name}  {args}")
+                self.ui.write_log(f"[tool] {name}")
+
+                # Special: shutdown
+                if name == "shutdown_jarvis":
+                    self.tts.speak("Goodbye, sir.")
+                    self._wait_for_tzs()
+                    self._running = False
+                    # Schedule shutdown
+                    threading.Thread(target=self._shutdown, daemon=True).start()
+                    return
+
+                # Special: save_memory (silent, no history)
+                if name == "save_memory":
+                    self._handle_save_memory(args)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": f"call_{tool_calls.index(tc)}",
+                        "content": "ok",
+                    })
+                    continue
+
+                # Execute the tool
+                result = self._execute_tool(name, args)
+                print(f"[JARVIS] 📤 {name} → {str(result)[:80]}")
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": f"call_{tool_calls.index(tc)}",
+                    "content": str(result),
+                })
+
+            # Loop back to call the LLM again with tool results
+            # (don't speak until we have a final text response)
+        else:
+            print(f"[JARVIS] ⚠️ Hit MAX_TOOL_ROUNDS ({self.MAX_TOOL_ROUNDS})")
+            self.tts.speak("Sir, I've reached the maximum number of tool calls for this turn.")
+
+    def _wait_for_tts(self):
+        """Wait for TTS to finish speaking (with timeout)."""
+        deadline = time.time() + 120  # 2 min max per response
+        while self.tts.is_speaking and time.time() < deadline:
+            time.sleep(0.1)
+
+    def _wait_for_tzs(self):
+        """Alias for _wait_for_tts (typo guard)."""
+        self._wait_for_tts()
+
+    def _trim_history(self):
+        """Keep conversation history under MAX_TURNS."""
+        if len(self.conversation) > self.MAX_TURNS:
+            # Keep the last MAX_TURNS messages
+            self.conversation = self.conversation[-self.MAX_TURNS:]
+
+    def _handle_save_memory(self, args: dict):
+        """Silently save a memory entry."""
+        category = args.get("category", "notes")
+        key = args.get("key", "")
+        value = args.get("value", "")
+        if key and value:
+            update_memory({category: {key: {"value": value}}})
+            print(f"[Memory] 💾 save_memory: {category}/{key} = {value}")
+
+    def _execute_tool(self, name: str, args: dict) -> str:
+        """Execute a single tool call. Returns the result as a string."""
         try:
+            # Use a synchronous executor — Ollama calls are blocking already
             if name == "open_app":
-                r = await loop.run_in_executor(None, lambda: open_app(parameters=args, response=None, player=self.ui))
-                result = r or f"Opened {args.get('app_name')}."
+                return open_app(parameters=args, response=None, player=self.ui) or f"Opened {args.get('app_name')}."
 
-            elif name == "close_app":
-                r = await loop.run_in_executor(None, lambda: close_app(parameters=args, response=None, player=self.ui))
-                result = r or f"Closed {args.get('app_name')}."
+            if name == "close_app":
+                return close_app(parameters=args, response=None, player=self.ui) or f"Closed {args.get('app_name')}."
 
-            elif name == "list_open_apps":
-                r = await loop.run_in_executor(None, lambda: list_open_apps(parameters=args, response=None, player=self.ui))
-                result = r or "Apps listed."
+            if name == "list_open_apps":
+                return list_open_apps(parameters=args, response=None, player=self.ui) or "Apps listed."
 
-            elif name == "media_control":
-                r = await loop.run_in_executor(None, lambda: media_control(parameters=args, response=None, player=self.ui))
-                result = r or "Done."
+            if name == "media_control":
+                return media_control(parameters=args, response=None, player=self.ui) or "Done."
 
-            elif name == "weather_report":
-                r = await loop.run_in_executor(None, lambda: weather_action(parameters=args, player=self.ui))
-                result = r or "Weather delivered."
+            if name == "weather_report":
+                return weather_action(parameters=args, player=self.ui) or "Weather delivered."
 
-            elif name == "browser_control":
-                r = await loop.run_in_executor(None, lambda: browser_control(parameters=args, player=self.ui))
-                result = r or "Done."
+            if name == "browser_control":
+                return browser_control(parameters=args, player=self.ui) or "Done."
 
-            elif name == "file_controller":
-                r = await loop.run_in_executor(None, lambda: file_controller(parameters=args, player=self.ui))
-                result = r or "Done."
+            if name == "file_controller":
+                return file_controller(parameters=args, player=self.ui) or "Done."
 
-            elif name == "send_message":
-                r = await loop.run_in_executor(None, lambda: send_message(parameters=args, response=None, player=self.ui, session_memory=None))
-                result = r or f"Message sent to {args.get('receiver')}."
+            if name == "send_message":
+                return send_message(parameters=args, response=None, player=self.ui, session_memory=None) or f"Message sent to {args.get('receiver')}."
 
-            elif name == "reminder":
-                r = await loop.run_in_executor(None, lambda: reminder(parameters=args, response=None, player=self.ui))
-                result = r or "Reminder set."
+            if name == "reminder":
+                return reminder(parameters=args, response=None, player=self.ui) or "Reminder set."
 
-            elif name == "youtube_video":
-                r = await loop.run_in_executor(None, lambda: youtube_video(parameters=args, response=None, player=self.ui))
-                result = r or "Done."
-            elif name == "file_processor":
+            if name == "youtube_video":
+                return youtube_video(parameters=args, response=None, player=self.ui) or "Done."
+
+            if name == "file_processor":
                 if not args.get("file_path") and self.ui.current_file:
                     args["file_path"] = self.ui.current_file
-                r = await loop.run_in_executor(
-                    None,
-                    lambda: file_processor(parameters=args, player=self.ui, speak=self.speak)
-                )
-                result = r or "Done."
+                return file_processor(parameters=args, player=self.ui, speak=self.tts.speak) or "Done."
 
-
-            elif name == "screen_process":
+            if name == "screen_process":
+                # Launch in a separate thread — it has its own loop
                 threading.Thread(
                     target=screen_process,
                     kwargs={"parameters": args, "response": None,
                             "player": self.ui, "session_memory": None},
-                    daemon=True
+                    daemon=True,
                 ).start()
-                result = "Vision module activated. Stay completely silent — vision module will speak directly."
+                return "Vision module activated."
 
-            elif name == "computer_settings":
-                r = await loop.run_in_executor(None, lambda: computer_settings(parameters=args, response=None, player=self.ui))
-                result = r or "Done."
+            if name == "computer_settings":
+                return computer_settings(parameters=args, response=None, player=self.ui) or "Done."
 
-            elif name == "desktop_control":
-                r = await loop.run_in_executor(None, lambda: desktop_control(parameters=args, player=self.ui))
-                result = r or "Done."
+            if name == "desktop_control":
+                return desktop_control(parameters=args, player=self.ui) or "Done."
 
-            elif name == "code_helper":
-                r = await loop.run_in_executor(None, lambda: code_helper(parameters=args, player=self.ui, speak=self.speak))
-                result = r or "Done."
+            if name == "code_helper":
+                return code_helper(parameters=args, player=self.ui, speak=self.tts.speak) or "Done."
 
-            elif name == "dev_agent":
-                r = await loop.run_in_executor(None, lambda: dev_agent(parameters=args, player=self.ui, speak=self.speak))
-                result = r or "Done."
+            if name == "dev_agent":
+                return dev_agent(parameters=args, player=self.ui, speak=self.tts.speak) or "Done."
 
-            elif name == "agent_task":
+            if name == "agent_task":
                 from agent.task_queue import get_queue, TaskPriority
                 priority_map = {"low": TaskPriority.LOW, "normal": TaskPriority.NORMAL, "high": TaskPriority.HIGH}
                 priority = priority_map.get(args.get("priority", "normal").lower(), TaskPriority.NORMAL)
-                task_id  = get_queue().submit(goal=args.get("goal", ""), priority=priority, speak=self.speak)
-                result   = f"Task started (ID: {task_id})."
+                task_id = get_queue().submit(goal=args.get("goal", ""), priority=priority, speak=self.tts.speak)
+                return f"Task started (ID: {task_id})."
 
-            elif name == "web_search":
-                r = await loop.run_in_executor(None, lambda: web_search_action(parameters=args, player=self.ui))
-                result = r or "Done."
+            if name == "web_search":
+                return web_search_action(parameters=args, player=self.ui) or "Done."
 
-            elif name == "computer_control":
-                r = await loop.run_in_executor(None, lambda: computer_control(parameters=args, player=self.ui))
-                result = r or "Done."
+            if name == "computer_control":
+                return computer_control(parameters=args, player=self.ui) or "Done."
 
-            elif name == "auto_click":
-                r = await loop.run_in_executor(None, lambda: auto_click(parameters=args, player=self.ui))
-                result = r or "Done."
+            if name == "auto_click":
+                return auto_click(parameters=args, player=self.ui) or "Done."
 
-            elif name == "cmd_control":
-                r = await loop.run_in_executor(None, lambda: cmd_control(parameters=args, player=self.ui))
-                result = r or "Done."
+            if name == "cmd_control":
+                return cmd_control(parameters=args, player=self.ui) or "Done."
 
-            elif name == "game_updater":
-                r = await loop.run_in_executor(None, lambda: game_updater(parameters=args, player=self.ui, speak=self.speak))
-                result = r or "Done."
+            if name == "game_updater":
+                return game_updater(parameters=args, player=self.ui, speak=self.tts.speak) or "Done."
 
-            elif name == "flight_finder":
-                r = await loop.run_in_executor(None, lambda: flight_finder(parameters=args, player=self.ui))
-                result = r or "Done."
+            if name == "flight_finder":
+                return flight_finder(parameters=args, player=self.ui) or "Done."
 
-            elif name == "discord_control":
-                r = await loop.run_in_executor(None, lambda: discord_control(parameters=args, player=self.ui))
-                result = r or "Done."
+            if name == "discord_control":
+                return discord_control(parameters=args, player=self.ui) or "Done."
 
-            elif name == "shutdown_jarvis":
-                self.ui.write_log("SYS: Shutdown requested.")
-                self.speak("Goodbye, sir.")
-
-                def _shutdown():
-                    import time, sys, os
-                    time.sleep(1)
-                    os._exit(0)
-
-                threading.Thread(target=_shutdown, daemon=True).start()
-            else:
-                result = f"Unknown tool: {name}"
+            return f"Unknown tool: {name}"
 
         except Exception as e:
-            result = f"Tool '{name}' failed: {e}"
+            err = f"Tool '{name}' failed: {e}"
             traceback.print_exc()
-            self.speak_error(name, e)
+            self.ui.write_log(f"ERR: {name} — {str(e)[:120]}")
+            return err
 
-        if not self.ui.muted:
-            self.ui.set_state("LISTENING")
+    def _shutdown(self):
+        """Force-shutdown Jarvis after a short delay."""
+        import os
+        time.sleep(1.5)
+        os._exit(0)
 
-        print(f"[JARVIS] 📤 {name} → {str(result)[:80]}")
+    def run(self):
+        """Start the assistant: init TTS/STT, listen forever."""
+        print("[JARVIS] 🚀 Starting local voice assistant...")
+        self._running = True
 
-        return types.FunctionResponse(
-            id=fc.id, name=name,
-            response={"result": result}
-        )
-
-    async def _send_realtime(self):
-        while True:
-            msg = await self.out_queue.get()
-            await self.session.send_realtime_input(media=msg)
-
-    async def _listen_audio(self):
-        print("[JARVIS] 🎤 Mic started")
-        loop = asyncio.get_event_loop()
-
-        def callback(indata, frames, time_info, status):
-            with self._speaking_lock:
-                jarvis_speaking = self._is_speaking
-            if not jarvis_speaking and not self.ui.muted:
-                data = indata.tobytes()
-                loop.call_soon_threadsafe(
-                    self.out_queue.put_nowait,
-                    {"data": data, "mime_type": "audio/pcm"}
-                )
+        # Init TTS
         try:
-            with sd.InputStream(
-                samplerate=SEND_SAMPLE_RATE,
-                channels=CHANNELS,
-                dtype="int16",
-                blocksize=CHUNK_SIZE,
-                callback=callback,
-            ):
-                print("[JARVIS] 🎤 Mic stream open")
-                while True:
-                    await asyncio.sleep(0.1)
+            self.tts.on_speak_start = lambda: self.ui.set_state("SPEAKING")
+            self.tts.on_speak_end = lambda: self.ui.set_state("LISTENING") if self._running else None
+            self.tts.start()
         except Exception as e:
-            print(f"[JARVIS] ❌ Mic: {e}")
-            raise
+            print(f"[JARVIS] ❌ TTS init failed: {e}")
+            self.ui.write_log(f"SYS: TTS error — {e}")
 
-    async def _receive_audio(self):
-        print("[JARVIS] 👂 Recv started")
-        out_buf, in_buf = [], []
-
+        # Init STT
         try:
-            while True:
-                async for response in self.session.receive():
-
-                    if response.data:
-                        self.audio_in_queue.put_nowait(response.data)
-
-                    if response.server_content:
-                        sc = response.server_content
-
-                        if sc.output_transcription and sc.output_transcription.text:
-                            self.set_speaking(True)
-                            txt = sc.output_transcription.text.strip()
-                            if txt:
-                                out_buf.append(txt)
-
-                        if sc.input_transcription and sc.input_transcription.text:
-                            txt = sc.input_transcription.text.strip()
-                            if txt:
-                                in_buf.append(txt)
-
-                        if sc.turn_complete:
-                            self.set_speaking(False)
-
-                            full_in = " ".join(in_buf).strip()
-                            if full_in:
-                                self.ui.write_log(f"You: {full_in}")
-                            in_buf = []
-
-                            full_out = " ".join(out_buf).strip()
-                            if full_out:
-                                self.ui.write_log(f"Jarvis: {full_out}")
-                            out_buf = []
-
-                            if full_in and len(full_in) > 5:
-                                threading.Thread(
-                                    target=_update_memory_async,
-                                    args=(full_in, full_out),
-                                    daemon=True
-                                ).start()
-
-                    if response.tool_call:
-                        fn_responses = []
-                        for fc in response.tool_call.function_calls:
-                            print(f"[JARVIS] 📞 {fc.name}")
-                            fr = await self._execute_tool(fc)
-                            fn_responses.append(fr)
-                        await self.session.send_tool_response(
-                            function_responses=fn_responses
-                        )
-
+            self.stt.on_transcript = self._on_transcript
+            self.stt.on_state_change = lambda s: self.ui.set_state(
+                {"idle": "THINKING", "listening": "LISTENING",
+                 "speaking_detected": "LISTENING", "transcribing": "THINKING"}.get(s, "LISTENING")
+            )
+            self.stt.start()
         except Exception as e:
-            err_str = str(e)
-            print(f"[JARVIS] ❌ Recv: {e}")
-            if "1011" in err_str:
-                print("[JARVIS] 🔴 Gemini 1011 — connection dropped, will reconnect")
-            else:
-                traceback.print_exc()
-            # Do NOT re-raise — let the run() loop handle reconnection gracefully
-            # The TaskGroup will still see the task ended, but without raising ExceptionGroup
+            print(f"[JARVIS] ❌ STT init failed: {e}")
+            self.ui.write_log(f"SYS: STT error — {e}")
 
-    async def _play_audio(self):
-        print("[JARVIS] 🔊 Play started")
-        loop = asyncio.get_event_loop()
+        # Welcome
+        self.ui.set_state("LISTENING")
+        self.ui.write_log("SYS: JARVIS online (local mode).")
+        self.tts.speak("JARVIS online, sir. Local models ready.")
 
-        stream = sd.RawOutputStream(
-            samplerate=RECEIVE_SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="int16",
-            blocksize=CHUNK_SIZE,
-        )
-        stream.start()
+        # Main loop: just keep the thread alive
         try:
-            while True:
-                chunk = await self.audio_in_queue.get()
-                self.set_speaking(True)
-                await asyncio.to_thread(stream.write, chunk)
-        except Exception as e:
-            print(f"[JARVIS] ❌ Play: {e}")
-            raise
+            while self._running:
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            print("\n🔴 Shutting down...")
         finally:
-            self.set_speaking(False)
-            stream.stop()
-            stream.close()
+            self._running = False
+            self.stt.stop()
+            self.tts.stop()
 
-    def _pick_next_model(self) -> str | None:
-        """Pick the next model to try, skipping failed ones.
-
-        Iterates over LIVE_MODEL_FALLBACKS (which includes the user-configured
-        model first via _load_live_model when it's also the default). Returns
-        None if every model in the chain has been marked failed.
-        """
-        # Build an ordered candidate list starting with the configured model,
-        # then appending any fallbacks not already in the list.
-        candidates = [self._live_model] + [
-            m for m in LIVE_MODEL_FALLBACKS if m != self._live_model
-        ]
-        for m in candidates:
-            if m not in self._failed_models:
-                return m
-        return None
-
-    async def run(self):
-        client = genai.Client(
-            api_key=_get_api_key(),
-            http_options={"api_version": "v1beta"}
-        )
-
-        reconnect_delay = 3  # Start with 3s, increase on repeated failures
-        max_delay = 30
-
-        while True:
-            # Pick the model to try this round
-            model = self._pick_next_model()
-            if model is None:
-                # Every model has failed — reset and wait longer before retrying
-                print("[JARVIS] 🔴 All Live models exhausted. Resetting failed list and waiting 60s.")
-                self._failed_models.clear()
-                self._minimal_config_tried = False
-                self.ui.set_state("THINKING")
-                await asyncio.sleep(60)
-                continue
-
-            # Decide whether to use minimal config: only when the current model
-            # has already failed once with the full config (i.e. it's in the
-            # failed list) AND we haven't tried minimal yet for this round.
-            use_minimal = self._minimal_config_tried
-
-            try:
-                cfg_kind = "minimal" if use_minimal else "full"
-                print(f"[JARVIS] 🔌 Connecting with model={model} config={cfg_kind}")
-                self.ui.set_state("THINKING")
-                config = self._build_config(minimal=use_minimal)
-
-                async with (
-                    client.aio.live.connect(model=model, config=config) as session,
-                    asyncio.TaskGroup() as tg,
-                ):
-                    self.session        = session
-                    self._loop          = asyncio.get_event_loop()
-                    self.audio_in_queue = asyncio.Queue()
-                    self.out_queue      = asyncio.Queue(maxsize=10)
-
-                    # Mark that the connection itself succeeded — distinguishes
-                    # runtime 1008 (model/feature issue mid-session) from
-                    # connection-time 1008 (config rejected at handshake).
-                    self._last_connect_succeeded = True
-
-                    print(f"[JARVIS] ✅ Connected (model={model}, config={cfg_kind}).")
-                    self.ui.set_state("LISTENING")
-                    self.ui.write_log("SYS: JARVIS online.")
-                    reconnect_delay = 3  # Reset on successful connection
-
-                    # Sticky success — remember the working model for next reconnect
-                    self._live_model = model
-                    self._minimal_config_tried = False
-                    self._failed_models.discard(model)
-                    # Reset the 1011 counter — this model just succeeded
-                    self._1011_counts[model] = 0
-
-                    tg.create_task(self._send_realtime())
-                    tg.create_task(self._listen_audio())
-                    tg.create_task(self._receive_audio())
-                    tg.create_task(self._play_audio())
-
-            except BaseException as e:
-                err_str = str(e)
-
-                # Extract sub-exceptions from TaskGroup if present
-                sub_errors = [str(sub) for sub in e.exceptions] if isinstance(e, ExceptionGroup) else []
-                all_errs = " | ".join([err_str] + sub_errors)
-
-                if isinstance(e, ExceptionGroup):
-                    for sub in e.exceptions:
-                        print(f"[JARVIS] ⚠️ TaskGroup sub-error: {sub}")
-                else:
-                    print(f"[JARVIS] ⚠️ {e}")
-                    traceback.print_exc()
-
-                runtime_failure = self._last_connect_succeeded
-
-                # ── 1008 policy violation — model rejected or unsupported feature ──
-                # Three-pronged recovery, depending on WHEN the 1008 occurred:
-                #   1. Connection-time 1008 + full config → retry same model with minimal config
-                #      (maybe transcription/tools were the culprit).
-                #   2. Connection-time 1008 + minimal config → mark model as failed,
-                #      move on to the next fallback.
-                #   3. Runtime 1008 (after a successful connect) → the model itself
-                #      is buggy in streaming mode (typical of preview models that
-                #      emit "thoughts" the Live API can't serialise). Skip minimal
-                #      config retry and go straight to the next model.
-                if "1008" in all_errs:
-                    print("[JARVIS] 🔴 1008 policy violation — model or feature rejected by Gemini Live API")
-                    if runtime_failure:
-                        # Runtime 1008 → don't bother with minimal config, the model
-                        # is fundamentally incompatible with streaming. Move on.
-                        print(f"[JARVIS]    Runtime 1008 (after successful connect) — marking '{model}' as failed.")
-                        self._failed_models.add(model)
-                        self._minimal_config_tried = False
-                        reconnect_delay = 2
-                    elif not use_minimal:
-                        # Connection-time 1008 with full config → try minimal config
-                        self._minimal_config_tried = True
-                        print(f"[JARVIS]    Retrying {model} with minimal config (no transcription, no tools)...")
-                        reconnect_delay = 1
-                    else:
-                        # Connection-time 1008 with minimal config → mark and move on
-                        print(f"[JARVIS]    Marking model '{model}' as failed. Trying next fallback.")
-                        self._failed_models.add(model)
-                        self._minimal_config_tried = False
-                        reconnect_delay = 2
-                # ── 1011 internal error — server-side ──
-                # Two cases:
-                #   - Transient (network blip, server overload): retry same model
-                #   - Structural (model crashes consistently right after connect):
-                #     mark as failed and move on after 2 consecutive 1011s
-                # We track this via _failed_models — if the same model 1011s twice
-                # in a row, it's structural and we skip to the next fallback.
-                elif "1011" in all_errs:
-                    print("[JARVIS] 🔴 Gemini API 1011 internal error — server-side issue")
-                    if runtime_failure:
-                        # Track repeated 1011s on this model via a counter
-                        count = self._1011_counts.get(model, 0) + 1
-                        self._1011_counts[model] = count
-                        if count >= 2:
-                            print(f"[JARVIS]    1011 x{count} on '{model}' — marking as failed, trying next fallback.")
-                            self._failed_models.add(model)
-                            self._minimal_config_tried = False
-                            # Reset counter so this model can be retried later if needed
-                            self._1011_counts[model] = 0
-                            reconnect_delay = 2
-                        else:
-                            print(f"[JARVIS]    1011 attempt {count}/2 on '{model}' — retrying same model.")
-                            reconnect_delay = max(reconnect_delay, 5)
-                    else:
-                        # 1011 at connection time — likely transient, short retry
-                        print("[JARVIS]    Connection-time 1011 — retrying same model.")
-                        reconnect_delay = max(reconnect_delay, 3)
-                # ── 401 / invalid API key — auth issue ──
-                elif "401" in all_errs or "API key not valid" in all_errs:
-                    print("[JARVIS] 🔴 Invalid Gemini API key — fix config/api_keys.json and restart Jarvis.")
-                    self.ui.set_state("THINKING")
-                    await asyncio.sleep(30)
-                    continue
-                # ── 429 / quota — rate limited, wait longer ──
-                elif "429" in all_errs or "quota" in all_errs.lower():
-                    print("[JARVIS] 🔴 Rate limited / quota exceeded by Gemini API")
-                    reconnect_delay = max(reconnect_delay, 30)
-
-            # Reset connect-succeeded flag at the end of each iteration
-            self._last_connect_succeeded = False
-
-            self.set_speaking(False)
-            self.session = None
-            self.ui.set_state("THINKING")
-            print(f"[JARVIS] 🔄 Reconnecting in {reconnect_delay}s...")
-            await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 1.5, max_delay)  # Exponential backoff
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="JARVIS — AI Assistant")
+    parser = argparse.ArgumentParser(description="JARVIS — AI Assistant (Local)")
     parser.add_argument("--discord", action="store_true",
                         help="Run as Discord bot instead of voice assistant")
     args = parser.parse_args()
@@ -1355,9 +1061,9 @@ def main():
 
     def runner():
         ui.wait_for_api_key()
-        jarvis = JarvisLive(ui)
+        jarvis = JarvisLocal(ui)
         try:
-            asyncio.run(jarvis.run())
+            jarvis.run()
         except KeyboardInterrupt:
             print("\n🔴 Shutting down...")
 

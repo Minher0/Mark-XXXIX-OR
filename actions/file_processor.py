@@ -25,66 +25,119 @@ import tempfile
 from pathlib import Path
 from datetime import datetime
 
-from google import genai as genai_new
-from google.genai import types as genai_types
-
 
 def _get_api_key() -> str:
+    """Legacy compat — returns empty string in local mode."""
     config_path = Path(__file__).resolve().parent.parent / "config" / "api_keys.json"
-    with open(config_path, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
-
-
-def _gemini_client():
-    """Return a google.genai Client instance for Gemini 2.5 Flash."""
-    return genai_new.Client(api_key=_get_api_key())
-
-_GEMINI_MODEL = "gemini-2.5-flash"
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            return json.load(f).get("gemini_api_key", "")
+    except Exception:
+        return ""
 
 
 def _gemini_generate(contents, system_instruction: str = "") -> str:
-    """One-shot helper that wraps the new google.genai generate_content API.
+    """Local-LLM replacement for the Gemini generate_content helper.
 
-    Accepts the same content types as the old GenerativeModel.generate_content:
-    - str  → text prompt
-    - list → mixed content (text + PIL Image, etc.)
+    Accepts the same content types as the old API:
+    - str  → text prompt → local_llm.chat()
+    - list → mixed content (text + PIL Image, audio bytes, etc.)
     Returns the response text as a string.
     """
-    client = _gemini_client()
+    from local_llm import client as llm_client
 
-    # Build the contents argument for the new API
+    # If it's a plain string, route to chat()
     if isinstance(contents, str):
-        parts = [genai_types.Part.from_text(text=contents)]
-    elif isinstance(contents, list):
-        parts = []
+        return llm_client.chat(
+            contents,
+            system=system_instruction or "You are a helpful AI assistant.",
+            temperature=0.2,
+            max_tokens=4096,
+        )
+
+    # If it's a list, look for images / audio / text parts
+    if isinstance(contents, list):
+        text_parts = []
+        image_bytes = None
+        audio_bytes = None
+        audio_mime  = None
+
         for item in contents:
-            if isinstance(item, genai_types.Part):
-                parts.append(item)
-            elif isinstance(item, str):
-                parts.append(genai_types.Part.from_text(text=item))
+            if isinstance(item, str):
+                text_parts.append(item)
             else:
-                # Assume it's a PIL Image — convert to inline_data
+                # Assume it's a PIL Image — convert to PNG bytes
                 try:
                     import io
                     buf = io.BytesIO()
                     item.save(buf, format="PNG")
-                    img_bytes = buf.getvalue()
-                    parts.append(genai_types.Part.from_bytes(data=img_bytes, mime_type="image/png"))
+                    image_bytes = buf.getvalue()
                 except Exception:
-                    parts.append(genai_types.Part.from_text(text=str(item)))
-    else:
-        parts = [genai_types.Part.from_text(text=str(contents))]
+                    # Maybe it's a tuple (bytes, mime_type) for audio
+                    if isinstance(item, tuple) and len(item) == 2:
+                        b, m = item
+                        if isinstance(b, bytes):
+                            audio_bytes = b
+                            audio_mime = m
+                    else:
+                        text_parts.append(str(item))
 
-    config = genai_types.GenerateContentConfig()
-    if system_instruction:
-        config.system_instruction = system_instruction
+        prompt = "\n\n".join(text_parts) or "Analyze this content."
 
-    response = client.models.generate_content(
-        model=_GEMINI_MODEL,
-        contents=parts,
-        config=config,
+        # If we have an image, use vision
+        if image_bytes:
+            return llm_client.vision_from_bytes(
+                prompt=prompt,
+                image_bytes=image_bytes,
+                system=system_instruction or "Analyze the image and respond clearly.",
+                temperature=0.2,
+                max_tokens=4096,
+            )
+
+        # If we have audio, transcribe first then chat
+        if audio_bytes:
+            try:
+                from local_stt import LocalSTT
+                import tempfile
+                ext = {"audio/wav": ".wav", "audio/mpeg": ".mp3", "audio/mp3": ".mp3",
+                       "audio/ogg": ".ogg", "audio/m4a": ".m4a", "audio/x-m4a": ".m4a"}.get(audio_mime, ".wav")
+                with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
+                    f.write(audio_bytes)
+                    tmp = f.name
+                try:
+                    stt = LocalSTT()
+                    transcript = stt.transcribe_file(tmp)
+                finally:
+                    try:
+                        import os as _os
+                        _os.unlink(tmp)
+                    except Exception:
+                        pass
+                full_prompt = f"{prompt}\n\nTranscript:\n{transcript}"
+                return llm_client.chat(
+                    full_prompt,
+                    system=system_instruction or "You are a helpful AI assistant.",
+                    temperature=0.2,
+                    max_tokens=4096,
+                )
+            except Exception as e:
+                return f"[transcription error: {e}]"
+
+        # No image, no audio — just text
+        return llm_client.chat(
+            prompt,
+            system=system_instruction or "You are a helpful AI assistant.",
+            temperature=0.2,
+            max_tokens=4096,
+        )
+
+    # Fallback: convert to string
+    return llm_client.chat(
+        str(contents),
+        system=system_instruction or "You are a helpful AI assistant.",
+        temperature=0.2,
+        max_tokens=4096,
     )
-    return response.text
 
 
 def _detect_type(path: Path) -> str:
@@ -561,17 +614,12 @@ def _process_audio(path: Path, action: str, params: dict, speak=None) -> str:
 
     if action == "transcribe":
         try:
-            content = path.read_bytes()
-            mime    = {
-                "mp3": "audio/mp3", "wav": "audio/wav",
-                "ogg": "audio/ogg", "m4a": "audio/mp4",
-                "aac": "audio/aac", "flac": "audio/flac",
-            }.get(path.suffix.lstrip(".").lower(), "audio/mpeg")
-            audio_part = genai_types.Part.from_bytes(data=content, mime_type=mime)
-            result = _gemini_generate([
-                "Transcribe all speech in this audio file accurately.",
-                audio_part
-            ]).strip()
+            # Use local Whisper STT for transcription (no LLM needed)
+            from local_stt import LocalSTT
+            stt = LocalSTT()
+            result = stt.transcribe_file(str(path)).strip()
+            if not result:
+                result = "(no speech detected)"
             if params.get("save", True):
                 out = _output_path(path, "transcript", ".txt")
                 out.write_text(result, encoding="utf-8")

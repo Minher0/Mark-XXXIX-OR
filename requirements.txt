@@ -1,7 +1,6 @@
 PyQt6
 sounddevice
-google-genai
-google-generativeai
+numpy
 Pillow
 requests
 beautifulsoup4
@@ -11,7 +10,6 @@ pyautogui
 pyperclip
 pygetwindow
 opencv-python
-numpy
 mss
 psutil
 comtypes
@@ -20,5 +18,11 @@ win10toast
 send2trash
 youtube-transcript-api
 pywinauto
-# pyaudio removed - requires portaudio.h C library to compile
-# sounddevice handles audio input/output without compilation
+pyttsx3
+
+# Local LLM stack (replaces Gemini API)
+ollama
+faster-whisper
+
+# OpenRouter client (kept — still used for many action modules)
+# (no extra deps — uses 'requests' which is already listed)

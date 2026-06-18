@@ -17,17 +17,45 @@ API_CONFIG_PATH  = BASE_DIR / "config" / "api_keys.json"
 PROJECTS_DIR     = Path.home() / "Desktop" / "JarvisProjects"
 MAX_FIX_ATTEMPTS = 5
 MODEL_PLANNER    = "gemini-2.5-flash"
-MODEL_WRITER     = "gemini-2.5-flash"
+MODEL_WRITER     = ""  # unused — local_llm uses its configured model
 
 def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
+    """Legacy compat — returns empty string in local mode."""
+    try:
+        with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f).get("gemini_api_key", "")
+    except Exception:
+        return ""
+
+
+class _GeminiCompatResponse:
+    def __init__(self, text: str):
+        self.text = text
+
+
+class _GeminiCompatModel:
+    """Mimics genai.GenerativeModel — routes to local LLM."""
+    def __init__(self, model_name: str = "", system_instruction: str = ""):
+        self.model_name = model_name
+        self.system_instruction = system_instruction
+
+    def generate_content(self, prompt, **kwargs):
+        from local_llm import client as llm_client
+        text = llm_client.chat(
+            str(prompt),
+            system=self.system_instruction or "You are an expert developer.",
+            temperature=0.2,
+            max_tokens=4096,
+        )
+        return _GeminiCompatResponse(text)
 
 
 def _get_model(model_name: str):
-    import google.generativeai as genai
-    genai.configure(api_key=_get_api_key())
-    return genai.GenerativeModel(model_name)
+    """Return a compat wrapper that routes to local_llm.
+
+    The model name is ignored — local_llm uses its configured model.
+    """
+    return _GeminiCompatModel(model_name)
 
 
 def _strip_fences(text: str) -> str:
