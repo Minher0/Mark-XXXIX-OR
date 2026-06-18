@@ -50,21 +50,15 @@ PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
 # Default Live API model — preview audio model that supports realtime voice.
 # Can be overridden via the "live_model" field in config/api_keys.json
 # (with or without the "models/" prefix).
-#
-# NOTE: gemini-live-2.5-flash-preview is the recommended default as of June 2026.
-# The "native-audio-preview-12-2025" model has been reported to crash with
-# 1011 Internal Error after successful connection (likely a server-side bug
-# with thinking_budget=0 on that specific preview). It's still listed in the
-# fallback chain so it can be tried if the primary fails.
-LIVE_MODEL_DEFAULT  = "models/gemini-live-2.5-flash-preview"
+LIVE_MODEL_DEFAULT  = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 
 # Fallback chain — if the primary model is rejected (e.g. 1008 policy violation
 # because the preview was deprecated), Jarvis tries each of these in order.
 # The last known-good model is sticky: once one succeeds, it's reused on
 # reconnects until it fails.
 LIVE_MODEL_FALLBACKS = [
-    "models/gemini-live-2.5-flash-preview",
     "models/gemini-2.5-flash-native-audio-preview-12-2025",
+    "models/gemini-live-2.5-flash-preview",
     "models/gemini-2.0-flash-live-001",
     "models/gemini-2.0-flash-exp-native-audio",
 ]
@@ -726,7 +720,7 @@ class JarvisLive:
 
         # Live model selection state
         # _live_model: the model that will be tried on the next connect()
-        # _failed_models: models that 1008'd (or 1011'd twice) and should be skipped
+        # _failed_models: models that 1008'd and should be skipped
         # _minimal_config_tried: True if we already tried the minimal config
         #                        with the current model — avoids infinite loops
         # _last_connect_succeeded: True if the previous connect() call opened
@@ -734,14 +728,10 @@ class JarvisLive:
         #                          "1008 at connect time" (config issue → retry
         #                          with minimal config) from "1008 at runtime"
         #                          (model issue → skip directly to next model).
-        # _1011_counts: per-model counter of consecutive 1011 errors. After 2
-        #               consecutive 1011s, the model is marked as failed and we
-        #               move on. Reset on successful connect or on model change.
         self._live_model: str          = _load_live_model()
         self._failed_models: set[str]  = set()
         self._minimal_config_tried: bool = False
         self._last_connect_succeeded: bool = False
-        self._1011_counts: dict[str, int] = {}
 
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
@@ -830,23 +820,18 @@ class JarvisLive:
         # WebSocket with 1008 "Operation is not implemented, or supported, or
         # enabled" right after the first response.
         #
-        # Setting thinking_budget=0 disables the feature entirely.
-        #
-        # NOTE: the SDK used to accept thinking_config nested under
-        # generation_config, but that's now deprecated. We set the field
-        # DIRECTLY on LiveConnectConfig. We try the structured types first
-        # (google-genai ≥1.x) and fall back to a plain dict for older SDK
-        # versions or models that don't expose ThinkingConfig.
-        thinking_set = False
+        # Setting thinking_budget=0 disables the feature entirely and prevents
+        # the runtime 1008. We try the structured types first (google-genai ≥1.x)
+        # and fall back to a plain dict for older SDK versions.
         try:
-            kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
-            thinking_set = True
+            kwargs["generation_config"] = types.GenerationConfig(
+                thinking_config=types.ThinkingConfig(thinking_budget=0)
+            )
         except (AttributeError, TypeError):
-            pass
-        if not thinking_set:
             try:
-                kwargs["thinking_config"] = {"thinking_budget": 0}
-                thinking_set = True
+                kwargs["generation_config"] = {
+                    "thinking_config": {"thinking_budget": 0}
+                }
             except Exception:
                 pass  # SDK too old — accept the risk of runtime 1008
 
@@ -1236,8 +1221,6 @@ class JarvisLive:
                     self._live_model = model
                     self._minimal_config_tried = False
                     self._failed_models.discard(model)
-                    # Reset the 1011 counter — this model just succeeded
-                    self._1011_counts[model] = 0
 
                     tg.create_task(self._send_realtime())
                     tg.create_task(self._listen_audio())
@@ -1290,33 +1273,9 @@ class JarvisLive:
                         self._failed_models.add(model)
                         self._minimal_config_tried = False
                         reconnect_delay = 2
-                # ── 1011 internal error — server-side ──
-                # Two cases:
-                #   - Transient (network blip, server overload): retry same model
-                #   - Structural (model crashes consistently right after connect):
-                #     mark as failed and move on after 2 consecutive 1011s
-                # We track this via _failed_models — if the same model 1011s twice
-                # in a row, it's structural and we skip to the next fallback.
+                # ── 1011 internal error — server-side, just retry ──
                 elif "1011" in all_errs:
-                    print("[JARVIS] 🔴 Gemini API 1011 internal error — server-side issue")
-                    if runtime_failure:
-                        # Track repeated 1011s on this model via a counter
-                        count = self._1011_counts.get(model, 0) + 1
-                        self._1011_counts[model] = count
-                        if count >= 2:
-                            print(f"[JARVIS]    1011 x{count} on '{model}' — marking as failed, trying next fallback.")
-                            self._failed_models.add(model)
-                            self._minimal_config_tried = False
-                            # Reset counter so this model can be retried later if needed
-                            self._1011_counts[model] = 0
-                            reconnect_delay = 2
-                        else:
-                            print(f"[JARVIS]    1011 attempt {count}/2 on '{model}' — retrying same model.")
-                            reconnect_delay = max(reconnect_delay, 5)
-                    else:
-                        # 1011 at connection time — likely transient, short retry
-                        print("[JARVIS]    Connection-time 1011 — retrying same model.")
-                        reconnect_delay = max(reconnect_delay, 3)
+                    print("[JARVIS] 🔴 Gemini API 1011 internal error — server-side issue, retrying...")
                 # ── 401 / invalid API key — auth issue ──
                 elif "401" in all_errs or "API key not valid" in all_errs:
                     print("[JARVIS] 🔴 Invalid Gemini API key — fix config/api_keys.json and restart Jarvis.")
