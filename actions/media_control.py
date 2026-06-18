@@ -339,7 +339,13 @@ def _seek_linux(seconds: int) -> str:
 # ─── Now Playing ─────────────────────────────────────────────
 
 def _now_playing_windows() -> str:
-    """Get currently playing media info on Windows via PowerShell + SMTC API."""
+    """Get currently playing media info on Windows via PowerShell + SMTC API.
+
+    Same fix as _get_current_media_app_windows: iterate over GetSessions()
+    instead of using GetCurrentSession(). The latter only returns the
+    foreground app's session, which is wrong when media plays in the
+    background (e.g. Spotify playing while Chrome is focused).
+    """
     ps_script = r'''
 Add-Type -TypeDefinition @"
 using System;
@@ -361,22 +367,56 @@ public static class NowPlaying {
         try {
             var t = Task.Run(async () => {
                 var manager = await Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager.RequestAsync();
-                var session = manager.GetCurrentSession();
-                if (session == null) return new MediaInfo { Status = "nothing_playing" };
 
-                var playback = session.GetPlaybackInfo();
-                var media = await session.TryGetMediaPropertiesAsync();
+                // Iterate ALL sessions, not just the foreground one.
+                var sessions = manager.GetSessions();
+                Windows.Media.Control.GlobalSystemMediaTransportControlsSession chosen = null;
+
+                // First pass: prefer a Playing session.
+                foreach (var s in sessions) {
+                    try {
+                        var info = s.GetPlaybackInfo();
+                        if (info != null && info.PlaybackStatus ==
+                            Windows.Media.Control.GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing) {
+                            chosen = s;
+                            break;
+                        }
+                    } catch { }
+                }
+                // Second pass: accept Paused.
+                if (chosen == null) {
+                    foreach (var s in sessions) {
+                        try {
+                            var info = s.GetPlaybackInfo();
+                            if (info != null && info.PlaybackStatus ==
+                                Windows.Media.Control.GlobalSystemMediaTransportControlsSessionPlaybackStatus.Paused) {
+                                chosen = s;
+                                break;
+                            }
+                        } catch { }
+                    }
+                }
+                // Last resort: foreground session.
+                if (chosen == null) {
+                    chosen = manager.GetCurrentSession();
+                }
+                if (chosen == null) return new MediaInfo { Status = "nothing_playing" };
+
+                var playback = chosen.GetPlaybackInfo();
+                var media = await chosen.TryGetMediaPropertiesAsync();
 
                 string status = "unknown";
-                switch (playback.PlaybackStatus) {
-                    case Windows.Media.Control.GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing:
-                        status = "playing"; break;
-                    case Windows.Media.Control.GlobalSystemMediaTransportControlsSessionPlaybackStatus.Paused:
-                        status = "paused"; break;
-                    case Windows.Media.Control.GlobalSystemMediaTransportControlsSessionPlaybackStatus.Stopped:
-                        status = "stopped"; break;
-                    case Windows.Media.Control.GlobalSystemMediaTransportControlsSessionPlaybackStatus.Changing:
-                        status = "changing"; break;
+                if (playback != null) {
+                    switch (playback.PlaybackStatus) {
+                        case Windows.Media.Control.GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing:
+                            status = "playing"; break;
+                        case Windows.Media.Control.GlobalSystemMediaTransportControlsSessionPlaybackStatus.Paused:
+                            status = "paused"; break;
+                        case Windows.Media.Control.GlobalSystemMediaTransportControlsSessionPlaybackStatus.Stopped:
+                            status = "stopped"; break;
+                        case Windows.Media.Control.GlobalSystemMediaTransportControlsSessionPlaybackStatus.Changing:
+                            status = "changing"; break;
+                    }
                 }
 
                 return new MediaInfo {
@@ -384,7 +424,7 @@ public static class NowPlaying {
                     Artist = media.Artist ?? "",
                     Album = media.Album ?? "",
                     Status = status,
-                    AppName = session.SourceAppUserModelId ?? ""
+                    AppName = chosen.SourceAppUserModelId ?? ""
                 };
             });
             t.Wait(TimeSpan.FromSeconds(5));
@@ -560,94 +600,95 @@ def _volume_windows(value: int | None, mode: str) -> str:
     """Control the volume of the currently playing media on Windows.
 
     Strategy:
-      1. Identify the currently playing app via the SMTC API (same as
-         _now_playing_windows). Returns the SourceAppUserModelId.
+      1. Identify the currently playing app via the SMTC API (GetSessions
+         + check PlaybackStatus == Playing). Returns SourceAppUserModelId.
       2. Use pycaw to find the audio session matching that app's process
-         and call ISimpleAudioVolume.SetMasterVolume(scalar, None).
-      3. Fallback: if no app is currently playing, return a helpful message.
+         (via _find_pycaw_session_by_app helper).
+      3. Fallback A: if SMTC reports nothing but pycaw has active audio
+         sessions, use the most active one. This catches apps that don't
+         register with SMTC (some browsers, VLC in certain modes, etc.).
+      4. Fallback B: if no audio session at all, suggest using volume_set.
 
     `mode` is one of: "set", "up", "down", "mute", "unmute".
     `value` is 0-100 when mode is "set", ignored otherwise.
     """
-    # Step 1: find which app is currently playing media
-    app_name = _get_current_media_app_windows()
-    if not app_name:
-        return "No media is currently playing. Use volume_set on computer_settings for system volume."
-
-    # Step 2: use pycaw to control that app's audio session volume
+    # Try pycaw first so we fail fast on missing dependency
     try:
-        from ctypes import cast, POINTER
-        from comtypes import CLSCTX_ALL
-        from pycaw.pycaw import AudioUtilities, IAudioSessionManager2
-
-        devices   = AudioUtilities.GetSpeakers()
-        interface = devices.Activate(IAudioSessionManager2._iid_, CLSCTX_ALL, None)
-        manager   = cast(interface, POINTER(IAudioSessionManager2))
-        sessions  = manager.GetSessionEnumerator()
-
-        target_session = None
-        for i in range(sessions.GetCount()):
-            sess = sessions.GetSession(i)
-            try:
-                proc_id = sess.ProcessId
-                if proc_id == 0:
-                    continue
-                import psutil
-                try:
-                    proc_name = psutil.Process(proc_id).name().lower()
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
-                # Match against the SMTC app identifier (heuristic)
-                if _app_name_matches(app_name, proc_name):
-                    target_session = sess
-                    break
-            except Exception:
-                continue
-
-        # If no exact match, fall back to the loudest/active session
-        if target_session is None:
-            for i in range(sessions.GetCount()):
-                sess = sessions.GetSession(i)
-                try:
-                    if sess.ProcessId and sess.State == 1:  # AudioSessionStateActive
-                        target_session = sess
-                        break
-                except Exception:
-                    continue
-
-        if target_session is None:
-            return f"Could not find an active audio session for {app_name}."
-
-        vol = target_session._ctl.QueryInterface(
-            __import__("pycaw").pycaw.ISimpleAudioVolume
-        )
-
-        if mode == "mute":
-            vol.SetMute(True, None)
-            return f"Muted {app_name}."
-        if mode == "unmute":
-            vol.SetMute(False, None)
-            return f"Unmuted {app_name}."
-
-        # Get current scalar (0.0 - 1.0)
-        current = vol.GetMasterVolume()
-        if mode == "up":
-            new_scalar = min(1.0, current + 0.1)
-        elif mode == "down":
-            new_scalar = max(0.0, current - 0.1)
-        else:  # "set"
-            new_scalar = max(0.0, min(1.0, (value or 0) / 100.0))
-
-        vol.SetMasterVolume(new_scalar, None)
-        return f"{app_name} volume set to {int(new_scalar * 100)}%."
-
+        from pycaw.pycaw import AudioUtilities  # noqa: F401
     except ImportError:
         return (
             "pycaw is not installed. Install with: pip install pycaw comtypes "
             "— or use computer_settings volume_set for system-wide volume."
         )
-    except Exception as e:
-        return f"Could not control {app_name} volume: {e}"
+
+    # Step 1: identify the playing app via SMTC
+    app_name = _get_current_media_app_windows()
+
+    target_session = None
+    source = ""
+
+    if app_name:
+        # Step 2: find the pycaw session matching that app's process
+        target_session = _find_pycaw_session_by_app(app_name)
+        source = f"SMTC: {app_name}"
+
+    # Fallback A: no SMTC match — try any active audio session.
+    # The user clearly has audio playing, so we honour that.
+    if target_session is None:
+        target_session = _find_any_active_pycaw_session()
+        if target_session is not None:
+            try:
+                proc_name = target_session.Process.name().replace(".exe", "")
+            except Exception:
+                proc_name = "active app"
+            source = f"fallback: {proc_name}"
+            if app_name:
+                print(
+                    f"[media_control] SMTC reported '{app_name}' but no pycaw "
+                    f"session matched — falling back to active session {proc_name}."
+                )
+            else:
+                print(
+                    "[media_control] SMTC reported no playing session — falling "
+                    f"back to active pycaw session {proc_name}."
+                )
+
+    if target_session is None:
+        return (
+            "No active audio session found. If media is playing, the app may "
+            "not be registered with Windows media controls. "
+            "Try computer_settings volume_set for system-wide volume."
+        )
+
+    # Compute the target scalar
+    if mode == "mute":
+        if _set_session_volume(target_session, scalar=0.0, mute=True):
+            return f"Muted {source}."
+        return f"Could not mute {source}."
+
+    if mode == "unmute":
+        # Restore to 50% if we don't know the previous level
+        current = _get_session_volume(target_session) or 0.5
+        if current <= 0.01:
+            current = 0.5
+        if _set_session_volume(target_session, scalar=current, mute=False):
+            return f"Unmuted {source} (volume at {int(current * 100)}%)."
+        return f"Could not unmute {source}."
+
+    current = _get_session_volume(target_session)
+    if current is None:
+        current = 0.5
+
+    if mode == "up":
+        new_scalar = min(1.0, current + 0.1)
+    elif mode == "down":
+        new_scalar = max(0.0, current - 0.1)
+    else:  # "set"
+        new_scalar = max(0.0, min(1.0, (value or 0) / 100.0))
+
+    if _set_session_volume(target_session, scalar=new_scalar, mute=False):
+        return f"{source} volume set to {int(new_scalar * 100)}%."
+    return f"Could not set volume for {source}."
 
 
 def _volume_macos(value: int | None, mode: str) -> str:
@@ -735,6 +776,14 @@ def _get_current_media_app_windows() -> str | None:
 
     Returns a cleaned-up app name (e.g. "Spotify", "Chrome") or None if no
     media is playing.
+
+    NOTE: We iterate over ALL SMTC sessions (GetSessions) and pick the first
+    one with PlaybackStatus == Playing. The previous code used GetCurrentSession(),
+    which only returns the session for the FOREGROUND app — so if Spotify was
+    playing in the background while Chrome was focused, GetCurrentSession()
+    returned Chrome's session (which has no media) and we'd report "nothing
+    playing". GetSessions() returns every registered media session, regardless
+    of which app is in the foreground.
     """
     ps_script = r'''
 Add-Type -TypeDefinition @"
@@ -742,17 +791,42 @@ using System;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Linq;
 
 public static class CurrentMediaApp {
     public static string Get() {
         try {
             var t = Task.Run(async () => {
                 var manager = await Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager.RequestAsync();
-                var session = manager.GetCurrentSession();
-                if (session == null) return "";
-                return session.SourceAppUserModelId ?? "";
+                // Try GetSessions() — returns ALL registered media sessions.
+                var sessions = manager.GetSessions();
+                // First pass: find a session that is actually Playing.
+                foreach (var s in sessions) {
+                    try {
+                        var info = s.GetPlaybackInfo();
+                        if (info != null && info.PlaybackStatus ==
+                            Windows.Media.Control.GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing) {
+                            return s.SourceAppUserModelId ?? "";
+                        }
+                    } catch { }
+                }
+                // Second pass: accept Paused sessions (user might want to control
+                // the volume of a paused player too).
+                foreach (var s in sessions) {
+                    try {
+                        var info = s.GetPlaybackInfo();
+                        if (info != null && info.PlaybackStatus ==
+                            Windows.Media.Control.GlobalSystemMediaTransportControlsSessionPlaybackStatus.Paused) {
+                            return s.SourceAppUserModelId ?? "";
+                        }
+                    } catch { }
+                }
+                // Last resort: GetCurrentSession() (foreground app).
+                var current = manager.GetCurrentSession();
+                if (current != null) return current.SourceAppUserModelId ?? "";
+                return "";
             });
-            t.Wait(TimeSpan.FromSeconds(4));
+            t.Wait(TimeSpan.FromSeconds(5));
             return t.Result;
         } catch {
             return "";
@@ -767,7 +841,7 @@ Write-Output $result
     try:
         result = subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps_script],
-            capture_output=True, text=True, timeout=8
+            capture_output=True, text=True, timeout=10
         )
         raw = result.stdout.strip()
         if not raw:
@@ -776,24 +850,91 @@ Write-Output $result
         clean = raw.split("!")[-1] if "!" in raw else raw
         clean = clean.replace("_", " ").split(".")[0] if "." in clean else clean
         return clean.strip() or None
+    except Exception as e:
+        print(f"[media_control] _get_current_media_app_windows error: {e}")
+        return None
+
+
+def _find_pycaw_session_by_app(app_name: str):
+    """Find a pycaw AudioSession whose process name matches `app_name`.
+
+    Returns the AudioSession object (with .ProcessId, ._ctl etc.) or None.
+    Uses pycaw's public AudioUtilities.GetAllSessions() API.
+    """
+    try:
+        from pycaw.pycaw import AudioUtilities
+        import psutil
+
+        app_query = (app_name or "").lower().replace(".exe", "").strip()
+        if not app_query:
+            return None
+
+        for sess in AudioUtilities.GetAllSessions():
+            try:
+                pid = sess.ProcessId
+                if pid == 0 or sess.Process is None:
+                    continue
+                proc_name = sess.Process.name().lower().replace(".exe", "")
+                # Partial match in either direction
+                if app_query in proc_name or proc_name in app_query:
+                    return sess
+            except Exception:
+                continue
+        return None
+    except ImportError:
+        return None
     except Exception:
         return None
 
 
-def _app_name_matches(smtc_app: str, proc_name: str) -> bool:
-    """Heuristic match between SMTC app identifier and a process name.
+def _find_any_active_pycaw_session():
+    """Find any active pycaw AudioSession — used as last-resort fallback when
+    SMTC detection fails but the user is clearly playing audio.
 
-    Both arguments are compared lowercased with non-alphanumerics stripped
-    to handle cases like 'Spotify' (SMTC) vs 'spotify.exe' (process).
+    Returns the most recently-active session or None.
     """
-    import re
-    def _norm(s: str) -> str:
-        return re.sub(r"[^a-z0-9]", "", (s or "").lower())
-    a = _norm(smtc_app)
-    b = _norm(proc_name)
-    if not a or not b:
+    try:
+        from pycaw.pycaw import AudioUtilities
+        sessions = AudioUtilities.GetAllSessions()
+        # Prefer sessions with a real process (not system sounds)
+        candidates = [s for s in sessions if s.ProcessId and s.Process is not None
+                      and s.Process.name().lower() not in ("audiodg.exe", "explorer.exe")]
+        return candidates[0] if candidates else None
+    except ImportError:
+        return None
+    except Exception:
+        return None
+
+
+def _set_session_volume(session, scalar: float, mute: bool | None = None) -> bool:
+    """Set the volume (and optionally mute state) of a pycaw AudioSession.
+
+    Args:
+        session: a pycaw AudioSession
+        scalar:  0.0 - 1.0
+        mute:    None to leave mute unchanged, True/False to set
+    Returns True on success.
+    """
+    try:
+        from pycaw.pycaw import ISimpleAudioVolume
+        vol = session._ctl.QueryInterface(ISimpleAudioVolume)
+        vol.SetMasterVolume(float(scalar), None)
+        if mute is not None:
+            vol.SetMute(bool(mute), None)
+        return True
+    except Exception as e:
+        print(f"[media_control] _set_session_volume error: {e}")
         return False
-    return a in b or b in a
+
+
+def _get_session_volume(session) -> float | None:
+    """Get the current volume scalar (0.0 - 1.0) of a pycaw AudioSession."""
+    try:
+        from pycaw.pycaw import ISimpleAudioVolume
+        vol = session._ctl.QueryInterface(ISimpleAudioVolume)
+        return vol.GetMasterVolume()
+    except Exception:
+        return None
 
 
 # ─── OS Dispatch Maps ────────────────────────────────────────
