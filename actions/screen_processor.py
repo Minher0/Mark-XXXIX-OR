@@ -223,6 +223,23 @@ class _LiveSession:
                     )
                 ),
             )
+
+            # ── CRITICAL: disable "thinking" mode ──
+            # Same rationale as main.py — without thinking_budget=0 the 2.5
+            # Flash preview emits 'thought' parts that the Live API can't
+            # stream, causing 1008 policy violations after the first response.
+            try:
+                kwargs["generation_config"] = types.GenerationConfig(
+                    thinking_config=types.ThinkingConfig(thinking_budget=0)
+                )
+            except (AttributeError, TypeError):
+                try:
+                    kwargs["generation_config"] = {
+                        "thinking_config": {"thinking_budget": 0}
+                    }
+                except Exception:
+                    pass
+
             if not minimal:
                 kwargs["output_audio_transcription"] = {}
             return types.LiveConnectConfig(**kwargs)
@@ -230,6 +247,7 @@ class _LiveSession:
         failed_models: set[str] = set()
         current_model: str = _load_live_model()
         use_minimal: bool = False
+        last_connect_succeeded: bool = False
 
         while True:
             # Pick a model that hasn't failed yet
@@ -259,6 +277,7 @@ class _LiveSession:
                 async with client.aio.live.connect(model=current_model, config=config) as session:
                     self._session = session
                     self._ready.set()
+                    last_connect_succeeded = True
                     print(f"[ScreenProcess] ✅ Vision session connected (model={current_model})")
                     async with asyncio.TaskGroup() as tg:
                         tg.create_task(self._send_loop())
@@ -270,10 +289,17 @@ class _LiveSession:
                 self._session = None
                 self._ready.clear()
 
-                # 1008 policy violation — same recovery strategy as main.py:
-                # try minimal config first, then move on to the next model
+                runtime_failure = last_connect_succeeded
+
+                # 1008 policy violation — same recovery strategy as main.py
                 if "1008" in err_str:
-                    if not use_minimal:
+                    if runtime_failure:
+                        # Runtime 1008 → model is fundamentally incompatible,
+                        # skip minimal config retry and go straight to next model
+                        print(f"[ScreenProcess]    Runtime 1008 — marking '{current_model}' as failed.")
+                        failed_models.add(current_model)
+                        use_minimal = False
+                    elif not use_minimal:
                         print("[ScreenProcess]    Retrying with minimal config (no transcription)...")
                         use_minimal = True
                     else:
@@ -281,6 +307,7 @@ class _LiveSession:
                         failed_models.add(current_model)
                         use_minimal = False
 
+                last_connect_succeeded = False
                 await asyncio.sleep(2)
                 self._ready.set()
 
