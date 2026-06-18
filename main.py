@@ -723,15 +723,9 @@ class JarvisLive:
         # _failed_models: models that 1008'd and should be skipped
         # _minimal_config_tried: True if we already tried the minimal config
         #                        with the current model — avoids infinite loops
-        # _last_connect_succeeded: True if the previous connect() call opened
-        #                          a session successfully. Used to distinguish
-        #                          "1008 at connect time" (config issue → retry
-        #                          with minimal config) from "1008 at runtime"
-        #                          (model issue → skip directly to next model).
         self._live_model: str          = _load_live_model()
         self._failed_models: set[str]  = set()
         self._minimal_config_tried: bool = False
-        self._last_connect_succeeded: bool = False
 
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
@@ -812,28 +806,6 @@ class JarvisLive:
                 )
             ),
         )
-
-        # ── CRITICAL: disable "thinking" mode ──
-        # Gemini 2.5 Flash models enable internal reasoning ("thoughts") by
-        # default. The Live API in audio streaming mode cannot serialise these
-        # thought parts — the server sends them anyway, then closes the
-        # WebSocket with 1008 "Operation is not implemented, or supported, or
-        # enabled" right after the first response.
-        #
-        # Setting thinking_budget=0 disables the feature entirely and prevents
-        # the runtime 1008. We try the structured types first (google-genai ≥1.x)
-        # and fall back to a plain dict for older SDK versions.
-        try:
-            kwargs["generation_config"] = types.GenerationConfig(
-                thinking_config=types.ThinkingConfig(thinking_budget=0)
-            )
-        except (AttributeError, TypeError):
-            try:
-                kwargs["generation_config"] = {
-                    "thinking_config": {"thinking_budget": 0}
-                }
-            except Exception:
-                pass  # SDK too old — accept the risk of runtime 1008
 
         if not minimal:
             # Transcription enables text mirroring of audio in/out — useful for
@@ -1207,11 +1179,6 @@ class JarvisLive:
                     self.audio_in_queue = asyncio.Queue()
                     self.out_queue      = asyncio.Queue(maxsize=10)
 
-                    # Mark that the connection itself succeeded — distinguishes
-                    # runtime 1008 (model/feature issue mid-session) from
-                    # connection-time 1008 (config rejected at handshake).
-                    self._last_connect_succeeded = True
-
                     print(f"[JARVIS] ✅ Connected (model={model}, config={cfg_kind}).")
                     self.ui.set_state("LISTENING")
                     self.ui.write_log("SYS: JARVIS online.")
@@ -1241,34 +1208,21 @@ class JarvisLive:
                     print(f"[JARVIS] ⚠️ {e}")
                     traceback.print_exc()
 
-                runtime_failure = self._last_connect_succeeded
-
                 # ── 1008 policy violation — model rejected or unsupported feature ──
-                # Three-pronged recovery, depending on WHEN the 1008 occurred:
-                #   1. Connection-time 1008 + full config → retry same model with minimal config
-                #      (maybe transcription/tools were the culprit).
-                #   2. Connection-time 1008 + minimal config → mark model as failed,
-                #      move on to the next fallback.
-                #   3. Runtime 1008 (after a successful connect) → the model itself
-                #      is buggy in streaming mode (typical of preview models that
-                #      emit "thoughts" the Live API can't serialise). Skip minimal
-                #      config retry and go straight to the next model.
+                # Two-pronged recovery:
+                #   1. If we were on full config, try minimal config with the same model
+                #      (in case transcription/tools were the culprit).
+                #   2. If we were already on minimal config, mark the model as failed
+                #      and move on to the next one in the fallback chain.
                 if "1008" in all_errs:
                     print("[JARVIS] 🔴 1008 policy violation — model or feature rejected by Gemini Live API")
-                    if runtime_failure:
-                        # Runtime 1008 → don't bother with minimal config, the model
-                        # is fundamentally incompatible with streaming. Move on.
-                        print(f"[JARVIS]    Runtime 1008 (after successful connect) — marking '{model}' as failed.")
-                        self._failed_models.add(model)
-                        self._minimal_config_tried = False
-                        reconnect_delay = 2
-                    elif not use_minimal:
-                        # Connection-time 1008 with full config → try minimal config
+                    if not use_minimal:
+                        # First failure on full config → retry same model with minimal config
                         self._minimal_config_tried = True
                         print(f"[JARVIS]    Retrying {model} with minimal config (no transcription, no tools)...")
-                        reconnect_delay = 1
+                        reconnect_delay = 1  # Quick retry — same model, different config
                     else:
-                        # Connection-time 1008 with minimal config → mark and move on
+                        # Minimal config also failed → mark model and move on
                         print(f"[JARVIS]    Marking model '{model}' as failed. Trying next fallback.")
                         self._failed_models.add(model)
                         self._minimal_config_tried = False
@@ -1286,9 +1240,6 @@ class JarvisLive:
                 elif "429" in all_errs or "quota" in all_errs.lower():
                     print("[JARVIS] 🔴 Rate limited / quota exceeded by Gemini API")
                     reconnect_delay = max(reconnect_delay, 30)
-
-            # Reset connect-succeeded flag at the end of each iteration
-            self._last_connect_succeeded = False
 
             self.set_speaking(False)
             self.session = None
