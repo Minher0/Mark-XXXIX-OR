@@ -33,11 +33,12 @@ API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 
 # Default Live API model for the vision session.
 # Reads the same "live_model" field as main.py for consistency, with the same
-# fallback chain in case the primary model is deprecated (1008 policy violation).
-LIVE_MODEL_DEFAULT = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+# fallback chain in case the primary model is deprecated (1008 policy violation)
+# or crashes at runtime (1011 internal error).
+LIVE_MODEL_DEFAULT = "models/gemini-live-2.5-flash-preview"
 LIVE_MODEL_FALLBACKS = [
-    "models/gemini-2.5-flash-native-audio-preview-12-2025",
     "models/gemini-live-2.5-flash-preview",
+    "models/gemini-2.5-flash-native-audio-preview-12-2025",
     "models/gemini-2.0-flash-live-001",
     "models/gemini-2.0-flash-exp-native-audio",
 ]
@@ -228,15 +229,18 @@ class _LiveSession:
             # Same rationale as main.py — without thinking_budget=0 the 2.5
             # Flash preview emits 'thought' parts that the Live API can't
             # stream, causing 1008 policy violations after the first response.
+            # Set the field DIRECTLY on LiveConnectConfig (not nested under
+            # generation_config, which is deprecated).
+            thinking_set = False
             try:
-                kwargs["generation_config"] = types.GenerationConfig(
-                    thinking_config=types.ThinkingConfig(thinking_budget=0)
-                )
+                kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+                thinking_set = True
             except (AttributeError, TypeError):
+                pass
+            if not thinking_set:
                 try:
-                    kwargs["generation_config"] = {
-                        "thinking_config": {"thinking_budget": 0}
-                    }
+                    kwargs["thinking_config"] = {"thinking_budget": 0}
+                    thinking_set = True
                 except Exception:
                     pass
 
@@ -248,6 +252,7 @@ class _LiveSession:
         current_model: str = _load_live_model()
         use_minimal: bool = False
         last_connect_succeeded: bool = False
+        counts_1011: dict[str, int] = {}
 
         while True:
             # Pick a model that hasn't failed yet
@@ -262,6 +267,7 @@ class _LiveSession:
                     # All models failed — reset and wait before retrying
                     print("[ScreenProcess] 🔴 All vision models exhausted — resetting and waiting 30s")
                     failed_models.clear()
+                    counts_1011.clear()
                     use_minimal = False
                     self._session = None
                     self._ready.clear()
@@ -278,6 +284,7 @@ class _LiveSession:
                     self._session = session
                     self._ready.set()
                     last_connect_succeeded = True
+                    counts_1011[current_model] = 0  # reset on success
                     print(f"[ScreenProcess] ✅ Vision session connected (model={current_model})")
                     async with asyncio.TaskGroup() as tg:
                         tg.create_task(self._send_loop())
@@ -294,8 +301,6 @@ class _LiveSession:
                 # 1008 policy violation — same recovery strategy as main.py
                 if "1008" in err_str:
                     if runtime_failure:
-                        # Runtime 1008 → model is fundamentally incompatible,
-                        # skip minimal config retry and go straight to next model
                         print(f"[ScreenProcess]    Runtime 1008 — marking '{current_model}' as failed.")
                         failed_models.add(current_model)
                         use_minimal = False
@@ -306,6 +311,20 @@ class _LiveSession:
                         print(f"[ScreenProcess]    Marking model '{current_model}' as failed.")
                         failed_models.add(current_model)
                         use_minimal = False
+                # 1011 internal error — track and move on after 2 consecutive
+                elif "1011" in err_str:
+                    if runtime_failure:
+                        count = counts_1011.get(current_model, 0) + 1
+                        counts_1011[current_model] = count
+                        if count >= 2:
+                            print(f"[ScreenProcess]    1011 x{count} on '{current_model}' — marking as failed.")
+                            failed_models.add(current_model)
+                            use_minimal = False
+                            counts_1011[current_model] = 0
+                        else:
+                            print(f"[ScreenProcess]    1011 attempt {count}/2 on '{current_model}' — retrying.")
+                    else:
+                        print(f"[ScreenProcess]    Connection-time 1011 on '{current_model}' — retrying.")
 
                 last_connect_succeeded = False
                 await asyncio.sleep(2)
