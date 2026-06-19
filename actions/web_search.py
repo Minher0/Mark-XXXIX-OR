@@ -125,7 +125,20 @@ def web_search(
             print(f"[WebSearch] ❌ Compare failed: {e}")
             return f"Comparison failed, sir: {e}"
 
-    # Search mode — OpenRouter first, DDG fallback
+    # Search mode — Gemini (grounded search) first, OpenRouter fallback, DDG last
+    # Gemini is the fastest because it has a built-in Google Search tool and
+    # the user already has a key configured. OpenRouter free models are slow
+    # (550B param fallbacks) and frequently rate-limited.
+
+    # 1. Try Gemini grounded search (instant, uses Google Search under the hood)
+    try:
+        result = _gemini_search(query)
+        print("[WebSearch] ✅ Gemini grounded search OK.")
+        return result
+    except Exception as e:
+        print(f"[WebSearch] ⚠️ Gemini failed ({e}) — trying OpenRouter...")
+
+    # 2. Fallback: OpenRouter
     try:
         from or_client import client
         result = client.chat(
@@ -137,6 +150,7 @@ def web_search(
     except Exception as e:
         print(f"[WebSearch] ⚠️ OpenRouter failed ({e}) — trying DDG...")
 
+    # 3. Last resort: DuckDuckGo
     try:
         results = _ddg_search(query)
         result  = _format_ddg(query, results)
