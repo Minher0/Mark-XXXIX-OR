@@ -202,31 +202,24 @@ async def _run_agent(
         print("[web_agent] ⚠️ BrowserConfig not found — using browser defaults")
 
     # ── Create the LLM ──
-    # Check for multiple API keys first (quota pooling)
-    try:
-        from multi_key_llm import MultiKeyGeminiLLM, get_gemini_keys
-        gemini_keys = get_gemini_keys()
-    except ImportError:
-        gemini_keys = []
-
     api_key = _get_api_key()
-    if not api_key and not gemini_keys:
+    if not api_key:
         return (
             "Gemini API key not configured. "
-            "Add 'gemini_api_key' or 'gemini_api_keys' to config/api_keys.json."
+            "Add 'gemini_api_key' to config/api_keys.json."
         )
 
     model_name = _get_model()
     fallback_model_name = _load_config().get(
         "web_agent_fallback_model", DEFAULT_FALLBACK_MODEL
     ).strip() or DEFAULT_FALLBACK_MODEL
+    # OpenRouter fallback — used when Gemini daily quota is exhausted.
+    # Activated by default (no daily quota on OpenRouter free models).
     or_fallback_model = _load_config().get(
-        "web_agent_openrouter_fallback", ""
+        "web_agent_openrouter_fallback", "qwen/qwen3-coder:free"
     ).strip()
 
     print(f"[web_agent] 🤖 LLM: {model_name} (vision={use_vision})")
-    if len(gemini_keys) > 1:
-        print(f"[web_agent] 🔑 Multi-key mode: {len(gemini_keys)} API keys pooled")
     print(f"[web_agent] 🤖 Fallback LLM: {fallback_model_name}")
     if or_fallback_model:
         print(f"[web_agent] 🤖 OpenRouter fallback: {or_fallback_model}")
@@ -236,116 +229,82 @@ async def _run_agent(
     llm_errors = []
     _or_llm_cache = None
 
-    # ── MULTI-KEY MODE: if we have 2+ keys, use MultiKeyGeminiLLM ──
-    # This pools the daily quota across all keys, automatically rotating on 429
-    if len(gemini_keys) >= 2:
-        try:
-            llm = MultiKeyGeminiLLM(
-                api_keys=gemini_keys,
-                model=model_name,
-                temperature=0.1,
-            )
-            print(f"[web_agent] 📦 Using MultiKeyGeminiLLM ({len(gemini_keys)} keys)")
+    def _make_native_llm(model_name):
+        """Try to create a browser-use native ChatGoogle for the given model."""
+        for native_path in [
+            ("browser_use.llm.google",       "ChatGoogle"),
+            ("browser_use.llm.gemini",       "ChatGemini"),
+            ("browser_use.llm",              "ChatGoogle"),
+        ]:
+            try:
+                mod = __import__(native_path[0], fromlist=[native_path[1]])
+                NativeCls = getattr(mod, native_path[1])
+                return NativeCls(model=model_name, api_key=api_key), native_path
+            except (ImportError, AttributeError):
+                continue
+            except Exception:
+                continue
+        return None, None
 
-            # Also create a fallback with a different model, using the same keys
+    # Approach 1: browser-use's native ChatGoogle
+    llm, native_path_used = _make_native_llm(model_name)
+    if llm is not None:
+        print(f"[web_agent] 📦 Using native LLM: {native_path_used[0]}.{native_path_used[1]}")
+        if fallback_model_name and fallback_model_name != model_name:
+            fallback_llm, _ = _make_native_llm(fallback_model_name)
+            if fallback_llm:
+                print(f"[web_agent] 📦 Fallback LLM ready: {fallback_model_name}")
+
+    # Approach 2: Subclass ChatGoogleGenerativeAI with provider attr
+    if llm is None:
+        try:
+            from langchain_google_genai import ChatGoogleGenerativeAI
+
+            class _GeminiWithProvider(ChatGoogleGenerativeAI):
+                provider: str = "google"
+                @property
+                def model_name(self) -> str:
+                    return getattr(self, "model", "") or ""
+
+            llm = _GeminiWithProvider(
+                model=model_name, google_api_key=api_key, temperature=0.1,
+            )
+            _ = llm.provider
+            print(f"[web_agent] 📦 Using ChatGoogleGenerativeAI + provider wrapper")
             if fallback_model_name and fallback_model_name != model_name:
-                fallback_llm = MultiKeyGeminiLLM(
-                    api_keys=gemini_keys,
-                    model=fallback_model_name,
+                fallback_llm = _GeminiWithProvider(
+                    model=fallback_model_name, google_api_key=api_key,
                     temperature=0.1,
                 )
-                print(f"[web_agent] 📦 Fallback MultiKeyGeminiLLM ready: {fallback_model_name}")
-
-            # OpenRouter tertiary fallback
-            if or_fallback_model:
-                _or_llm_cache = _make_openrouter_llm_safe(or_fallback_model)
-                if _or_llm_cache:
-                    print(f"[web_agent] 📦 OpenRouter tertiary fallback ready")
+        except ImportError:
+            return ("langchain-google-genai is not installed. "
+                    "Install with: pip install langchain-google-genai")
         except Exception as e:
-            print(f"[web_agent] ⚠️ MultiKeyGeminiLLM failed: {e}, falling back to single key")
-            llm = None
+            llm_errors.append(f"subclass approach: {e}")
 
-    # ── SINGLE-KEY MODE (or multi-key failed) ──
+    # Approach 3: Plain ChatGoogleGenerativeAI
     if llm is None:
-        # Use the original single-key approach
-        if not api_key and gemini_keys:
-            api_key = gemini_keys[0]
-
-        def _make_native_llm(model_name):
-            for native_path in [
-                ("browser_use.llm.google",       "ChatGoogle"),
-                ("browser_use.llm.gemini",       "ChatGemini"),
-                ("browser_use.llm",              "ChatGoogle"),
-            ]:
-                try:
-                    mod = __import__(native_path[0], fromlist=[native_path[1]])
-                    NativeCls = getattr(mod, native_path[1])
-                    return NativeCls(model=model_name, api_key=api_key), native_path
-                except (ImportError, AttributeError):
-                    continue
-                except Exception:
-                    continue
-            return None, None
-
-        # Approach 1: browser-use's native ChatGoogle
-        llm, native_path_used = _make_native_llm(model_name)
-        if llm is not None:
-            print(f"[web_agent] 📦 Using native LLM: {native_path_used[0]}.{native_path_used[1]}")
-            if fallback_model_name and fallback_model_name != model_name:
-                fallback_llm, _ = _make_native_llm(fallback_model_name)
-                if fallback_llm:
-                    print(f"[web_agent] 📦 Fallback LLM ready: {fallback_model_name}")
-
-        # Approach 2: Subclass ChatGoogleGenerativeAI with provider attr
-        if llm is None:
-            try:
-                from langchain_google_genai import ChatGoogleGenerativeAI
-
-                class _GeminiWithProvider(ChatGoogleGenerativeAI):
-                    provider: str = "google"
-                    @property
-                    def model_name(self) -> str:
-                        return getattr(self, "model", "") or ""
-
-                llm = _GeminiWithProvider(
-                    model=model_name, google_api_key=api_key, temperature=0.1,
-                )
-                _ = llm.provider
-                print(f"[web_agent] 📦 Using ChatGoogleGenerativeAI + provider wrapper")
-                if fallback_model_name and fallback_model_name != model_name:
-                    fallback_llm = _GeminiWithProvider(
-                        model=fallback_model_name, google_api_key=api_key,
-                        temperature=0.1,
-                    )
-            except ImportError:
-                return ("langchain-google-genai is not installed. "
-                        "Install with: pip install langchain-google-genai")
-            except Exception as e:
-                llm_errors.append(f"subclass approach: {e}")
-
-        # Approach 3: Plain ChatGoogleGenerativeAI
-        if llm is None:
-            try:
-                from langchain_google_genai import ChatGoogleGenerativeAI
-                llm = ChatGoogleGenerativeAI(
-                    model=model_name, google_api_key=api_key, temperature=0.1,
-                )
-                print("[web_agent] 📦 Using plain ChatGoogleGenerativeAI")
-            except Exception as e:
-                llm_errors.append(f"plain approach: {e}")
-
-        if llm is None:
-            return (
-                "Could not initialise Gemini LLM for browser-use. Tried:\n  - " +
-                "\n  - ".join(llm_errors) +
-                "\n\nTry: pip install --upgrade browser-use langchain-google-genai"
+        try:
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            llm = ChatGoogleGenerativeAI(
+                model=model_name, google_api_key=api_key, temperature=0.1,
             )
+            print("[web_agent] 📦 Using plain ChatGoogleGenerativeAI")
+        except Exception as e:
+            llm_errors.append(f"plain approach: {e}")
 
-        # OpenRouter fallback for single-key mode
-        if or_fallback_model and _or_llm_cache is None:
-            _or_llm_cache = _make_openrouter_llm_safe(or_fallback_model)
-            if _or_llm_cache:
-                print(f"[web_agent] 📦 OpenRouter tertiary fallback ready")
+    if llm is None:
+        return (
+            "Could not initialise Gemini LLM for browser-use. Tried:\n  - " +
+            "\n  - ".join(llm_errors) +
+            "\n\nTry: pip install --upgrade browser-use langchain-google-genai"
+        )
+
+    # OpenRouter fallback (used when Gemini daily quota is exhausted)
+    if or_fallback_model:
+        _or_llm_cache = _make_openrouter_llm_safe(or_fallback_model)
+        if _or_llm_cache:
+            print(f"[web_agent] 📦 OpenRouter tertiary fallback ready")
 
     # Set up the browser
     try:
