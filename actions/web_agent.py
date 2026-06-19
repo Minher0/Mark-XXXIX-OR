@@ -188,8 +188,16 @@ async def _run_agent(
     fallback_model_name = _load_config().get(
         "web_agent_fallback_model", DEFAULT_FALLBACK_MODEL
     ).strip() or DEFAULT_FALLBACK_MODEL
+    # OpenRouter as ultimate fallback when Gemini daily quota is exhausted.
+    # OpenRouter has free models (qwen3-coder, nemotron, llama-3.3-70b, etc.)
+    # with no daily quota — only per-minute rate limits.
+    or_fallback_model = _load_config().get(
+        "web_agent_openrouter_fallback", ""
+    ).strip()  # default: don't use OpenRouter unless explicitly configured
     print(f"[web_agent] 🤖 LLM: {model_name} (vision={use_vision})")
     print(f"[web_agent] 🤖 Fallback LLM: {fallback_model_name}")
+    if or_fallback_model:
+        print(f"[web_agent] 🤖 OpenRouter fallback: {or_fallback_model}")
 
     llm = None
     fallback_llm = None
@@ -212,6 +220,41 @@ async def _run_agent(
                 continue
         return None, None
 
+    def _make_openrouter_llm(or_model: str):
+        """Create a LangChain-compatible LLM wrapper around OpenRouter.
+
+        Uses the existing or_client.py module — no extra deps needed.
+        Returns an object that mimics ChatModel enough for browser-use to call.
+        Note: this won't have vision support, but it's better than nothing
+        when Gemini is completely rate-limited.
+        """
+        try:
+            from or_client import client as or_client_inst, _load_api_key as _or_load_key
+            or_key = _or_load_key()
+            if not or_key:
+                return None
+
+            # Try to use langchain-openai's ChatOpenAI pointed at OpenRouter
+            try:
+                from langchain_openai import ChatOpenAI
+                return ChatOpenAI(
+                    model=or_model,
+                    api_key=or_key,
+                    base_url="https://openrouter.ai/api/v1",
+                    temperature=0.1,
+                    # OpenRouter requires these headers for some free models
+                    default_headers={
+                        "HTTP-Referer": "https://github.com/mark-xxxix-or",
+                        "X-Title": "MARK XXXIX-OR",
+                    },
+                )
+            except ImportError:
+                print("[web_agent] ⚠️ langchain-openai not installed — can't use OpenRouter fallback")
+                return None
+        except Exception as e:
+            print(f"[web_agent] ⚠️ OpenRouter fallback init failed: {e}")
+            return None
+
     # Approach 1: browser-use's native ChatGoogle class (cleanest)
     llm, native_path_used = _make_native_llm(model_name)
     if llm is not None:
@@ -225,6 +268,26 @@ async def _run_agent(
                 print(f"[web_agent] 📦 Fallback LLM ready: {fallback_model_name}")
             else:
                 print(f"[web_agent] ⚠️ Could not create fallback LLM")
+
+        # If OpenRouter fallback is configured, chain it as a tertiary fallback.
+        # We do this by setting the fallback_llm's own fallback if possible,
+        # or by using it directly when the Gemini fallback also fails.
+        if or_fallback_model and fallback_llm is not None:
+            or_llm = _make_openrouter_llm(or_fallback_model)
+            if or_llm is not None:
+                print(f"[web_agent] 📦 OpenRouter tertiary fallback ready: {or_fallback_model}")
+                # Store for use in our outer retry loop (see below)
+                # We can't easily chain 3 levels in browser-use, so we'll
+                # swap the primary llm to OpenRouter if both Gemini models fail.
+                # This is handled in the retry loop.
+                # (saved as a nonlocal variable)
+                _or_llm_cache = or_llm  # noqa: F841
+            else:
+                _or_llm_cache = None
+        else:
+            _or_llm_cache = None
+    else:
+        _or_llm_cache = None
 
     # Approach 2: Subclass ChatGoogleGenerativeAI and add the `provider` attr
     if llm is None:
@@ -456,39 +519,49 @@ async def _run_agent(
     # Pass fallback_llm if available — browser-use v0.13+ supports it and will
     # automatically switch to it when the primary LLM returns 429.
     agent = None
-    agent_kwargs = {
-        "task": task,
-        "llm": llm,
-        "browser": browser,
-    }
-    # Add optional kwargs that some browser-use versions support
-    for opt_kwarg, opt_val in [
-        ("use_vision", use_vision),
-        ("max_steps", max_steps),
-        ("fallback_llm", fallback_llm),
-    ]:
+
+    # Build a list of (kwargs_dict, label) to try in order, from most-features
+    # to least. We don't pre-test with a fake agent because that's unreliable
+    # (some kwargs are accepted at construction but only validated at run time).
+    candidate_kwargs = [
+        # Full kwargs (browser-use v0.13+)
+        {
+            "task": task, "llm": llm, "browser": browser,
+            "use_vision": use_vision, "max_steps": max_steps,
+            "fallback_llm": fallback_llm,
+        },
+        # Without fallback_llm
+        {
+            "task": task, "llm": llm, "browser": browser,
+            "use_vision": use_vision, "max_steps": max_steps,
+        },
+        # Without max_steps
+        {
+            "task": task, "llm": llm, "browser": browser,
+            "use_vision": use_vision,
+            "fallback_llm": fallback_llm,
+        },
+        # Without use_vision
+        {
+            "task": task, "llm": llm, "browser": browser,
+            "max_steps": max_steps,
+            "fallback_llm": fallback_llm,
+        },
+        # Bare minimum
+        {"task": task, "llm": llm, "browser": browser},
+    ]
+
+    for kwargs in candidate_kwargs:
+        # Skip None values (e.g. fallback_llm might be None if creation failed)
+        clean_kwargs = {k: v for k, v in kwargs.items() if v is not None}
         try:
-            test_agent = Agent(task="test", llm=llm, browser=browser, **{opt_kwarg: opt_val})
-            agent_kwargs[opt_kwarg] = opt_val
-            print(f"[web_agent] 📦 Agent supports {opt_kwarg}={opt_val if opt_kwarg != 'fallback_llm' else 'set'}")
-            del test_agent
-            break  # if one optional kwarg works, assume others do too
-        except (TypeError, Exception):
+            agent = Agent(**clean_kwargs)
+            accepted = list(clean_kwargs.keys())
+            print(f"[web_agent] 📦 Agent created with kwargs: {accepted}")
+            break
+        except (TypeError, Exception) as e:
             continue
-    # Actually build the real agent with all supported kwargs
-    try:
-        # First try with all optional kwargs
-        agent = Agent(**agent_kwargs)
-    except (TypeError, Exception):
-        # Strip optional kwargs one by one until it works
-        for opt_kwarg in ("fallback_llm", "use_vision", "max_steps"):
-            agent_kwargs.pop(opt_kwarg, None)
-            try:
-                agent = Agent(**agent_kwargs)
-                print(f"[web_agent] ⚠️ Agent created without {opt_kwarg}")
-                break
-            except (TypeError, Exception):
-                continue
+
     if agent is None:
         try:
             await _force_close_browser()
@@ -498,32 +571,107 @@ async def _run_agent(
 
     print(f"[web_agent] 🌐 Running agent (max_steps={max_steps})...")
 
+    def _result_contains_429(result) -> bool:
+        """Check if the agent's result indicates a 429 quota error.
+
+        browser-use v0.13 does NOT raise an exception on 429 — it logs
+        'Stopping due to 5 consecutive failures' and returns an ActionResult
+        with the error message in it. We have to inspect the result string.
+        """
+        try:
+            result_str = str(result)
+            return ("429" in result_str or
+                    "RESOURCE_EXHAUSTED" in result_str or
+                    "quota" in result_str.lower())
+        except Exception:
+            return False
+
+    # Get the OpenRouter LLM cache (set during LLM init above, may be None)
+    or_llm_for_retry = locals().get("_or_llm_cache", None)
+
     try:
-        # Run with overall timeout. If the primary LLM hits 429 and there's no
-        # fallback, browser-use will retry up to 6 times rapidly. We wrap the
-        # run in our own retry loop that waits RETRY_DELAY_ON_429 seconds
-        # between attempts to respect the rate limit.
+        # Run with overall timeout. If the primary LLM hits 429, browser-use
+        # retries 6 times rapidly, then stops and returns a result containing
+        # the 429 error (without raising). We wrap the run in our own retry
+        # loop that waits RETRY_DELAY_ON_429 seconds between attempts.
+        #
+        # On the 2nd retry, if an OpenRouter fallback LLM is available, we
+        # recreate the agent with it as the PRIMARY llm — this handles the
+        # case where Gemini's DAILY quota is exhausted (waiting won't help).
         result = None
         max_outer_retries = 3
+        current_agent = agent
         for attempt in range(1, max_outer_retries + 1):
             try:
                 result = await asyncio.wait_for(
-                    agent.run(max_steps=max_steps),
+                    current_agent.run(max_steps=max_steps),
                     timeout=TASK_TIMEOUT_SEC,
                 )
-                break  # success
-            except asyncio.TimeoutError:
-                raise  # let the outer except handle it
-            except Exception as run_err:
-                err_str = str(run_err)
-                # Check if it's a 429 quota error
-                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower():
-                    if attempt < max_outer_retries:
-                        print(f"[web_agent] ⚠️ 429 quota error (attempt {attempt}/{max_outer_retries})")
+                # Check if the result indicates a 429 (browser-use doesn't raise)
+                if _result_contains_429(result) and attempt < max_outer_retries:
+                    print(f"[web_agent] ⚠️ 429 quota error in result (attempt {attempt}/{max_outer_retries})")
+                    # If we have an OpenRouter fallback and this is attempt 2+,
+                    # recreate the agent with OpenRouter as the primary LLM.
+                    # This handles the case where Gemini daily quota is gone.
+                    if attempt == 2 and or_llm_for_retry is not None:
+                        print(f"[web_agent] 🔄 Switching to OpenRouter LLM as primary "
+                              f"(Gemini daily quota likely exhausted)")
+                        if speak:
+                            speak("Switching to OpenRouter, sir. Gemini quota is exhausted.")
+                        try:
+                            current_agent = Agent(
+                                task=task,
+                                llm=or_llm_for_retry,
+                                browser=browser,
+                                use_vision=False,  # OpenRouter free models usually don't support vision
+                                max_steps=max_steps,
+                            )
+                            print("[web_agent] ✅ Agent recreated with OpenRouter LLM")
+                        except Exception as e:
+                            print(f"[web_agent] ⚠️ Could not recreate agent with OpenRouter: {e}")
+                            # Fall back to waiting + retry with original agent
+                            print(f"[web_agent]    Waiting {RETRY_DELAY_ON_429}s before retry...")
+                            if speak:
+                                speak(f"Hit the rate limit, sir. Waiting {RETRY_DELAY_ON_429} seconds.")
+                            await asyncio.sleep(RETRY_DELAY_ON_429)
+                        continue
+                    else:
+                        # Just wait and retry with the same agent
                         print(f"[web_agent]    Waiting {RETRY_DELAY_ON_429}s before retry...")
                         if speak:
                             speak(f"Hit the rate limit, sir. Waiting {RETRY_DELAY_ON_429} seconds before retrying.")
                         await asyncio.sleep(RETRY_DELAY_ON_429)
+                        continue
+                break  # success (or final retry)
+            except asyncio.TimeoutError:
+                raise  # let the outer except handle it
+            except Exception as run_err:
+                err_str = str(run_err)
+                # Check if it's a 429 quota error (raised by some versions)
+                if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str or
+                    "quota" in err_str.lower()):
+                    if attempt < max_outer_retries:
+                        print(f"[web_agent] ⚠️ 429 quota error (attempt {attempt}/{max_outer_retries})")
+                        if attempt == 2 and or_llm_for_retry is not None:
+                            print(f"[web_agent] 🔄 Switching to OpenRouter LLM as primary")
+                            if speak:
+                                speak("Switching to OpenRouter, sir.")
+                            try:
+                                current_agent = Agent(
+                                    task=task,
+                                    llm=or_llm_for_retry,
+                                    browser=browser,
+                                    use_vision=False,
+                                    max_steps=max_steps,
+                                )
+                            except Exception as e:
+                                print(f"[web_agent] ⚠️ Could not recreate agent: {e}")
+                                await asyncio.sleep(RETRY_DELAY_ON_429)
+                        else:
+                            print(f"[web_agent]    Waiting {RETRY_DELAY_ON_429}s before retry...")
+                            if speak:
+                                speak(f"Hit the rate limit, sir. Waiting {RETRY_DELAY_ON_429} seconds.")
+                            await asyncio.sleep(RETRY_DELAY_ON_429)
                         continue
                 # Not a 429, or last attempt — re-raise
                 raise
@@ -562,11 +710,25 @@ async def _run_agent(
 
         # Last resort
         if not summary:
-            steps_done = step_counter[0]
-            summary = (
-                f"Web agent completed after {steps_done} step(s). "
-                "No explicit final result was returned."
-            )
+            # If the result string contains the 429 error, surface it clearly
+            try:
+                result_str = str(result)
+                if "429" in result_str or "RESOURCE_EXHAUSTED" in result_str:
+                    summary = (
+                        "Web agent hit the Gemini free-tier rate limit and could "
+                        "not complete the task. This is a daily quota issue — "
+                        "waiting won't help. Try again tomorrow, switch to a paid "
+                        "Gemini plan, or use OpenRouter via the web_agent_fallback_model "
+                        "config option. Original error: " + result_str[:500]
+                    )
+                else:
+                    steps_done = step_counter[0]
+                    summary = (
+                        f"Web agent completed after {steps_done} step(s). "
+                        "No explicit final result was returned."
+                    )
+            except Exception:
+                summary = "Web agent completed with no final result."
 
         # Check for errors
         errors = []
