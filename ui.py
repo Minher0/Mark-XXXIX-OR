@@ -1074,8 +1074,10 @@ class SetupOverlay(QWidget):
 
 
 class MainWindow(QMainWindow):
-    _log_sig   = pyqtSignal(str)
-    _state_sig = pyqtSignal(str)
+    _log_sig      = pyqtSignal(str)
+    _state_sig    = pyqtSignal(str)
+    _f4_pressed   = pyqtSignal()
+    _f4_released  = pyqtSignal()
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -1133,6 +1135,8 @@ class MainWindow(QMainWindow):
 
         self._log_sig.connect(self._log.append_log)
         self._state_sig.connect(self._apply_state)
+        self._f4_pressed.connect(self._handle_f4_press)
+        self._f4_released.connect(self._handle_f4_release)
 
         self._overlay: SetupOverlay | None = None
         self._ready = self._check_config()
@@ -1152,34 +1156,41 @@ class MainWindow(QMainWindow):
 
         This works even when Jarvis is in the background (e.g. you're
         playing a game, browsing Chrome, etc.).
+
+        Uses pyqtSignal to safely cross from the keyboard hook thread
+        to the Qt main thread.
         """
         try:
             import keyboard
 
-            # Suppress F4 so it doesn't also trigger the default action
-            # (F4 in browsers opens the address bar dropdown, etc.)
-            keyboard.block_key('f4')
-
-            # Hook key down and key up events separately for push-to-talk
-            keyboard.on_press_key('f4', lambda e: self._on_f4_press())
-            keyboard.on_release_key('f4', lambda e: self._on_f4_release())
+            # Don't block F4 — let it through to both the hook AND Qt
+            # (Qt's keyPressEvent will handle it when focused, the hook
+            # handles it when not focused)
+            keyboard.on_press_key('f4', lambda e: self._f4_pressed.emit())
+            keyboard.on_release_key('f4', lambda e: self._f4_released.emit())
 
             print("[UI] ✅ Global F4 hotkey registered (works in background)")
         except ImportError:
             print("[UI] ⚠️ 'keyboard' library not installed — F4 only works when Jarvis is focused")
-            print("[UI]    Install with: pip install keyboard")
         except Exception as e:
             print(f"[UI] ⚠️ Could not register global F4: {e}")
             print("[UI]    F4 will only work when Jarvis is in foreground")
 
-    def _on_f4_press(self):
-        """Called when F4 is pressed (globally, via keyboard lib)."""
-        # Use QTimer to ensure we're on the Qt thread
-        QTimer.singleShot(0, self._handle_f4_press)
+    def keyPressEvent(self, event):
+        """Handle F4 press when Jarvis IS in foreground (backup for keyboard lib)."""
+        if event.key() == Qt.Key.Key_F4:
+            self._handle_f4_press()
+            event.accept()
+        else:
+            super().keyPressEvent(event)
 
-    def _on_f4_release(self):
-        """Called when F4 is released (globally, via keyboard lib)."""
-        QTimer.singleShot(0, self._handle_f4_release)
+    def keyReleaseEvent(self, event):
+        """Handle F4 release when Jarvis IS in foreground."""
+        if event.key() == Qt.Key.Key_F4:
+            self._handle_f4_release()
+            event.accept()
+        else:
+            super().keyReleaseEvent(event)
 
     def _handle_f4_press(self):
         """Handle F4 press on the Qt thread."""
