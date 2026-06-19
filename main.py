@@ -715,16 +715,8 @@ class JarvisLive:
         self._is_speaking   = False
         self._speaking_lock = threading.Lock()
         self._needs_reconnect = False
-        self._wake_detector = None
-        self._wake_unmute_timer = None
-        self._is_wake_active = False  # True when user said "Jarvis" (mic open to Gemini)
         self.ui.on_text_command = self._on_text_command
         self.ui._jarvis = self  # give UI a reference for reconnect triggers
-
-        # If wake word was enabled before Jarvis was ready, start it now
-        if getattr(self.ui, '_wake_word', False):
-            print("[JARVIS] 🔇 Wake word was pre-enabled — starting detector...")
-            self.start_wake_detector()
 
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
@@ -736,94 +728,6 @@ class JarvisLive:
             ),
             self._loop
         )
-
-    # ── Wake word management ──
-
-    WAKE_ACTIVE_DURATION = 30  # seconds the mic stays open to Gemini after "Jarvis"
-
-    def start_wake_detector(self):
-        """Start the local wake word detector (when wake word mode is enabled).
-
-        Runs in a background thread to avoid blocking the UI (Vosk model
-        download can take 30+ seconds).
-        """
-        if self._wake_detector is not None:
-            return  # already running
-        print("[JARVIS] 🔇 Wake word: initialising detector (background)...")
-        threading.Thread(
-            target=self._init_wake_detector_async,
-            daemon=True,
-            name="wake-word-init"
-        ).start()
-
-    def _init_wake_detector_async(self):
-        """Initialise the wake word detector in a background thread."""
-        try:
-            from wake_word import WakeWordDetector
-            detector = WakeWordDetector(
-                on_detected=self._on_wake_word_detected
-            )
-            detector._init_engine()
-            engine_type = detector._engine_type
-
-            if engine_type in ("vosk", "sr"):
-                # Real engine available — use local detection (zero quota)
-                self._wake_detector = detector
-                detector.start()
-                self._is_wake_active = False  # mic gated until "Jarvis" heard
-                print(f"[JARVIS] 🔇 Wake word: local {engine_type} engine active, "
-                      f"mic gated (0 API calls when idle)")
-                self.ui.write_log("SYS: Wake word active (local). Say 'Jarvis' to talk.")
-            else:
-                # No real engine — use filter mode (suppress_output)
-                print("[JARVIS] ⚠️ No local wake word engine — using filter mode")
-                print("[JARVIS] ⚠️ Mic stays open to Gemini, output suppressed unless 'Jarvis' heard")
-                self._wake_detector = None
-                self._is_wake_active = True  # keep mic open, rely on suppress_output
-                self.ui.write_log("SYS: Wake word filter mode. Say 'Jarvis' to get a response.")
-        except Exception as e:
-            print(f"[JARVIS] ⚠️ Wake word init failed: {e}")
-            import traceback
-            traceback.print_exc()
-            # Fall back to filter mode
-            self._wake_detector = None
-            self._is_wake_active = True
-            self.ui.write_log(f"SYS: Wake word filter mode (init error). Say 'Jarvis' to talk.")
-
-    def stop_wake_detector(self):
-        """Stop the local wake word detector (when wake word mode is disabled)."""
-        if self._wake_detector is not None:
-            self._wake_detector.stop()
-            self._wake_detector = None
-        self._is_wake_active = False
-        if self._wake_unmute_timer:
-            self._wake_unmute_timer.cancel()
-            self._wake_unmute_timer = None
-        print("[JARVIS] 🔊 Wake word mode disabled, mic always open")
-
-    def _on_wake_word_detected(self):
-        """Called by the WakeWordDetector when 'Jarvis' is heard locally."""
-        print("[JARVIS] ✅ Wake word detected! Opening mic to Gemini for "
-              f"{self.WAKE_ACTIVE_DURATION}s")
-        self.ui.write_log("SYS: Jarvis activated.")
-        self._is_wake_active = True
-
-        # Set a timer to re-mute after the conversation window
-        if self._wake_unmute_timer:
-            self._wake_unmute_timer.cancel()
-        self._wake_unmute_timer = threading.Timer(
-            self.WAKE_ACTIVE_DURATION,
-            self._wake_timeout
-        )
-        self._wake_unmute_timer.daemon = True
-        self._wake_unmute_timer.start()
-
-    def _wake_timeout(self):
-        """Called when the wake word conversation window expires."""
-        print(f"[JARVIS] 🔇 Wake word timeout ({self.WAKE_ACTIVE_DURATION}s) — "
-              f"muting mic, back to wake word mode")
-        self._is_wake_active = False
-        self.ui.write_log("SYS: Wake word timeout. Say 'Jarvis' to talk again.")
 
     def set_speaking(self, value: bool):
         with self._speaking_lock:
@@ -1106,14 +1010,6 @@ class JarvisLive:
         def callback(indata, frames, time_info, status):
             with self._speaking_lock:
                 jarvis_speaking = self._is_speaking
-
-            # In wake word mode: only send audio if Jarvis was recently woken
-            # (within the unmute window) — otherwise the WakeWordDetector
-            # handles listening locally and we don't send anything to Gemini
-            if getattr(self.ui, '_wake_word', False):
-                if not self._is_wake_active:
-                    return  # don't send audio to Gemini — wake detector handles it
-
             if not jarvis_speaking and not self.ui.muted:
                 data = indata.tobytes()
                 loop.call_soon_threadsafe(
@@ -1139,99 +1035,52 @@ class JarvisLive:
         print("[JARVIS] 👂 Recv started")
         out_buf, in_buf = [], []
 
-        # Wake word state — reset each turn
-        suppress_output = False
-        ww_checked = False  # have we decided whether to suppress this turn?
-        ww_input_accumulated = ""
-
         try:
             while True:
-                # Check if UI requested a reconnect (e.g. wake word toggle)
+                # Check if UI requested a reconnect
                 if self._needs_reconnect:
                     self._needs_reconnect = False
                     print("[JARVIS] 🔄 Reconnect requested by UI (settings changed)")
-                    return  # exit → TaskGroup ends → session closes → run() reconnects
+                    return
 
                 async for response in self.session.receive():
 
-                    # ── Audio output: only play if not suppressed ──
                     if response.data:
-                        if not suppress_output:
-                            self.audio_in_queue.put_nowait(response.data)
+                        self.audio_in_queue.put_nowait(response.data)
 
                     if response.server_content:
                         sc = response.server_content
 
-                        # ── Output transcription: only log if not suppressed ──
                         if sc.output_transcription and sc.output_transcription.text:
-                            if not suppress_output:
-                                self.set_speaking(True)
+                            self.set_speaking(True)
                             txt = sc.output_transcription.text.strip()
                             if txt:
                                 out_buf.append(txt)
 
-                        # ── Input transcription: check for wake word ──
                         if sc.input_transcription and sc.input_transcription.text:
                             txt = sc.input_transcription.text.strip()
                             if txt:
                                 in_buf.append(txt)
 
-                                # Wake word check: only use the suppress_output
-                                # fallback if the local detector is NOT running
-                                # (when the detector IS running, the mic is
-                                # already gated at the _listen_audio level and
-                                # no audio reaches Gemini unless "Jarvis" was said)
-                                if (getattr(self.ui, '_wake_word', False)
-                                        and not ww_checked
-                                        and self._wake_detector is None):
-                                    ww_input_accumulated += " " + txt
-                                    ww_input_accumulated = ww_input_accumulated.strip()
-
-                                    # Once we have 6+ chars, check if "jarvis"
-                                    # appears in the first 20 chars
-                                    if len(ww_input_accumulated) >= 6:
-                                        lower = ww_input_accumulated.lower()[:20]
-                                        if "jarvis" not in lower:
-                                            suppress_output = True
-                                            ww_checked = True
-                                            print(
-                                                f"[JARVIS] 🔇 Wake word: not addressed "
-                                                f"('{ww_input_accumulated[:40]}'), "
-                                                f"suppressing output"
-                                            )
-                                        else:
-                                            ww_checked = True
-                                            print(
-                                                f"[JARVIS] ✅ Wake word: addressed "
-                                                f"('{ww_input_accumulated[:40]}')"
-                                            )
-
-                        # ── Turn complete: reset state ──
                         if sc.turn_complete:
                             self.set_speaking(False)
 
                             full_in = " ".join(in_buf).strip()
-                            if full_in and not suppress_output:
+                            if full_in:
                                 self.ui.write_log(f"You: {full_in}")
                             in_buf = []
 
                             full_out = " ".join(out_buf).strip()
-                            if full_out and not suppress_output:
+                            if full_out:
                                 self.ui.write_log(f"Jarvis: {full_out}")
                             out_buf = []
 
-                            # Only update memory if Jarvis actually responded
-                            if full_in and len(full_in) > 5 and not suppress_output:
+                            if full_in and len(full_in) > 5:
                                 threading.Thread(
                                     target=_update_memory_async,
                                     args=(full_in, full_out),
                                     daemon=True
                                 ).start()
-
-                            # Reset wake word state for next turn
-                            suppress_output = False
-                            ww_checked = False
-                            ww_input_accumulated = ""
 
                     if response.tool_call:
                         fn_responses = []
@@ -1305,11 +1154,6 @@ class JarvisLive:
                     self.ui.set_state("LISTENING")
                     self.ui.write_log("SYS: JARVIS online.")
                     reconnect_delay = 3  # Reset on successful connection
-
-                    # Start wake word detector if enabled (handles pre-check case)
-                    if getattr(self.ui, '_wake_word', False) and self._wake_detector is None:
-                        print("[JARVIS] 🔇 Wake word enabled — starting detector...")
-                        self.start_wake_detector()
 
                     tg.create_task(self._send_realtime())
                     tg.create_task(self._listen_audio())

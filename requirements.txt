@@ -26,7 +26,3 @@ pywinauto
 # Web agent (autonomous browsing via browser-use + Gemini)
 browser-use
 langchain-google-genai
-
-# Wake word detection (local, offline — saves Gemini API quota)
-vosk
-SpeechRecognition

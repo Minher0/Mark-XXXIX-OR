@@ -1091,7 +1091,7 @@ class MainWindow(QMainWindow):
 
         self.on_text_command  = None
         self._muted           = False
-        self._wake_word       = False  # if True, only respond when called "Jarvis"
+        self._push_to_talk    = False  # if True, mic muted until F4 held
         self._current_file: str | None = None
 
         central = QWidget()
@@ -1377,12 +1377,12 @@ class MainWindow(QMainWindow):
         self._style_mute_btn()
         lay.addWidget(self._mute_btn)
 
-        # Wake word checkbox (unchecked by default = always responds)
-        self._wake_word_checkbox = QCheckBox("🔇  WAKE WORD (respond only when called 'Jarvis')")
-        self._wake_word_checkbox.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
-        self._wake_word_checkbox.setChecked(False)
-        self._wake_word_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._wake_word_checkbox.setStyleSheet(f"""
+        # Push-to-talk checkbox (unchecked by default = always listening)
+        self._ptt_checkbox = QCheckBox("🔇  PUSH-TO-TALK (hold F4 to speak)")
+        self._ptt_checkbox.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        self._ptt_checkbox.setChecked(False)
+        self._ptt_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._ptt_checkbox.setStyleSheet(f"""
             QCheckBox {{
                 color: {C.TEXT_DIM}; background: transparent;
                 padding: 4px 2px; spacing: 6px;
@@ -1397,8 +1397,8 @@ class MainWindow(QMainWindow):
             }}
             QCheckBox:hover {{ color: {C.TEXT}; }}
         """)
-        self._wake_word_checkbox.toggled.connect(self._toggle_wake_word)
-        lay.addWidget(self._wake_word_checkbox)
+        self._ptt_checkbox.toggled.connect(self._toggle_push_to_talk)
+        lay.addWidget(self._ptt_checkbox)
 
         fs_btn = QPushButton("⛶  FULLSCREEN  [F11]")
         fs_btn.setFixedHeight(26)
@@ -1460,7 +1460,7 @@ class MainWindow(QMainWindow):
             l.setStyleSheet(f"color: {color}; background: transparent;")
             return l
 
-        lay.addWidget(_fl("[F4] Mute  ·  [F11] Fullscreen"))
+        lay.addWidget(_fl("[F4] Mute / Push-to-talk  ·  [F11] Fullscreen"))
         lay.addStretch()
         lay.addWidget(_fl("FatihMakes Industries  ·  MARK XXXIX  ·  CLASSIFIED"))
         lay.addStretch()
@@ -1485,6 +1485,8 @@ class MainWindow(QMainWindow):
             threading.Thread(target=self.on_text_command, args=(msg,), daemon=True).start()
 
     def _toggle_mute(self):
+        """F4 handler. In push-to-talk mode, toggles mute on/off.
+        In normal mode, just toggles mute."""
         self._muted = not self._muted
         self.hud.muted = self._muted
         self._style_mute_btn()
@@ -1495,35 +1497,28 @@ class MainWindow(QMainWindow):
             self._apply_state("LISTENING")
             self._log.append_log("SYS: Microphone active.")
 
-    def _toggle_wake_word(self, checked: bool):
-        """Toggle wake word mode."""
-        self._wake_word = checked
-        jarvis = getattr(self, '_jarvis', None)
-        if not jarvis:
-            # Jarvis not ready yet — store the flag, it will be applied
-            # when JarvisLive starts
-            print("[UI] ⚠️ Jarvis not ready — wake word will activate on startup")
-            self._log.append_log("SYS: Wake word enabled. Will activate when Jarvis connects.")
-            return
-        if checked:
-            self._log.append_log("SYS: Wake word enabled. Initialising...")
-            print("[UI] Wake word checkbox checked — starting detector...")
-            jarvis.start_wake_detector()
-        else:
-            self._log.append_log("SYS: Wake word disabled. Always listening.")
-            print("[UI] Wake word checkbox unchecked — stopping detector...")
-            jarvis.stop_wake_detector()
-            jarvis._needs_reconnect = True
+    def _toggle_push_to_talk(self, checked: bool):
+        """Toggle push-to-talk mode.
 
-    def _force_reconnect(self):
-        """Force Jarvis to reconnect (picks up new system prompt settings)."""
-        try:
-            jarvis = getattr(self, '_jarvis', None)
-            if jarvis:
-                jarvis._needs_reconnect = True
-                self._log.append_log("SYS: Reconnecting with new settings...")
-        except Exception as e:
-            print(f"[UI] Could not trigger reconnect: {e}")
+        When ON: mic is muted by default. Hold F4 to talk, release to mute.
+        When OFF (default): Jarvis always listens.
+        """
+        self._push_to_talk = checked
+        if checked:
+            self._muted = True
+            self.hud.muted = True
+            self._style_mute_btn()
+            self._apply_state("MUTED")
+            self._mute_btn.setText("🔇  HOLD F4 TO SPEAK")
+            self._log.append_log("SYS: Push-to-talk enabled. Hold F4 to speak.")
+            print("[UI] Push-to-talk enabled — mic muted, hold F4 to talk")
+        else:
+            self._muted = False
+            self.hud.muted = False
+            self._style_mute_btn()
+            self._apply_state("LISTENING")
+            self._log.append_log("SYS: Push-to-talk disabled. Always listening.")
+            print("[UI] Push-to-talk disabled — always listening")
 
     def _style_mute_btn(self):
         if self._muted:
