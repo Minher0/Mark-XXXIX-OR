@@ -715,6 +715,9 @@ class JarvisLive:
         self._is_speaking   = False
         self._speaking_lock = threading.Lock()
         self._needs_reconnect = False
+        self._wake_detector = None
+        self._wake_unmute_timer = None
+        self._is_wake_active = False  # True when user said "Jarvis" (mic open to Gemini)
         self.ui.on_text_command = self._on_text_command
         self.ui._jarvis = self  # give UI a reference for reconnect triggers
 
@@ -728,6 +731,62 @@ class JarvisLive:
             ),
             self._loop
         )
+
+    # ── Wake word management ──
+
+    WAKE_ACTIVE_DURATION = 30  # seconds the mic stays open to Gemini after "Jarvis"
+
+    def start_wake_detector(self):
+        """Start the local wake word detector (when wake word mode is enabled)."""
+        if self._wake_detector is not None:
+            return  # already running
+        try:
+            from wake_word import WakeWordDetector
+            self._wake_detector = WakeWordDetector(
+                on_detected=self._on_wake_word_detected
+            )
+            self._wake_detector.start()
+            print("[JARVIS] 🔇 Wake word mode: mic muted, listening for 'Jarvis' locally")
+            self.ui.write_log("SYS: Wake word active. Say 'Jarvis' to talk.")
+        except Exception as e:
+            print(f"[JARVIS] ⚠️ Could not start wake word detector: {e}")
+            print("[JARVIS] ⚠️ Falling back to always-listening (suppress_output mode)")
+            self.ui.write_log(f"SYS: Wake word engine unavailable ({e}), using filter mode")
+
+    def stop_wake_detector(self):
+        """Stop the local wake word detector (when wake word mode is disabled)."""
+        if self._wake_detector is not None:
+            self._wake_detector.stop()
+            self._wake_detector = None
+        self._is_wake_active = False
+        if self._wake_unmute_timer:
+            self._wake_unmute_timer.cancel()
+            self._wake_unmute_timer = None
+        print("[JARVIS] 🔊 Wake word mode disabled, mic always open")
+
+    def _on_wake_word_detected(self):
+        """Called by the WakeWordDetector when 'Jarvis' is heard locally."""
+        print("[JARVIS] ✅ Wake word detected! Opening mic to Gemini for "
+              f"{self.WAKE_ACTIVE_DURATION}s")
+        self.ui.write_log("SYS: Jarvis activated.")
+        self._is_wake_active = True
+
+        # Set a timer to re-mute after the conversation window
+        if self._wake_unmute_timer:
+            self._wake_unmute_timer.cancel()
+        self._wake_unmute_timer = threading.Timer(
+            self.WAKE_ACTIVE_DURATION,
+            self._wake_timeout
+        )
+        self._wake_unmute_timer.daemon = True
+        self._wake_unmute_timer.start()
+
+    def _wake_timeout(self):
+        """Called when the wake word conversation window expires."""
+        print(f"[JARVIS] 🔇 Wake word timeout ({self.WAKE_ACTIVE_DURATION}s) — "
+              f"muting mic, back to wake word mode")
+        self._is_wake_active = False
+        self.ui.write_log("SYS: Wake word timeout. Say 'Jarvis' to talk again.")
 
     def set_speaking(self, value: bool):
         with self._speaking_lock:
@@ -1010,6 +1069,14 @@ class JarvisLive:
         def callback(indata, frames, time_info, status):
             with self._speaking_lock:
                 jarvis_speaking = self._is_speaking
+
+            # In wake word mode: only send audio if Jarvis was recently woken
+            # (within the unmute window) — otherwise the WakeWordDetector
+            # handles listening locally and we don't send anything to Gemini
+            if getattr(self.ui, '_wake_word', False):
+                if not self._is_wake_active:
+                    return  # don't send audio to Gemini — wake detector handles it
+
             if not jarvis_speaking and not self.ui.muted:
                 data = indata.tobytes()
                 loop.call_soon_threadsafe(
@@ -1072,9 +1139,14 @@ class JarvisLive:
                             if txt:
                                 in_buf.append(txt)
 
-                                # Wake word check: accumulate input and decide
-                                # as early as possible whether to suppress
-                                if getattr(self.ui, '_wake_word', False) and not ww_checked:
+                                # Wake word check: only use the suppress_output
+                                # fallback if the local detector is NOT running
+                                # (when the detector IS running, the mic is
+                                # already gated at the _listen_audio level and
+                                # no audio reaches Gemini unless "Jarvis" was said)
+                                if (getattr(self.ui, '_wake_word', False)
+                                        and not ww_checked
+                                        and self._wake_detector is None):
                                     ww_input_accumulated += " " + txt
                                     ww_input_accumulated = ww_input_accumulated.strip()
 
