@@ -1162,19 +1162,56 @@ class MainWindow(QMainWindow):
             super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event):
-        """Handle F4 release: in PTT mode = mute back."""
+        """Handle F4 release: in PTT mode = mute after a short delay
+        (gives Gemini time to detect end-of-speech and start responding)."""
         if event.key() == Qt.Key.Key_F4:
             if self._push_to_talk:
-                # PTT mode: F4 release = mute (stop talking)
-                if not self._muted:
-                    self._muted = True
-                    self.hud.muted = True
-                    self._style_mute_btn()
-                    self._apply_state("MUTED")
-                    self._mute_btn.setText("🔇  HOLD F4 TO SPEAK")
+                # PTT mode: don't mute immediately! Gemini Live API needs
+                # to receive silence after your speech to detect end-of-turn
+                # via its server-side VAD. If we cut the mic instantly,
+                # Gemini never receives the "pause" and never responds.
+                # Delay the mute by 2 seconds.
+                self._ptt_want_mute = True
+                self._mute_btn.setText("🎙  Listening for response…")
+                # Start a 2s timer — if Jarvis hasn't started speaking
+                # by then, mute. If Jarvis IS speaking, wait for it to
+                # finish (handled in set_speaking callback).
+                if hasattr(self, '_ptt_mute_timer') and self._ptt_mute_timer:
+                    self._ptt_mute_timer.cancel()
+                self._ptt_mute_timer = QTimer(self)
+                self._ptt_mute_timer.setSingleShot(True)
+                self._ptt_mute_timer.timeout.connect(self._check_ptt_mute)
+                self._ptt_mute_timer.start(2000)
             event.accept()
         else:
             super().keyReleaseEvent(event)
+
+    def _check_ptt_mute(self):
+        """Called 2s after F4 release. Mute if Jarvis isn't speaking."""
+        if self._ptt_want_mute:
+            if not self._is_jarvis_speaking():
+                self._do_ptt_mute()
+            else:
+                # Jarvis is speaking — wait more, check again in 1s
+                self._ptt_mute_timer.start(1000)
+
+    def _is_jarvis_speaking(self) -> bool:
+        """Check if Jarvis is currently speaking."""
+        jarvis = getattr(self, '_jarvis', None)
+        if jarvis:
+            with jarvis._speaking_lock:
+                return jarvis._is_speaking
+        return False
+
+    def _do_ptt_mute(self):
+        """Actually mute the mic (called after F4 release, possibly delayed)."""
+        self._ptt_want_mute = False
+        if not self._muted:
+            self._muted = True
+            self.hud.muted = True
+            self._style_mute_btn()
+            self._apply_state("MUTED")
+            self._mute_btn.setText("🔇  HOLD F4 TO SPEAK")
 
     def _toggle_fullscreen(self):
         if self.isFullScreen():
