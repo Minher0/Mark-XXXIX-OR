@@ -22,3 +22,7 @@ youtube-transcript-api
 pywinauto
 # pyaudio removed - requires portaudio.h C library to compile
 # sounddevice handles audio input/output without compilation
+
+# Web agent (autonomous browsing via browser-use + Gemini)
+browser-use
+langchain-google-genai

@@ -35,6 +35,7 @@ from actions.game_updater      import game_updater
 from actions.discord_control   import discord_control
 from actions.media_control     import media_control
 from actions.auto_click        import auto_click
+from actions.web_agent         import web_agent
 
 
 def get_base_dir():
@@ -429,6 +430,37 @@ TOOL_DECLARATIONS = [
                 "priority": {"type": "STRING", "description": "low | normal | high (default: normal)"}
             },
             "required": ["goal"]
+        }
+    },
+    {
+        "name": "web_agent",
+        "description": (
+            "Autonomous web browsing agent that can accomplish complex multi-step tasks "
+            "on the web by driving a REAL browser (visible to the user). The agent sees "
+            "screenshots of the page, decides what to click/type, and iterates until the "
+            "task is done. Powered by browser-use + Gemini. "
+            "Use for tasks like: 'book me a flight from X to Y', 'find and download the PDF "
+            "for paper Z', 'go to my account on website X and check Y', 'order me a pizza "
+            "from Domino's website', 'fill out this form on website X'. "
+            "CRITICAL: Do NOT use web_agent for simple actions like: "
+            "- Opening a single URL → use browser_control action:open_url "
+            "- A simple web search → use web_search "
+            "- Reading text from a page → use browser_control action:get_text "
+            "- Clicking one element you already know → use browser_control action:click "
+            "web_agent is for COMPLEX tasks that require navigating multiple pages, "
+            "filling forms, making decisions based on page content, etc. "
+            "The browser is visible by default so the user can see what's happening. "
+            "The agent will speak progress updates every 5 steps."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "task":       {"type": "STRING",  "description": "Natural language description of what to accomplish on the web. Be specific: include URLs, credentials (if safe), form values, etc."},
+                "max_steps":  {"type": "INTEGER", "description": "Maximum number of agent iterations (default: 30, max: 100). Increase for very complex tasks like multi-page bookings."},
+                "headless":   {"type": "BOOLEAN", "description": "Run browser without showing the UI (default: false). Set to true only if the user explicitly asks for it."},
+                "use_vision": {"type": "BOOLEAN", "description": "Use vision-capable LLM (screenshots). Default: true. Disable only if the model doesn't support vision."}
+            },
+            "required": ["task"]
         }
     },
     {
@@ -881,6 +913,13 @@ class JarvisLive:
                 priority = priority_map.get(args.get("priority", "normal").lower(), TaskPriority.NORMAL)
                 task_id  = get_queue().submit(goal=args.get("goal", ""), priority=priority, speak=self.speak)
                 result   = f"Task started (ID: {task_id})."
+
+            elif name == "web_agent":
+                r = await loop.run_in_executor(
+                    None,
+                    lambda: web_agent(parameters=args, player=self.ui, speak=self.speak)
+                )
+                result = r or "Done."
 
             elif name == "web_search":
                 r = await loop.run_in_executor(None, lambda: web_search_action(parameters=args, player=self.ui))
