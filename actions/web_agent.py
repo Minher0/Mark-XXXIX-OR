@@ -154,14 +154,14 @@ async def _run_agent(
     if BrowserConfig is None:
         print("[web_agent] ⚠️ BrowserConfig not found — using browser defaults")
 
-    try:
-        from langchain_google_genai import ChatGoogleGenerativeAI
-    except ImportError:
-        return (
-            "langchain-google-genai is not installed. "
-            "Install with: pip install langchain-google-genai"
-        )
-
+    # ── Create the LLM ──
+    # browser-use v1+ checks `llm.provider` to know how to format messages
+    # and call the model. ChatGoogleGenerativeAI from langchain-google-genai
+    # doesn't expose this attribute by default → causes "object has no
+    # attribute 'provider'" error. We try multiple approaches:
+    #   1. browser_use.llm.google.ChatGoogle (native browser-use Gemini class)
+    #   2. Subclass ChatGoogleGenerativeAI and add `provider = 'google'`
+    #   3. Manual wrapper that delegates everything
     api_key = _get_api_key()
     if not api_key:
         return (
@@ -169,16 +169,80 @@ async def _run_agent(
             "Add 'gemini_api_key' to config/api_keys.json."
         )
 
-    # Set up the LLM (LangChain interface for browser-use)
-    print(f"[web_agent] 🤖 LLM: {_get_model()} (vision={use_vision})")
-    try:
-        llm = ChatGoogleGenerativeAI(
-            model=_get_model(),
-            google_api_key=api_key,
-            temperature=0.1,  # deterministic for web automation
+    model_name = _get_model()
+    print(f"[web_agent] 🤖 LLM: {model_name} (vision={use_vision})")
+
+    llm = None
+    llm_errors = []
+
+    # Approach 1: browser-use's native ChatGoogle class (cleanest)
+    for native_path in [
+        ("browser_use.llm.google",       "ChatGoogle"),
+        ("browser_use.llm.gemini",       "ChatGemini"),
+        ("browser_use.llm",              "ChatGoogle"),
+    ]:
+        try:
+            mod = __import__(native_path[0], fromlist=[native_path[1]])
+            NativeCls = getattr(mod, native_path[1])
+            llm = NativeCls(model=model_name, api_key=api_key)
+            print(f"[web_agent] 📦 Using native LLM: {native_path[0]}.{native_path[1]}")
+            break
+        except (ImportError, AttributeError):
+            continue
+        except Exception as e:
+            llm_errors.append(f"{native_path[0]}.{native_path[1]}: {e}")
+            continue
+
+    # Approach 2: Subclass ChatGoogleGenerativeAI and add the `provider` attr
+    if llm is None:
+        try:
+            from langchain_google_genai import ChatGoogleGenerativeAI
+
+            class _GeminiWithProvider(ChatGoogleGenerativeAI):
+                """ChatGoogleGenerativeAI with `provider` attr for browser-use v1+."""
+                provider: str = "google"
+
+                # Some browser-use versions also check `model_name` instead of `model`
+                @property
+                def model_name(self) -> str:
+                    return getattr(self, "model", "") or ""
+
+            llm = _GeminiWithProvider(
+                model=model_name,
+                google_api_key=api_key,
+                temperature=0.1,
+            )
+            # Verify the provider attribute is actually accessible
+            _ = llm.provider
+            print(f"[web_agent] 📦 Using ChatGoogleGenerativeAI + provider='google' wrapper")
+        except ImportError:
+            return (
+                "langchain-google-genai is not installed. "
+                "Install with: pip install langchain-google-genai"
+            )
+        except Exception as e:
+            llm_errors.append(f"subclass approach: {e}")
+
+    # Approach 3: Last resort — try the basic ChatGoogleGenerativeAI without
+    # the wrapper. Some older browser-use versions don't need `provider`.
+    if llm is None:
+        try:
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            llm = ChatGoogleGenerativeAI(
+                model=model_name,
+                google_api_key=api_key,
+                temperature=0.1,
+            )
+            print("[web_agent] 📦 Using plain ChatGoogleGenerativeAI (fallback)")
+        except Exception as e:
+            llm_errors.append(f"plain approach: {e}")
+
+    if llm is None:
+        return (
+            "Could not initialise Gemini LLM for browser-use. Tried:\n  - " +
+            "\n  - ".join(llm_errors) +
+            "\n\nTry: pip install --upgrade browser-use langchain-google-genai"
         )
-    except Exception as e:
-        return f"Could not initialise LLM: {e}"
 
     # Set up the browser
     try:
