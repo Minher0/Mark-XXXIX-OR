@@ -26,3 +26,6 @@ pywinauto
 # Web agent (autonomous browsing via browser-use + Gemini)
 browser-use
 langchain-google-genai
+
+# Global hotkey (F4 push-to-talk works even when Jarvis is in background)
+keyboard

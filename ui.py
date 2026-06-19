@@ -1139,52 +1139,71 @@ class MainWindow(QMainWindow):
         if not self._ready:
             self._show_setup()
 
-        # F11 fullscreen shortcut (F4 is handled via keyPressEvent/keyReleaseEvent)
+        # F11 fullscreen shortcut (F4 is handled globally via keyboard lib)
         sc_full = QShortcut(QKeySequence("F11"), self)
         sc_full.activated.connect(self._toggle_fullscreen)
 
-    def keyPressEvent(self, event):
-        """Handle F4 press: in PTT mode = unmute, in normal mode = toggle."""
-        if event.key() == Qt.Key.Key_F4:
-            if self._push_to_talk:
-                # PTT mode: F4 press = unmute (start talking)
-                if self._muted:
-                    self._muted = False
-                    self.hud.muted = False
-                    self._style_mute_btn()
-                    self._apply_state("LISTENING")
-                    self._mute_btn.setText("🎙  LISTENING… (release F4 to mute)")
-            else:
-                # Normal mode: F4 = toggle mute
-                self._toggle_mute()
-            event.accept()
-        else:
-            super().keyPressEvent(event)
+        # Global F4 hotkey via keyboard lib (works even when Jarvis
+        # is NOT in foreground — uses Windows low-level keyboard hook)
+        self._setup_global_f4()
 
-    def keyReleaseEvent(self, event):
-        """Handle F4 release: in PTT mode = mute after a short delay
-        (gives Gemini time to detect end-of-speech and start responding)."""
-        if event.key() == Qt.Key.Key_F4:
-            if self._push_to_talk:
-                # PTT mode: don't mute immediately! Gemini Live API needs
-                # to receive silence after your speech to detect end-of-turn
-                # via its server-side VAD. If we cut the mic instantly,
-                # Gemini never receives the "pause" and never responds.
-                # Delay the mute by 2 seconds.
-                self._ptt_want_mute = True
-                self._mute_btn.setText("🎙  Listening for response…")
-                # Start a 2s timer — if Jarvis hasn't started speaking
-                # by then, mute. If Jarvis IS speaking, wait for it to
-                # finish (handled in set_speaking callback).
-                if hasattr(self, '_ptt_mute_timer') and self._ptt_mute_timer:
-                    self._ptt_mute_timer.cancel()
-                self._ptt_mute_timer = QTimer(self)
-                self._ptt_mute_timer.setSingleShot(True)
-                self._ptt_mute_timer.timeout.connect(self._check_ptt_mute)
-                self._ptt_mute_timer.start(2000)
-            event.accept()
+    def _setup_global_f4(self):
+        """Register F4 as a global hotkey using the 'keyboard' library.
+
+        This works even when Jarvis is in the background (e.g. you're
+        playing a game, browsing Chrome, etc.).
+        """
+        try:
+            import keyboard
+
+            # Suppress F4 so it doesn't also trigger the default action
+            # (F4 in browsers opens the address bar dropdown, etc.)
+            keyboard.block_key('f4')
+
+            # Hook key down and key up events separately for push-to-talk
+            keyboard.on_press_key('f4', lambda e: self._on_f4_press())
+            keyboard.on_release_key('f4', lambda e: self._on_f4_release())
+
+            print("[UI] ✅ Global F4 hotkey registered (works in background)")
+        except ImportError:
+            print("[UI] ⚠️ 'keyboard' library not installed — F4 only works when Jarvis is focused")
+            print("[UI]    Install with: pip install keyboard")
+        except Exception as e:
+            print(f"[UI] ⚠️ Could not register global F4: {e}")
+            print("[UI]    F4 will only work when Jarvis is in foreground")
+
+    def _on_f4_press(self):
+        """Called when F4 is pressed (globally, via keyboard lib)."""
+        # Use QTimer to ensure we're on the Qt thread
+        QTimer.singleShot(0, self._handle_f4_press)
+
+    def _on_f4_release(self):
+        """Called when F4 is released (globally, via keyboard lib)."""
+        QTimer.singleShot(0, self._handle_f4_release)
+
+    def _handle_f4_press(self):
+        """Handle F4 press on the Qt thread."""
+        if self._push_to_talk:
+            if self._muted:
+                self._muted = False
+                self.hud.muted = False
+                self._style_mute_btn()
+                self._apply_state("LISTENING")
+                self._mute_btn.setText("🎙  LISTENING… (release F4 to mute)")
         else:
-            super().keyReleaseEvent(event)
+            self._toggle_mute()
+
+    def _handle_f4_release(self):
+        """Handle F4 release on the Qt thread."""
+        if self._push_to_talk:
+            self._ptt_want_mute = True
+            self._mute_btn.setText("🎙  Listening for response…")
+            if hasattr(self, '_ptt_mute_timer') and self._ptt_mute_timer:
+                self._ptt_mute_timer.cancel()
+            self._ptt_mute_timer = QTimer(self)
+            self._ptt_mute_timer.setSingleShot(True)
+            self._ptt_mute_timer.timeout.connect(self._check_ptt_mute)
+            self._ptt_mute_timer.start(2000)
 
     def _check_ptt_mute(self):
         """Called 2s after F4 release. Mute if Jarvis isn't speaking."""
