@@ -1180,7 +1180,7 @@ class MainWindow(QMainWindow):
             self._ptt_want_mute = True
             self._mute_btn.setText("🎙  Listening for response…")
             if hasattr(self, '_ptt_mute_timer') and self._ptt_mute_timer:
-                self._ptt_mute_timer.cancel()
+                self._ptt_mute_timer.stop()
             self._ptt_mute_timer = QTimer(self)
             self._ptt_mute_timer.setSingleShot(True)
             self._ptt_mute_timer.timeout.connect(self._check_ptt_mute)
