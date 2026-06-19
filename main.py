@@ -1162,12 +1162,70 @@ class JarvisLive:
             await asyncio.sleep(reconnect_delay)
             reconnect_delay = min(reconnect_delay * 1.5, max_delay)  # Exponential backoff
 
+def _ensure_optional_deps():
+    """Check for optional dependencies and install them in the background
+    if missing. Non-blocking — runs in a daemon thread so Jarvis starts
+    immediately.
+
+    This catches the case where the Updater.exe failed to install new
+    packages (e.g. browser-use was added to requirements.txt but the
+    updater's old code didn't actually install it).
+    """
+    import subprocess
+    import sys
+
+    # (import_name, pip_package) — packages that are optional but needed
+    # for specific features. Each is checked and installed independently.
+    optional_deps = [
+        ("browser_use",            "browser-use"),
+        ("langchain_google_genai", "langchain-google-genai"),
+    ]
+
+    def _worker():
+        for import_name, pip_pkg in optional_deps:
+            try:
+                __import__(import_name)
+                # Already available — skip
+            except ImportError:
+                print(f"[JARVIS] 📦 Installing missing optional dep: {pip_pkg}...")
+                try:
+                    result = subprocess.run(
+                        [sys.executable, "-m", "pip", "install", pip_pkg],
+                        capture_output=True, text=True, timeout=600
+                    )
+                    if result.returncode == 0:
+                        # Verify it's now importable
+                        try:
+                            __import__(import_name)
+                            print(f"[JARVIS] ✅ {pip_pkg} installed")
+                            # Special case: browser-use needs chromium binary
+                            if pip_pkg == "browser-use":
+                                print("[JARVIS] 🌐 Installing Playwright Chromium...")
+                                subprocess.run(
+                                    [sys.executable, "-m", "playwright", "install", "chromium"],
+                                    capture_output=True, timeout=600
+                                )
+                                print("[JARVIS] ✅ Chromium installed")
+                        except ImportError:
+                            print(f"[JARVIS] ⚠️ {pip_pkg} installed but still not importable")
+                    else:
+                        err = (result.stderr or "")[-200:]
+                        print(f"[JARVIS] ⚠️ Failed to install {pip_pkg}: {err}")
+                except Exception as e:
+                    print(f"[JARVIS] ⚠️ Error installing {pip_pkg}: {e}")
+
+    threading.Thread(target=_worker, daemon=True, name="optional-deps-installer").start()
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="JARVIS — AI Assistant")
     parser.add_argument("--discord", action="store_true",
                         help="Run as Discord bot instead of voice assistant")
     args = parser.parse_args()
+
+    # Install missing optional deps in the background (non-blocking)
+    _ensure_optional_deps()
 
     if args.discord:
         print("[JARVIS] 🤖 Starting Discord bot mode...")
