@@ -547,14 +547,15 @@ async def _run_agent(
     or_llm_for_retry = locals().get("_or_llm_cache", None)
 
     try:
-        # Run with overall timeout. If the primary LLM hits 429, browser-use
-        # retries 6 times rapidly, then stops and returns a result containing
-        # the 429 error (without raising). We wrap the run in our own retry
-        # loop that waits RETRY_DELAY_ON_429 seconds between attempts.
+        # Run with overall timeout.
         #
-        # On the 2nd retry, if an OpenRouter fallback LLM is available, we
-        # recreate the agent with it as the PRIMARY llm — this handles the
-        # case where Gemini's DAILY quota is exhausted (waiting won't help).
+        # RETRY STRATEGY on 429 (Gemini daily quota exhausted):
+        #   Attempt 1: try Gemini primary + fallback
+        #     ↓ 429 in result
+        #   Attempt 2: IMMEDIATELY switch to OpenRouter (no 60s wait — the wait
+        #     kills the Jarvis Live API session with keepalive timeout)
+        #     ↓ OpenRouter has no daily quota → should succeed
+        #   Attempt 3: last resort, retry OpenRouter with brief delay
         result = None
         max_outer_retries = 3
         current_agent = agent
@@ -567,12 +568,12 @@ async def _run_agent(
                 # Check if the result indicates a 429 (browser-use doesn't raise)
                 if _result_contains_429(result) and attempt < max_outer_retries:
                     print(f"[web_agent] ⚠️ 429 quota error in result (attempt {attempt}/{max_outer_retries})")
-                    # If we have an OpenRouter fallback and this is attempt 2+,
-                    # recreate the agent with OpenRouter as the primary LLM.
-                    # This handles the case where Gemini daily quota is gone.
-                    if attempt == 2 and or_llm_for_retry is not None:
-                        print(f"[web_agent] 🔄 Switching to OpenRouter LLM as primary "
-                              f"(Gemini daily quota likely exhausted)")
+                    # If we have an OpenRouter fallback, switch to it IMMEDIATELY.
+                    # Don't wait 60s — Gemini daily quota won't reset in 60s,
+                    # and the wait kills the Jarvis Live API session.
+                    if or_llm_for_retry is not None:
+                        print(f"[web_agent] 🔄 Switching to OpenRouter LLM immediately "
+                              f"(Gemini daily quota exhausted)")
                         if speak:
                             speak("Switching to OpenRouter, sir. Gemini quota is exhausted.")
                         try:
@@ -580,25 +581,21 @@ async def _run_agent(
                                 task=task,
                                 llm=or_llm_for_retry,
                                 browser=browser,
-                                use_vision=False,  # OpenRouter free models usually don't support vision
+                                use_vision=False,
                                 max_steps=max_steps,
                             )
                             print("[web_agent] ✅ Agent recreated with OpenRouter LLM")
                         except Exception as e:
                             print(f"[web_agent] ⚠️ Could not recreate agent with OpenRouter: {e}")
-                            # Fall back to waiting + retry with original agent
-                            print(f"[web_agent]    Waiting {RETRY_DELAY_ON_429}s before retry...")
-                            if speak:
-                                speak(f"Hit the rate limit, sir. Waiting {RETRY_DELAY_ON_429} seconds.")
-                            await asyncio.sleep(RETRY_DELAY_ON_429)
-                        continue
+                            # Brief delay before next retry
+                            await asyncio.sleep(5)
                     else:
-                        # Just wait and retry with the same agent
+                        # No OpenRouter fallback — wait and retry
                         print(f"[web_agent]    Waiting {RETRY_DELAY_ON_429}s before retry...")
                         if speak:
                             speak(f"Hit the rate limit, sir. Waiting {RETRY_DELAY_ON_429} seconds before retrying.")
                         await asyncio.sleep(RETRY_DELAY_ON_429)
-                        continue
+                    continue
                 break  # success (or final retry)
             except asyncio.TimeoutError:
                 raise  # let the outer except handle it
@@ -609,8 +606,8 @@ async def _run_agent(
                     "quota" in err_str.lower()):
                     if attempt < max_outer_retries:
                         print(f"[web_agent] ⚠️ 429 quota error (attempt {attempt}/{max_outer_retries})")
-                        if attempt == 2 and or_llm_for_retry is not None:
-                            print(f"[web_agent] 🔄 Switching to OpenRouter LLM as primary")
+                        if or_llm_for_retry is not None:
+                            print(f"[web_agent] 🔄 Switching to OpenRouter LLM immediately")
                             if speak:
                                 speak("Switching to OpenRouter, sir.")
                             try:
@@ -623,7 +620,7 @@ async def _run_agent(
                                 )
                             except Exception as e:
                                 print(f"[web_agent] ⚠️ Could not recreate agent: {e}")
-                                await asyncio.sleep(RETRY_DELAY_ON_429)
+                                await asyncio.sleep(5)
                         else:
                             print(f"[web_agent]    Waiting {RETRY_DELAY_ON_429}s before retry...")
                             if speak:
