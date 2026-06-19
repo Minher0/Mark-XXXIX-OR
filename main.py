@@ -1035,6 +1035,11 @@ class JarvisLive:
         print("[JARVIS] 👂 Recv started")
         out_buf, in_buf = [], []
 
+        # Wake word state — reset each turn
+        suppress_output = False
+        ww_checked = False  # have we decided whether to suppress this turn?
+        ww_input_accumulated = ""
+
         try:
             while True:
                 # Check if UI requested a reconnect (e.g. wake word toggle)
@@ -1045,42 +1050,79 @@ class JarvisLive:
 
                 async for response in self.session.receive():
 
+                    # ── Audio output: only play if not suppressed ──
                     if response.data:
-                        self.audio_in_queue.put_nowait(response.data)
+                        if not suppress_output:
+                            self.audio_in_queue.put_nowait(response.data)
 
                     if response.server_content:
                         sc = response.server_content
 
+                        # ── Output transcription: only log if not suppressed ──
                         if sc.output_transcription and sc.output_transcription.text:
-                            self.set_speaking(True)
+                            if not suppress_output:
+                                self.set_speaking(True)
                             txt = sc.output_transcription.text.strip()
                             if txt:
                                 out_buf.append(txt)
 
+                        # ── Input transcription: check for wake word ──
                         if sc.input_transcription and sc.input_transcription.text:
                             txt = sc.input_transcription.text.strip()
                             if txt:
                                 in_buf.append(txt)
 
+                                # Wake word check: accumulate input and decide
+                                # as early as possible whether to suppress
+                                if getattr(self.ui, '_wake_word', False) and not ww_checked:
+                                    ww_input_accumulated += " " + txt
+                                    ww_input_accumulated = ww_input_accumulated.strip()
+
+                                    # Once we have 6+ chars, check if "jarvis"
+                                    # appears in the first 20 chars
+                                    if len(ww_input_accumulated) >= 6:
+                                        lower = ww_input_accumulated.lower()[:20]
+                                        if "jarvis" not in lower:
+                                            suppress_output = True
+                                            ww_checked = True
+                                            print(
+                                                f"[JARVIS] 🔇 Wake word: not addressed "
+                                                f"('{ww_input_accumulated[:40]}'), "
+                                                f"suppressing output"
+                                            )
+                                        else:
+                                            ww_checked = True
+                                            print(
+                                                f"[JARVIS] ✅ Wake word: addressed "
+                                                f"('{ww_input_accumulated[:40]}')"
+                                            )
+
+                        # ── Turn complete: reset state ──
                         if sc.turn_complete:
                             self.set_speaking(False)
 
                             full_in = " ".join(in_buf).strip()
-                            if full_in:
+                            if full_in and not suppress_output:
                                 self.ui.write_log(f"You: {full_in}")
                             in_buf = []
 
                             full_out = " ".join(out_buf).strip()
-                            if full_out:
+                            if full_out and not suppress_output:
                                 self.ui.write_log(f"Jarvis: {full_out}")
                             out_buf = []
 
-                            if full_in and len(full_in) > 5:
+                            # Only update memory if Jarvis actually responded
+                            if full_in and len(full_in) > 5 and not suppress_output:
                                 threading.Thread(
                                     target=_update_memory_async,
                                     args=(full_in, full_out),
                                     daemon=True
                                 ).start()
+
+                            # Reset wake word state for next turn
+                            suppress_output = False
+                            ww_checked = False
+                            ww_input_accumulated = ""
 
                     if response.tool_call:
                         fn_responses = []
