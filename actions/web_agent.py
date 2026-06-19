@@ -42,13 +42,15 @@ def _get_base_dir() -> Path:
 BASE_DIR        = _get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 
-DEFAULT_MODEL     = "gemini-2.5-flash"
+DEFAULT_MODEL     = "gemini-2.0-flash"   # higher free-tier rate limit (60 RPM vs 20)
+DEFAULT_FALLBACK_MODEL = "gemini-2.5-flash"  # used if primary is rate-limited
 DEFAULT_MAX_STEPS = 30
 DEFAULT_HEADLESS  = False    # user can see what JARVIS is doing
 DEFAULT_VISION    = True     # Gemini 2.5 Flash supports vision
 DEFAULT_KEEP_OPEN = True     # keep browser open after task so user can inspect
 MAX_STEPS_CAP     = 100      # safety — prevent runaway agents
-TASK_TIMEOUT_SEC  = 600      # 10 minutes max per task
+TASK_TIMEOUT_SEC  = 1200     # 20 minutes max per task (was 10 — heavy tasks need more)
+RETRY_DELAY_ON_429 = 60     # seconds to wait when 429 hits before retrying
 
 
 def _load_config() -> dict:
@@ -183,28 +185,46 @@ async def _run_agent(
         )
 
     model_name = _get_model()
+    fallback_model_name = _load_config().get(
+        "web_agent_fallback_model", DEFAULT_FALLBACK_MODEL
+    ).strip() or DEFAULT_FALLBACK_MODEL
     print(f"[web_agent] 🤖 LLM: {model_name} (vision={use_vision})")
+    print(f"[web_agent] 🤖 Fallback LLM: {fallback_model_name}")
 
     llm = None
+    fallback_llm = None
     llm_errors = []
 
+    def _make_native_llm(model_name):
+        """Try to create a browser-use native ChatGoogle for the given model."""
+        for native_path in [
+            ("browser_use.llm.google",       "ChatGoogle"),
+            ("browser_use.llm.gemini",       "ChatGemini"),
+            ("browser_use.llm",              "ChatGoogle"),
+        ]:
+            try:
+                mod = __import__(native_path[0], fromlist=[native_path[1]])
+                NativeCls = getattr(mod, native_path[1])
+                return NativeCls(model=model_name, api_key=api_key), native_path
+            except (ImportError, AttributeError):
+                continue
+            except Exception:
+                continue
+        return None, None
+
     # Approach 1: browser-use's native ChatGoogle class (cleanest)
-    for native_path in [
-        ("browser_use.llm.google",       "ChatGoogle"),
-        ("browser_use.llm.gemini",       "ChatGemini"),
-        ("browser_use.llm",              "ChatGoogle"),
-    ]:
-        try:
-            mod = __import__(native_path[0], fromlist=[native_path[1]])
-            NativeCls = getattr(mod, native_path[1])
-            llm = NativeCls(model=model_name, api_key=api_key)
-            print(f"[web_agent] 📦 Using native LLM: {native_path[0]}.{native_path[1]}")
-            break
-        except (ImportError, AttributeError):
-            continue
-        except Exception as e:
-            llm_errors.append(f"{native_path[0]}.{native_path[1]}: {e}")
-            continue
+    llm, native_path_used = _make_native_llm(model_name)
+    if llm is not None:
+        print(f"[web_agent] 📦 Using native LLM: {native_path_used[0]}.{native_path_used[1]}")
+
+        # Also create a fallback LLM with a different model (higher rate limit)
+        # browser-use will switch to it if the primary returns 429
+        if fallback_model_name and fallback_model_name != model_name:
+            fallback_llm, _ = _make_native_llm(fallback_model_name)
+            if fallback_llm is not None:
+                print(f"[web_agent] 📦 Fallback LLM ready: {fallback_model_name}")
+            else:
+                print(f"[web_agent] ⚠️ Could not create fallback LLM")
 
     # Approach 2: Subclass ChatGoogleGenerativeAI and add the `provider` attr
     if llm is None:
@@ -228,6 +248,15 @@ async def _run_agent(
             # Verify the provider attribute is actually accessible
             _ = llm.provider
             print(f"[web_agent] 📦 Using ChatGoogleGenerativeAI + provider='google' wrapper")
+
+            # Create fallback LLM
+            if fallback_model_name and fallback_model_name != model_name:
+                fallback_llm = _GeminiWithProvider(
+                    model=fallback_model_name,
+                    google_api_key=api_key,
+                    temperature=0.1,
+                )
+                print(f"[web_agent] 📦 Fallback LLM ready: {fallback_model_name}")
         except ImportError:
             return (
                 "langchain-google-genai is not installed. "
@@ -423,39 +452,84 @@ async def _run_agent(
         if speak and step % 5 == 0:
             speak(f"Step {step} of {max_steps}, sir.")
 
-    # Build the agent — try with use_vision first, fall back if API changes
+    # Build the agent — try with use_vision first, fall back if API changes.
+    # Pass fallback_llm if available — browser-use v0.13+ supports it and will
+    # automatically switch to it when the primary LLM returns 429.
     agent = None
-    try:
-        agent = Agent(
-            task=task,
-            llm=llm,
-            browser=browser,
-            use_vision=use_vision,
-            max_steps=max_steps,
-        )
-    except TypeError:
-        # Older browser-use versions don't have use_vision / max_steps
+    agent_kwargs = {
+        "task": task,
+        "llm": llm,
+        "browser": browser,
+    }
+    # Add optional kwargs that some browser-use versions support
+    for opt_kwarg, opt_val in [
+        ("use_vision", use_vision),
+        ("max_steps", max_steps),
+        ("fallback_llm", fallback_llm),
+    ]:
         try:
-            agent = Agent(
-                task=task,
-                llm=llm,
-                browser=browser,
-            )
-        except Exception as e:
-            await browser.close()
-            return f"Could not create agent: {e}"
-    except Exception as e:
-        await browser.close()
-        return f"Could not create agent: {e}"
+            test_agent = Agent(task="test", llm=llm, browser=browser, **{opt_kwarg: opt_val})
+            agent_kwargs[opt_kwarg] = opt_val
+            print(f"[web_agent] 📦 Agent supports {opt_kwarg}={opt_val if opt_kwarg != 'fallback_llm' else 'set'}")
+            del test_agent
+            break  # if one optional kwarg works, assume others do too
+        except (TypeError, Exception):
+            continue
+    # Actually build the real agent with all supported kwargs
+    try:
+        # First try with all optional kwargs
+        agent = Agent(**agent_kwargs)
+    except (TypeError, Exception):
+        # Strip optional kwargs one by one until it works
+        for opt_kwarg in ("fallback_llm", "use_vision", "max_steps"):
+            agent_kwargs.pop(opt_kwarg, None)
+            try:
+                agent = Agent(**agent_kwargs)
+                print(f"[web_agent] ⚠️ Agent created without {opt_kwarg}")
+                break
+            except (TypeError, Exception):
+                continue
+    if agent is None:
+        try:
+            await _force_close_browser()
+        except Exception:
+            pass
+        return "Could not create agent (incompatible browser-use API)."
 
     print(f"[web_agent] 🌐 Running agent (max_steps={max_steps})...")
 
     try:
-        # Run with overall timeout
-        result = await asyncio.wait_for(
-            agent.run(max_steps=max_steps),
-            timeout=TASK_TIMEOUT_SEC,
-        )
+        # Run with overall timeout. If the primary LLM hits 429 and there's no
+        # fallback, browser-use will retry up to 6 times rapidly. We wrap the
+        # run in our own retry loop that waits RETRY_DELAY_ON_429 seconds
+        # between attempts to respect the rate limit.
+        result = None
+        max_outer_retries = 3
+        for attempt in range(1, max_outer_retries + 1):
+            try:
+                result = await asyncio.wait_for(
+                    agent.run(max_steps=max_steps),
+                    timeout=TASK_TIMEOUT_SEC,
+                )
+                break  # success
+            except asyncio.TimeoutError:
+                raise  # let the outer except handle it
+            except Exception as run_err:
+                err_str = str(run_err)
+                # Check if it's a 429 quota error
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower():
+                    if attempt < max_outer_retries:
+                        print(f"[web_agent] ⚠️ 429 quota error (attempt {attempt}/{max_outer_retries})")
+                        print(f"[web_agent]    Waiting {RETRY_DELAY_ON_429}s before retry...")
+                        if speak:
+                            speak(f"Hit the rate limit, sir. Waiting {RETRY_DELAY_ON_429} seconds before retrying.")
+                        await asyncio.sleep(RETRY_DELAY_ON_429)
+                        continue
+                # Not a 429, or last attempt — re-raise
+                raise
+
+        if result is None:
+            return "Web agent did not produce a result after retries."
 
         # Extract the final result — browser-use API has evolved, so be flexible
         summary = None
