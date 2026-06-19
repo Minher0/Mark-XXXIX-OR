@@ -347,7 +347,8 @@ def download_zip_update() -> bool:
 
 def update_deps() -> bool:
     """Update pip dependencies if requirements.txt changed.
-    Installs packages one by one so one failure doesn't block others."""
+    Installs packages one by one so one failure doesn't block others.
+    Verifies each package is actually importable after install."""
     if not REQUIREMENTS.exists() or not VENV_PYTHON.exists():
         _warn("Cannot update deps (missing requirements or venv)")
         return False
@@ -372,23 +373,96 @@ def update_deps() -> bool:
 
     failed = []
     succeeded = 0
+    installed_now = []  # packages installed during this run (not already there)
 
     for pkg in packages:
         pkg_name = pkg.split("==")[0].split(">=")[0].split("<=")[0].split("[")[0].strip()
+        # Normalise package name for import check
+        # e.g. "google-genai" -> "google.genai", "beautifulsoup4" -> "bs4"
+        import_name = {
+            "beautifulsoup4": "bs4",
+            "Pillow": "PIL",
+            "pyautogui": "pyautogui",
+            "opencv-python": "cv2",
+            "duckduckgo-search": "duckduckgo_search",
+            "youtube-transcript-api": "youtube_transcript_api",
+            "google-genai": "google.genai",
+            "google-generativeai": "google.generativeai",
+            "browser-use": "browser_use",
+            "langchain-google-genai": "langchain_google_genai",
+            "send2trash": "send2trash",
+            "youtube-transcript-api": "youtube_transcript_api",
+        }.get(pkg_name, pkg_name.lower().replace("-", "_"))
+
+        # Check if already importable
+        check = subprocess.run(
+            [str(VENV_PYTHON), "-c", f"import {import_name}"],
+            capture_output=True, timeout=15
+        )
+        already_installed = (check.returncode == 0)
+
+        if already_installed:
+            succeeded += 1
+            continue
+
+        # Not installed — install it now (without --quiet so we can see errors)
+        print(f"        Installing {pkg_name}...", end=" ", flush=True)
         try:
+            # First attempt: regular install (no --upgrade, no --quiet)
             result = subprocess.run(
-                [str(VENV_PYTHON), "-m", "pip", "install", pkg, "--quiet", "--upgrade"],
-                capture_output=True, text=True, timeout=300
+                [str(VENV_PYTHON), "-m", "pip", "install", pkg],
+                capture_output=True, text=True, timeout=600
             )
-            if result.returncode == 0:
+            if result.returncode != 0:
+                # Retry with --upgrade --force-reinstall as a fallback
+                result = subprocess.run(
+                    [str(VENV_PYTHON), "-m", "pip", "install", "--upgrade",
+                     "--force-reinstall", "--no-deps", pkg],
+                    capture_output=True, text=True, timeout=600
+                )
+
+            # Verify the package is now importable
+            verify = subprocess.run(
+                [str(VENV_PYTHON), "-c", f"import {import_name}"],
+                capture_output=True, timeout=15
+            )
+            if verify.returncode == 0:
+                print(_green("OK"))
                 succeeded += 1
+                installed_now.append(pkg_name)
             else:
+                print(_red("FAILED (import check)"))
+                err = result.stderr.strip()[-300:] if result.stderr else ""
+                if err:
+                    print(f"          {err[-200:]}")
                 failed.append(pkg_name)
-        except Exception:
+        except subprocess.TimeoutExpired:
+            print(_red("TIMEOUT"))
+            failed.append(pkg_name)
+        except Exception as e:
+            print(_red(f"ERROR ({e})"))
             failed.append(pkg_name)
 
+    # Special: if browser-use was just installed, ensure playwright chromium is too
+    if "browser-use" in installed_now:
+        print(f"        Installing Playwright Chromium browser...", end=" ", flush=True)
+        try:
+            result = subprocess.run(
+                [str(VENV_PYTHON), "-m", "playwright", "install", "chromium"],
+                capture_output=True, text=True, timeout=600
+            )
+            if result.returncode == 0:
+                print(_green("OK"))
+            else:
+                print(_yellow("already installed or skipped"))
+        except Exception as e:
+            print(_yellow(f"skipped ({e})"))
+
     if not failed:
-        _ok(f"All {succeeded} dependencies up to date")
+        if installed_now:
+            _ok(f"All {succeeded} dependencies OK ({len(installed_now)} newly installed)")
+        else:
+            _ok(f"All {succeeded} dependencies up to date")
     elif succeeded > 0:
         _warn(f"{succeeded} OK, {len(failed)} failed: {', '.join(failed)}")
     else:
