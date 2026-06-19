@@ -1170,49 +1170,78 @@ def _ensure_optional_deps():
     This catches the case where the Updater.exe failed to install new
     packages (e.g. browser-use was added to requirements.txt but the
     updater's old code didn't actually install it).
+
+    For browser-use, we don't just check `import browser_use` — we also
+    check that `Agent` and `Browser` are importable, because the API
+    changed between versions and a partially-compatible install would
+    pass the basic import check but fail at runtime.
     """
     import subprocess
     import sys
 
-    # (import_name, pip_package) — packages that are optional but needed
-    # for specific features. Each is checked and installed independently.
-    optional_deps = [
-        ("browser_use",            "browser-use"),
-        ("langchain_google_genai", "langchain-google-genai"),
-    ]
+    def _check_browser_use():
+        """Return True if browser-use is importable AND has the Agent class."""
+        try:
+            mod = __import__("browser_use")
+            # Check that Agent exists — it's the main class we need
+            if not hasattr(mod, "Agent"):
+                return False
+            return True
+        except ImportError:
+            return False
+
+    def _check_langchain_google():
+        """Return True if langchain-google-genai is importable."""
+        try:
+            __import__("langchain_google_genai")
+            return True
+        except ImportError:
+            return False
 
     def _worker():
-        for import_name, pip_pkg in optional_deps:
+        # Check browser-use
+        if not _check_browser_use():
+            print("[JARVIS] 📦 browser-use missing or incompatible — installing...")
             try:
-                __import__(import_name)
-                # Already available — skip
-            except ImportError:
-                print(f"[JARVIS] 📦 Installing missing optional dep: {pip_pkg}...")
-                try:
-                    result = subprocess.run(
-                        [sys.executable, "-m", "pip", "install", pip_pkg],
-                        capture_output=True, text=True, timeout=600
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "--upgrade", "browser-use"],
+                    capture_output=True, text=True, timeout=600
+                )
+                if result.returncode == 0 and _check_browser_use():
+                    print("[JARVIS] ✅ browser-use installed")
+                    # Install Chromium binary for Playwright
+                    print("[JARVIS] 🌐 Installing Playwright Chromium...")
+                    subprocess.run(
+                        [sys.executable, "-m", "playwright", "install", "chromium"],
+                        capture_output=True, timeout=600
                     )
-                    if result.returncode == 0:
-                        # Verify it's now importable
-                        try:
-                            __import__(import_name)
-                            print(f"[JARVIS] ✅ {pip_pkg} installed")
-                            # Special case: browser-use needs chromium binary
-                            if pip_pkg == "browser-use":
-                                print("[JARVIS] 🌐 Installing Playwright Chromium...")
-                                subprocess.run(
-                                    [sys.executable, "-m", "playwright", "install", "chromium"],
-                                    capture_output=True, timeout=600
-                                )
-                                print("[JARVIS] ✅ Chromium installed")
-                        except ImportError:
-                            print(f"[JARVIS] ⚠️ {pip_pkg} installed but still not importable")
-                    else:
-                        err = (result.stderr or "")[-200:]
-                        print(f"[JARVIS] ⚠️ Failed to install {pip_pkg}: {err}")
-                except Exception as e:
-                    print(f"[JARVIS] ⚠️ Error installing {pip_pkg}: {e}")
+                    print("[JARVIS] ✅ Chromium installed")
+                else:
+                    err = (result.stderr or "")[-300:]
+                    print(f"[JARVIS] ⚠️ browser-use install failed: {err}")
+            except Exception as e:
+                print(f"[JARVIS] ⚠️ Error installing browser-use: {e}")
+        else:
+            print("[JARVIS] ✅ browser-use already available")
+
+        # Check langchain-google-genai
+        if not _check_langchain_google():
+            print("[JARVIS] 📦 langchain-google-genai missing — installing...")
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "--upgrade",
+                     "langchain-google-genai"],
+                    capture_output=True, text=True, timeout=600
+                )
+                if result.returncode == 0 and _check_langchain_google():
+                    print("[JARVIS] ✅ langchain-google-genai installed")
+                else:
+                    err = (result.stderr or "")[-300:]
+                    print(f"[JARVIS] ⚠️ langchain-google-genai install failed: {err}")
+            except Exception as e:
+                print(f"[JARVIS] ⚠️ Error installing langchain-google-genai: {e}")
+        else:
+            print("[JARVIS] ✅ langchain-google-genai already available")
 
     threading.Thread(target=_worker, daemon=True, name="optional-deps-installer").start()
 

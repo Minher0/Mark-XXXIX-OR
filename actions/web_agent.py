@@ -97,14 +97,62 @@ async def _run_agent(
 
     Returns the agent's final result as a string.
     """
-    # Lazy imports so the module loads even if browser-use isn't installed
+    # Lazy imports so the module loads even if browser-use isn't installed.
+    # browser-use's API has changed between versions — we try multiple import
+    # patterns to stay compatible.
+    Agent = None
+    Browser = None
+    BrowserConfig = None
+
     try:
-        from browser_use import Agent, Browser, BrowserConfig
+        from browser_use import Agent  # noqa: F401
     except ImportError:
         return (
             "browser-use is not installed. Install with: pip install browser-use\n"
             "Then run: playwright install chromium"
         )
+
+    # Browser and BrowserConfig have moved around between versions.
+    # Try several known locations:
+    #   v1.x: from browser_use import Browser, BrowserConfig
+    #   v2.x: from browser_use.browser.browser import Browser
+    #         from browser_use.browser.config import BrowserConfig
+    #   Some versions: from browser_use.browser import Browser, BrowserConfig
+    import_attempts = [
+        ("browser_use",                "Browser",       "BrowserConfig"),
+        ("browser_use.browser",        "Browser",       "BrowserConfig"),
+        ("browser_use.browser.browser","Browser",       None),
+    ]
+    for mod_name, browser_attr, config_attr in import_attempts:
+        try:
+            mod = __import__(mod_name, fromlist=[browser_attr])
+            Browser = getattr(mod, browser_attr, None)
+            if Browser is None:
+                continue
+            if config_attr:
+                BrowserConfig = getattr(mod, config_attr, None)
+            else:
+                # Try to import BrowserConfig from a sub-module
+                try:
+                    cfg_mod = __import__(f"{mod_name}.config", fromlist=["BrowserConfig"])
+                    BrowserConfig = getattr(cfg_mod, "BrowserConfig", None)
+                except (ImportError, AttributeError):
+                    pass
+            if Browser is not None:
+                print(f"[web_agent] 📦 Using {mod_name} for Browser/BrowserConfig")
+                break
+        except ImportError:
+            continue
+
+    if Browser is None:
+        return (
+            "browser-use is installed but the Browser class could not be imported. "
+            "Your version may be incompatible. Try: pip install --upgrade browser-use"
+        )
+
+    # If BrowserConfig is still None, just don't pass a config (use defaults)
+    if BrowserConfig is None:
+        print("[web_agent] ⚠️ BrowserConfig not found — using browser defaults")
 
     try:
         from langchain_google_genai import ChatGoogleGenerativeAI
@@ -134,13 +182,21 @@ async def _run_agent(
 
     # Set up the browser
     try:
-        browser_config = BrowserConfig(
-            headless=headless,
-            # Use a fresh profile so we don't interfere with the user's
-            # main browser session (cookies, logins, etc.)
-            disable_security=False,
-        )
-        browser = Browser(config=browser_config)
+        if BrowserConfig is not None:
+            browser_config = BrowserConfig(
+                headless=headless,
+                # Use a fresh profile so we don't interfere with the user's
+                # main browser session (cookies, logins, etc.)
+                disable_security=False,
+            )
+            browser = Browser(config=browser_config)
+        else:
+            # Older/newer API without BrowserConfig — pass headless as kwarg
+            # or use defaults
+            try:
+                browser = Browser(config=None)
+            except TypeError:
+                browser = Browser()
     except Exception as e:
         return f"Could not initialise browser: {e}"
 

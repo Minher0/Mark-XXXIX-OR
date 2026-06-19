@@ -377,22 +377,25 @@ def update_deps() -> bool:
 
     for pkg in packages:
         pkg_name = pkg.split("==")[0].split(">=")[0].split("<=")[0].split("[")[0].strip()
-        # Normalise package name for import check
-        # e.g. "google-genai" -> "google.genai", "beautifulsoup4" -> "bs4"
+        # Normalise package name for import check.
+        # Python imports are CASE-SENSITIVE, so we preserve case and only
+        # replace hyphens with underscores. Special cases where the import
+        # name differs significantly from the pip name are handled explicitly.
         import_name = {
             "beautifulsoup4": "bs4",
             "Pillow": "PIL",
-            "pyautogui": "pyautogui",
             "opencv-python": "cv2",
             "duckduckgo-search": "duckduckgo_search",
             "youtube-transcript-api": "youtube_transcript_api",
             "google-genai": "google.genai",
             "google-generativeai": "google.generativeai",
-            "browser-use": "browser_use",
-            "langchain-google-genai": "langchain_google_genai",
-            "send2trash": "send2trash",
-            "youtube-transcript-api": "youtube_transcript_api",
-        }.get(pkg_name, pkg_name.lower().replace("-", "_"))
+            "pycaw": "pycaw.pycaw",
+            "PyQt6-Qt6": "PyQt6",
+            "PyQt6-sip": "PyQt6.sip",
+            "pyyaml": "yaml",
+            "scikit-learn": "sklearn",
+            "python-dateutil": "dateutil",
+        }.get(pkg_name, pkg_name.replace("-", "_"))
 
         # Check if already importable
         check = subprocess.run(
