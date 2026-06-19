@@ -85,7 +85,7 @@ class WakeWordDetector:
             from vosk import Model, KaldiRecognizer
             import sounddevice as sd
 
-            # Try to find a Vosk model
+            # Try to find a Vosk model — check several locations
             model_paths = [
                 BASE_DIR / "models" / "vosk-model-small-en-us-0.15",
                 BASE_DIR / "models" / "vosk-model-small-fr-0.22",
@@ -94,25 +94,15 @@ class WakeWordDetector:
                 Path("/usr/share/vosk-model"),
             ]
 
-            # Also check if vosk can download automatically
             model = None
             for p in model_paths:
                 if p.exists() and (p / "conf" / "mfcc.conf").exists():
                     model = Model(str(p))
                     break
 
+            # If no model found, try to auto-download the small English model
             if model is None:
-                # Vosk is installed but no model — try to use the small
-                # English model that pip install vosk sometimes bundles
-                try:
-                    import vosk
-                    vosk_path = Path(vosk.__file__).parent / "models"
-                    for p in vosk_path.iterdir() if vosk_path.exists() else []:
-                        if (p / "conf" / "mfcc.conf").exists():
-                            model = Model(str(p))
-                            break
-                except Exception:
-                    pass
+                model = self._download_vosk_model()
 
             if model is not None:
                 self._engine = ("vosk", model)
@@ -120,7 +110,7 @@ class WakeWordDetector:
                 print("[wake_word] ✅ Using Vosk offline engine")
                 return
             else:
-                print("[wake_word] Vosk installed but no model found — trying other engines")
+                print("[wake_word] Vosk installed but no model available — trying other engines")
         except ImportError:
             pass
         except Exception as e:
@@ -131,7 +121,6 @@ class WakeWordDetector:
             import speech_recognition as sr
             self._engine = ("sr", sr.Recognizer())
             self._engine_type = "sr"
-            # Configure for continuous listening with PocketSphinx
             self._engine[1].energy_threshold = 300
             self._engine[1].dynamic_energy_threshold = True
             print("[wake_word] ✅ Using speech_recognition + PocketSphinx")
@@ -142,11 +131,50 @@ class WakeWordDetector:
             print(f"[wake_word] speech_recognition init failed: {e}")
 
         # Strategy 3: Energy-based VAD only (triggers on ANY speech)
-        # This is a fallback — it can't actually detect "Jarvis" but
-        # it will trigger on speech and let the caller decide.
         self._engine = ("energy", None)
         self._engine_type = "energy"
         print("[wake_word] ⚠️ No recognition engine — using energy-based VAD (any speech triggers)")
+
+    def _download_vosk_model(self):
+        """Auto-download the small English Vosk model (~40MB)."""
+        import urllib.request
+        import zipfile
+        import tempfile
+        import os
+
+        model_dir = BASE_DIR / "models"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        target = model_dir / "vosk-model-small-en-us-0.15"
+
+        if target.exists() and (target / "conf" / "mfcc.conf").exists():
+            from vosk import Model
+            return Model(str(target))
+
+        url = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
+        print(f"[wake_word] 📦 Downloading Vosk model (~40MB)...")
+        try:
+            tmp_zip = tempfile.NamedTemporaryFile(
+                suffix=".zip", delete=False, dir=str(model_dir)
+            )
+            tmp_zip.close()
+            urllib.request.urlretrieve(url, tmp_zip.name)
+            print("[wake_word] 📦 Extracting model...")
+            with zipfile.ZipFile(tmp_zip.name, 'r') as zf:
+                zf.extractall(str(model_dir))
+            os.unlink(tmp_zip.name)
+
+            if target.exists() and (target / "conf" / "mfcc.conf").exists():
+                from vosk import Model
+                print("[wake_word] ✅ Vosk model downloaded and ready")
+                return Model(str(target))
+            else:
+                print(f"[wake_word] ⚠️ Model extracted but not found at {target}")
+                for item in model_dir.iterdir():
+                    print(f"  Found: {item.name}")
+        except Exception as e:
+            print(f"[wake_word] ⚠️ Model download failed: {e}")
+
+        return None
 
     def _vosk_loop(self):
         """Continuous listening loop with Vosk."""
