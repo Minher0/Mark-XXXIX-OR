@@ -23,8 +23,8 @@ from PyQt6.QtGui import (
     QRadialGradient, QShortcut,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QPushButton, QScrollArea, QSizePolicy, QTextEdit,
+    QApplication, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
+    QLineEdit, QMainWindow, QPushButton, QScrollArea, QSizePolicy, QTextEdit,
     QVBoxLayout, QWidget, QProgressBar,
 )
 
@@ -1091,6 +1091,7 @@ class MainWindow(QMainWindow):
 
         self.on_text_command  = None
         self._muted           = False
+        self._push_to_talk    = False  # if True, mic stays muted until F4
         self._current_file: str | None = None
 
         central = QWidget()
@@ -1376,6 +1377,29 @@ class MainWindow(QMainWindow):
         self._style_mute_btn()
         lay.addWidget(self._mute_btn)
 
+        # Push-to-talk checkbox (unchecked by default = always listening)
+        self._ptt_checkbox = QCheckBox("🔊  PUSH-TO-TALK (respond only when activated)")
+        self._ptt_checkbox.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        self._ptt_checkbox.setChecked(False)
+        self._ptt_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._ptt_checkbox.setStyleSheet(f"""
+            QCheckBox {{
+                color: {C.TEXT_DIM}; background: transparent;
+                padding: 4px 2px; spacing: 6px;
+            }}
+            QCheckBox::indicator {{
+                width: 14px; height: 14px;
+                border: 1px solid {C.BORDER_B}; border-radius: 2px;
+                background: #000d12;
+            }}
+            QCheckBox::indicator:checked {{
+                background: {C.ACC2}; border: 1px solid {C.ACC2};
+            }}
+            QCheckBox:hover {{ color: {C.TEXT}; }}
+        """)
+        self._ptt_checkbox.toggled.connect(self._toggle_push_to_talk)
+        lay.addWidget(self._ptt_checkbox)
+
         fs_btn = QPushButton("⛶  FULLSCREEN  [F11]")
         fs_btn.setFixedHeight(26)
         fs_btn.setFont(QFont("Courier New", 7))
@@ -1436,7 +1460,7 @@ class MainWindow(QMainWindow):
             l.setStyleSheet(f"color: {color}; background: transparent;")
             return l
 
-        lay.addWidget(_fl("[F4] Mute  ·  [F11] Fullscreen"))
+        lay.addWidget(_fl("[F4] Mute/Push-to-talk  ·  [F11] Fullscreen"))
         lay.addStretch()
         lay.addWidget(_fl("FatihMakes Industries  ·  MARK XXXIX  ·  CLASSIFIED"))
         lay.addStretch()
@@ -1471,9 +1495,38 @@ class MainWindow(QMainWindow):
             self._apply_state("LISTENING")
             self._log.append_log("SYS: Microphone active.")
 
+    def _toggle_push_to_talk(self, checked: bool):
+        """Toggle push-to-talk mode.
+
+        When ON: microphone is muted by default. Jarvis only listens when
+        the user presses F4 (or clicks the mic button) to temporarily
+        unmute. After speaking, press F4 again to mute.
+
+        When OFF (default): Jarvis always listens, as before.
+        """
+        self._push_to_talk = checked
+        if checked:
+            # Mute the mic immediately — user must press F4 to talk
+            self._muted = True
+            self.hud.muted = True
+            self._style_mute_btn()
+            self._apply_state("MUTED")
+            self._log.append_log("SYS: Push-to-talk enabled. Press F4 to speak.")
+            self._mute_btn.setText("🔇  PRESS F4 TO SPEAK")
+        else:
+            # Restore always-listening mode
+            self._muted = False
+            self.hud.muted = False
+            self._style_mute_btn()
+            self._apply_state("LISTENING")
+            self._log.append_log("SYS: Push-to-talk disabled. Always listening.")
+
     def _style_mute_btn(self):
         if self._muted:
-            self._mute_btn.setText("🔇  MICROPHONE MUTED")
+            if self._push_to_talk:
+                self._mute_btn.setText("🔇  PRESS F4 TO SPEAK")
+            else:
+                self._mute_btn.setText("🔇  MICROPHONE MUTED")
             self._mute_btn.setStyleSheet(f"""
                 QPushButton {{
                     background: #140006; color: {C.MUTED_C};
@@ -1481,7 +1534,10 @@ class MainWindow(QMainWindow):
                 }}
             """)
         else:
-            self._mute_btn.setText("🎙  MICROPHONE ACTIVE")
+            if self._push_to_talk:
+                self._mute_btn.setText("🎙  LISTENING… (F4 to mute)")
+            else:
+                self._mute_btn.setText("🎙  MICROPHONE ACTIVE")
             self._mute_btn.setStyleSheet(f"""
                 QPushButton {{
                     background: #00140a; color: {C.GREEN};
