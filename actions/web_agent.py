@@ -42,15 +42,12 @@ def _get_base_dir() -> Path:
 BASE_DIR        = _get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 
-DEFAULT_MODEL     = "gemini-2.0-flash"   # higher free-tier rate limit (60 RPM vs 20)
-DEFAULT_FALLBACK_MODEL = "gemini-2.5-flash"  # used if primary is rate-limited
+DEFAULT_MODEL     = "gemini-2.5-flash"
 DEFAULT_MAX_STEPS = 30
 DEFAULT_HEADLESS  = False    # user can see what JARVIS is doing
 DEFAULT_VISION    = True     # Gemini 2.5 Flash supports vision
-DEFAULT_KEEP_OPEN = True     # keep browser open after task so user can inspect
 MAX_STEPS_CAP     = 100      # safety — prevent runaway agents
-TASK_TIMEOUT_SEC  = 1200     # 20 minutes max per task (was 10 — heavy tasks need more)
-RETRY_DELAY_ON_429 = 60     # seconds to wait when 429 hits before retrying
+TASK_TIMEOUT_SEC  = 600      # 10 minutes max per task
 
 
 def _load_config() -> dict:
@@ -86,43 +83,6 @@ def _get_use_vision() -> bool:
     return str(val).lower() in ("true", "1", "yes")
 
 
-def _get_keep_browser_open() -> bool:
-    val = _load_config().get("web_agent_keep_browser_open", "true")
-    return str(val).lower() in ("true", "1", "yes")
-
-
-# ─── Helpers ───────────────────────────────────────────────
-
-def _make_openrouter_llm_safe(or_model: str):
-    """Create a LangChain-compatible LLM wrapper around OpenRouter.
-
-    Uses langchain_openai.ChatOpenAI pointed at OpenRouter's API.
-    Returns None on failure.
-    """
-    try:
-        from or_client import _load_api_key as _or_load_key
-        or_key = _or_load_key()
-        if not or_key:
-            return None
-        from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
-            model=or_model,
-            api_key=or_key,
-            base_url="https://openrouter.ai/api/v1",
-            temperature=0.1,
-            default_headers={
-                "HTTP-Referer": "https://github.com/mark-xxxix-or",
-                "X-Title": "MARK XXXIX-OR",
-            },
-        )
-    except ImportError:
-        print("[web_agent] ⚠️ langchain-openai not installed — can't use OpenRouter fallback")
-        return None
-    except Exception as e:
-        print(f"[web_agent] ⚠️ OpenRouter fallback init failed: {e}")
-        return None
-
-
 # ─── Async agent runner ────────────────────────────────────
 
 async def _run_agent(
@@ -130,17 +90,10 @@ async def _run_agent(
     max_steps: int,
     headless: bool,
     use_vision: bool,
-    keep_browser_open: bool = True,
     speak: Optional[Callable] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> str:
     """Run the browser-use agent asynchronously.
-
-    Args:
-        keep_browser_open: if True (default), the browser stays open after the
-            task completes so the user can inspect the result. The agent's
-            asyncio task still terminates — the browser just remains visible
-            until the user closes it manually.
 
     Returns the agent's final result as a string.
     """
@@ -202,6 +155,13 @@ async def _run_agent(
         print("[web_agent] ⚠️ BrowserConfig not found — using browser defaults")
 
     # ── Create the LLM ──
+    # browser-use v1+ checks `llm.provider` to know how to format messages
+    # and call the model. ChatGoogleGenerativeAI from langchain-google-genai
+    # doesn't expose this attribute by default → causes "object has no
+    # attribute 'provider'" error. We try multiple approaches:
+    #   1. browser_use.llm.google.ChatGoogle (native browser-use Gemini class)
+    #   2. Subclass ChatGoogleGenerativeAI and add `provider = 'google'`
+    #   3. Manual wrapper that delegates everything
     api_key = _get_api_key()
     if not api_key:
         return (
@@ -210,86 +170,70 @@ async def _run_agent(
         )
 
     model_name = _get_model()
-    fallback_model_name = _load_config().get(
-        "web_agent_fallback_model", DEFAULT_FALLBACK_MODEL
-    ).strip() or DEFAULT_FALLBACK_MODEL
-    # OpenRouter fallback — used when Gemini daily quota is exhausted.
-    # Activated by default (no daily quota on OpenRouter free models).
-    or_fallback_model = _load_config().get(
-        "web_agent_openrouter_fallback", "qwen/qwen3-coder:free"
-    ).strip()
-
     print(f"[web_agent] 🤖 LLM: {model_name} (vision={use_vision})")
-    print(f"[web_agent] 🤖 Fallback LLM: {fallback_model_name}")
-    if or_fallback_model:
-        print(f"[web_agent] 🤖 OpenRouter fallback: {or_fallback_model}")
 
     llm = None
-    fallback_llm = None
     llm_errors = []
-    _or_llm_cache = None
 
-    def _make_native_llm(model_name):
-        """Try to create a browser-use native ChatGoogle for the given model."""
-        for native_path in [
-            ("browser_use.llm.google",       "ChatGoogle"),
-            ("browser_use.llm.gemini",       "ChatGemini"),
-            ("browser_use.llm",              "ChatGoogle"),
-        ]:
-            try:
-                mod = __import__(native_path[0], fromlist=[native_path[1]])
-                NativeCls = getattr(mod, native_path[1])
-                return NativeCls(model=model_name, api_key=api_key), native_path
-            except (ImportError, AttributeError):
-                continue
-            except Exception:
-                continue
-        return None, None
+    # Approach 1: browser-use's native ChatGoogle class (cleanest)
+    for native_path in [
+        ("browser_use.llm.google",       "ChatGoogle"),
+        ("browser_use.llm.gemini",       "ChatGemini"),
+        ("browser_use.llm",              "ChatGoogle"),
+    ]:
+        try:
+            mod = __import__(native_path[0], fromlist=[native_path[1]])
+            NativeCls = getattr(mod, native_path[1])
+            llm = NativeCls(model=model_name, api_key=api_key)
+            print(f"[web_agent] 📦 Using native LLM: {native_path[0]}.{native_path[1]}")
+            break
+        except (ImportError, AttributeError):
+            continue
+        except Exception as e:
+            llm_errors.append(f"{native_path[0]}.{native_path[1]}: {e}")
+            continue
 
-    # Approach 1: browser-use's native ChatGoogle
-    llm, native_path_used = _make_native_llm(model_name)
-    if llm is not None:
-        print(f"[web_agent] 📦 Using native LLM: {native_path_used[0]}.{native_path_used[1]}")
-        if fallback_model_name and fallback_model_name != model_name:
-            fallback_llm, _ = _make_native_llm(fallback_model_name)
-            if fallback_llm:
-                print(f"[web_agent] 📦 Fallback LLM ready: {fallback_model_name}")
-
-    # Approach 2: Subclass ChatGoogleGenerativeAI with provider attr
+    # Approach 2: Subclass ChatGoogleGenerativeAI and add the `provider` attr
     if llm is None:
         try:
             from langchain_google_genai import ChatGoogleGenerativeAI
 
             class _GeminiWithProvider(ChatGoogleGenerativeAI):
+                """ChatGoogleGenerativeAI with `provider` attr for browser-use v1+."""
                 provider: str = "google"
+
+                # Some browser-use versions also check `model_name` instead of `model`
                 @property
                 def model_name(self) -> str:
                     return getattr(self, "model", "") or ""
 
             llm = _GeminiWithProvider(
-                model=model_name, google_api_key=api_key, temperature=0.1,
+                model=model_name,
+                google_api_key=api_key,
+                temperature=0.1,
             )
+            # Verify the provider attribute is actually accessible
             _ = llm.provider
-            print(f"[web_agent] 📦 Using ChatGoogleGenerativeAI + provider wrapper")
-            if fallback_model_name and fallback_model_name != model_name:
-                fallback_llm = _GeminiWithProvider(
-                    model=fallback_model_name, google_api_key=api_key,
-                    temperature=0.1,
-                )
+            print(f"[web_agent] 📦 Using ChatGoogleGenerativeAI + provider='google' wrapper")
         except ImportError:
-            return ("langchain-google-genai is not installed. "
-                    "Install with: pip install langchain-google-genai")
+            return (
+                "langchain-google-genai is not installed. "
+                "Install with: pip install langchain-google-genai"
+            )
         except Exception as e:
             llm_errors.append(f"subclass approach: {e}")
 
-    # Approach 3: Plain ChatGoogleGenerativeAI
+    # Approach 3: Last resort — try the basic ChatGoogleGenerativeAI without
+    # the wrapper. Some older browser-use versions don't need `provider`.
     if llm is None:
         try:
             from langchain_google_genai import ChatGoogleGenerativeAI
             llm = ChatGoogleGenerativeAI(
-                model=model_name, google_api_key=api_key, temperature=0.1,
+                model=model_name,
+                google_api_key=api_key,
+                temperature=0.1,
             )
-            print("[web_agent] 📦 Using plain ChatGoogleGenerativeAI")
+            print("[web_agent] 📦 Using plain ChatGoogleGenerativeAI (fallback)")
         except Exception as e:
             llm_errors.append(f"plain approach: {e}")
 
@@ -300,34 +244,15 @@ async def _run_agent(
             "\n\nTry: pip install --upgrade browser-use langchain-google-genai"
         )
 
-    # OpenRouter fallback (used when Gemini daily quota is exhausted)
-    if or_fallback_model:
-        _or_llm_cache = _make_openrouter_llm_safe(or_fallback_model)
-        if _or_llm_cache:
-            print(f"[web_agent] 📦 OpenRouter tertiary fallback ready")
-
     # Set up the browser
     try:
         if BrowserConfig is not None:
-            # Build config kwargs — try to set keep_alive if the BrowserConfig
-            # of this browser-use version supports it.
-            cfg_kwargs = {
-                "headless": headless,
+            browser_config = BrowserConfig(
+                headless=headless,
                 # Use a fresh profile so we don't interfere with the user's
                 # main browser session (cookies, logins, etc.)
-                "disable_security": False,
-            }
-            # Try to add keep_alive — not all browser-use versions support it
-            # at the BrowserConfig level (older versions only have it on Agent)
-            try:
-                # Test if the parameter exists
-                test_cfg = BrowserConfig(headless=headless, keep_alive=True)
-                cfg_kwargs["keep_alive"] = keep_browser_open
-            except (TypeError, Exception):
-                # keep_alive not a valid param — skip it (will be handled below)
-                pass
-
-            browser_config = BrowserConfig(**cfg_kwargs)
+                disable_security=False,
+            )
             browser = Browser(config=browser_config)
         else:
             # Older/newer API without BrowserConfig — pass headless as kwarg
@@ -338,122 +263,6 @@ async def _run_agent(
                 browser = Browser()
     except Exception as e:
         return f"Could not initialise browser: {e}"
-
-    # ── Critical: prevent browser-use from closing the browser ──
-    # When the agent finishes (calls the 'done' action), browser-use internally
-    # triggers a BrowserStopEvent → session.reset(force=True) → session.close()
-    # This happens BEFORE our finally block runs, so the browser is already
-    # closed by the time we try to keep it open.
-    #
-    # Solution: monkey-patch the close() method on the Browser and its
-    # BrowserSession to be no-ops when keep_browser_open=True. We keep a
-    # reference to the original close method so we can force-close on
-    # timeout/error.
-    #
-    # COMPATIBILITY NOTE: browser-use uses Pydantic v2 models with
-    # validate_assignment=True, which means setting an attribute via
-    # `obj.attr = value` triggers validation and rejects unknown attributes
-    # (like 'close'). We bypass this by using object.__setattr__().
-    _original_close_methods = []  # list of (obj, name, original_method)
-
-    def _patch_method(obj, name, new_method):
-        """Set an attribute on a (possibly Pydantic) object, bypassing validation.
-
-        Tries three strategies in order:
-          1. setattr() — works for non-Pydantic objects
-          2. object.__setattr__() — bypasses Pydantic's __setattr__ override
-          3. Class-level patch — sets the method on the class itself
-             (affects all instances, but we accept this trade-off)
-
-        Returns the original method (so we can restore it later) or None on
-        failure.
-        """
-        original = getattr(obj, name, None)
-
-        # Strategy 1: regular setattr (works for non-Pydantic)
-        try:
-            setattr(obj, name, new_method)
-            return original
-        except Exception:
-            pass
-
-        # Strategy 2: object.__setattr__ (bypasses Pydantic validation)
-        try:
-            object.__setattr__(obj, name, new_method)
-            return original
-        except (AttributeError, TypeError):
-            pass
-
-        # Strategy 3: class-level patch
-        try:
-            cls = type(obj)
-            setattr(cls, name, new_method)
-            # Note: this affects ALL instances, but for browser-use we only
-            # run one agent at a time per process, so it's acceptable.
-            return original
-        except (AttributeError, TypeError):
-            return None
-
-    if keep_browser_open:
-        async def _noop_close(*args, **kwargs):
-            # Silently swallow close calls from browser-use internals
-            pass
-
-        # Patch browser.close
-        orig = _patch_method(browser, "close", _noop_close)
-        if orig is not None:
-            _original_close_methods.append(("browser", "close", orig))
-            print("[web_agent] 🔒 Patched browser.close → no-op")
-        else:
-            print("[web_agent] ⚠️ Could not patch browser.close")
-
-        # Patch session.close and session.reset (browser-use v0.13+ uses
-        # BrowserSession internally). Try multiple attribute names since the
-        # API has changed across versions.
-        for sess_attr in ("_session", "session", "_browser_session",
-                          "browser_session", "_manager"):
-            sess = getattr(browser, sess_attr, None)
-            if sess is None:
-                continue
-
-            # Patch close()
-            if hasattr(sess, "close"):
-                orig_close = _patch_method(sess, "close", _noop_close)
-                if orig_close is not None:
-                    _original_close_methods.append((sess_attr, "close", orig_close))
-                    print(f"[web_agent] 🔒 Patched {sess_attr}.close → no-op")
-
-            # Patch reset() — this is the method that triggers close() when
-            # the agent finishes. We force keep_alive=True so it doesn't close.
-            if hasattr(sess, "reset"):
-                original_reset = sess.reset
-
-                async def _safe_reset(*args, _orig=original_reset, **kwargs):
-                    # Force keep_alive=True so reset doesn't close the browser
-                    kwargs["keep_alive"] = True
-                    return await _orig(*args, **kwargs)
-
-                if _patch_method(sess, "reset", _safe_reset) is not None:
-                    print(f"[web_agent] 🔒 Patched {sess_attr}.reset → keep_alive=True")
-            break  # only patch the first session found
-
-    async def _force_close_browser():
-        """Call the original close methods to actually close the browser.
-        Used on timeout/error when we need to clean up."""
-        for obj_name, method_name, original_method in _original_close_methods:
-            try:
-                # Find the current object reference
-                if obj_name == "browser":
-                    obj = browser
-                else:
-                    obj = getattr(browser, obj_name, None)
-                if obj is None:
-                    continue
-                result = original_method()
-                if hasattr(result, "__await__"):
-                    await result
-            except Exception:
-                pass
 
     if speak:
         speak(f"Starting web agent, sir. Task: {task[:80]}")
@@ -472,166 +281,39 @@ async def _run_agent(
         if speak and step % 5 == 0:
             speak(f"Step {step} of {max_steps}, sir.")
 
-    # Build the agent — try with use_vision first, fall back if API changes.
-    # Pass fallback_llm if available — browser-use v0.13+ supports it and will
-    # automatically switch to it when the primary LLM returns 429.
+    # Build the agent — try with use_vision first, fall back if API changes
     agent = None
-
-    # Build a list of (kwargs_dict, label) to try in order, from most-features
-    # to least. We don't pre-test with a fake agent because that's unreliable
-    # (some kwargs are accepted at construction but only validated at run time).
-    candidate_kwargs = [
-        # Full kwargs (browser-use v0.13+)
-        {
-            "task": task, "llm": llm, "browser": browser,
-            "use_vision": use_vision, "max_steps": max_steps,
-            "fallback_llm": fallback_llm,
-        },
-        # Without fallback_llm
-        {
-            "task": task, "llm": llm, "browser": browser,
-            "use_vision": use_vision, "max_steps": max_steps,
-        },
-        # Without max_steps
-        {
-            "task": task, "llm": llm, "browser": browser,
-            "use_vision": use_vision,
-            "fallback_llm": fallback_llm,
-        },
-        # Without use_vision
-        {
-            "task": task, "llm": llm, "browser": browser,
-            "max_steps": max_steps,
-            "fallback_llm": fallback_llm,
-        },
-        # Bare minimum
-        {"task": task, "llm": llm, "browser": browser},
-    ]
-
-    for kwargs in candidate_kwargs:
-        # Skip None values (e.g. fallback_llm might be None if creation failed)
-        clean_kwargs = {k: v for k, v in kwargs.items() if v is not None}
+    try:
+        agent = Agent(
+            task=task,
+            llm=llm,
+            browser=browser,
+            use_vision=use_vision,
+            max_steps=max_steps,
+        )
+    except TypeError:
+        # Older browser-use versions don't have use_vision / max_steps
         try:
-            agent = Agent(**clean_kwargs)
-            accepted = list(clean_kwargs.keys())
-            print(f"[web_agent] 📦 Agent created with kwargs: {accepted}")
-            break
-        except (TypeError, Exception) as e:
-            continue
-
-    if agent is None:
-        try:
-            await _force_close_browser()
-        except Exception:
-            pass
-        return "Could not create agent (incompatible browser-use API)."
+            agent = Agent(
+                task=task,
+                llm=llm,
+                browser=browser,
+            )
+        except Exception as e:
+            await browser.close()
+            return f"Could not create agent: {e}"
+    except Exception as e:
+        await browser.close()
+        return f"Could not create agent: {e}"
 
     print(f"[web_agent] 🌐 Running agent (max_steps={max_steps})...")
 
-    def _result_contains_429(result) -> bool:
-        """Check if the agent's result indicates a 429 quota error.
-
-        browser-use v0.13 does NOT raise an exception on 429 — it logs
-        'Stopping due to 5 consecutive failures' and returns an ActionResult
-        with the error message in it. We have to inspect the result string.
-        """
-        try:
-            result_str = str(result)
-            return ("429" in result_str or
-                    "RESOURCE_EXHAUSTED" in result_str or
-                    "quota" in result_str.lower())
-        except Exception:
-            return False
-
-    # Get the OpenRouter LLM cache (set during LLM init above, may be None)
-    or_llm_for_retry = locals().get("_or_llm_cache", None)
-
     try:
-        # Run with overall timeout.
-        #
-        # RETRY STRATEGY on 429 (Gemini daily quota exhausted):
-        #   Attempt 1: try Gemini primary + fallback
-        #     ↓ 429 in result
-        #   Attempt 2: IMMEDIATELY switch to OpenRouter (no 60s wait — the wait
-        #     kills the Jarvis Live API session with keepalive timeout)
-        #     ↓ OpenRouter has no daily quota → should succeed
-        #   Attempt 3: last resort, retry OpenRouter with brief delay
-        result = None
-        max_outer_retries = 3
-        current_agent = agent
-        for attempt in range(1, max_outer_retries + 1):
-            try:
-                result = await asyncio.wait_for(
-                    current_agent.run(max_steps=max_steps),
-                    timeout=TASK_TIMEOUT_SEC,
-                )
-                # Check if the result indicates a 429 (browser-use doesn't raise)
-                if _result_contains_429(result) and attempt < max_outer_retries:
-                    print(f"[web_agent] ⚠️ 429 quota error in result (attempt {attempt}/{max_outer_retries})")
-                    # If we have an OpenRouter fallback, switch to it IMMEDIATELY.
-                    # Don't wait 60s — Gemini daily quota won't reset in 60s,
-                    # and the wait kills the Jarvis Live API session.
-                    if or_llm_for_retry is not None:
-                        print(f"[web_agent] 🔄 Switching to OpenRouter LLM immediately "
-                              f"(Gemini daily quota exhausted)")
-                        if speak:
-                            speak("Switching to OpenRouter, sir. Gemini quota is exhausted.")
-                        try:
-                            current_agent = Agent(
-                                task=task,
-                                llm=or_llm_for_retry,
-                                browser=browser,
-                                use_vision=False,
-                                max_steps=max_steps,
-                            )
-                            print("[web_agent] ✅ Agent recreated with OpenRouter LLM")
-                        except Exception as e:
-                            print(f"[web_agent] ⚠️ Could not recreate agent with OpenRouter: {e}")
-                            # Brief delay before next retry
-                            await asyncio.sleep(5)
-                    else:
-                        # No OpenRouter fallback — wait and retry
-                        print(f"[web_agent]    Waiting {RETRY_DELAY_ON_429}s before retry...")
-                        if speak:
-                            speak(f"Hit the rate limit, sir. Waiting {RETRY_DELAY_ON_429} seconds before retrying.")
-                        await asyncio.sleep(RETRY_DELAY_ON_429)
-                    continue
-                break  # success (or final retry)
-            except asyncio.TimeoutError:
-                raise  # let the outer except handle it
-            except Exception as run_err:
-                err_str = str(run_err)
-                # Check if it's a 429 quota error (raised by some versions)
-                if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str or
-                    "quota" in err_str.lower()):
-                    if attempt < max_outer_retries:
-                        print(f"[web_agent] ⚠️ 429 quota error (attempt {attempt}/{max_outer_retries})")
-                        if or_llm_for_retry is not None:
-                            print(f"[web_agent] 🔄 Switching to OpenRouter LLM immediately")
-                            if speak:
-                                speak("Switching to OpenRouter, sir.")
-                            try:
-                                current_agent = Agent(
-                                    task=task,
-                                    llm=or_llm_for_retry,
-                                    browser=browser,
-                                    use_vision=False,
-                                    max_steps=max_steps,
-                                )
-                            except Exception as e:
-                                print(f"[web_agent] ⚠️ Could not recreate agent: {e}")
-                                await asyncio.sleep(5)
-                        else:
-                            print(f"[web_agent]    Waiting {RETRY_DELAY_ON_429}s before retry...")
-                            if speak:
-                                speak(f"Hit the rate limit, sir. Waiting {RETRY_DELAY_ON_429} seconds.")
-                            await asyncio.sleep(RETRY_DELAY_ON_429)
-                        continue
-                # Not a 429, or last attempt — re-raise
-                raise
-
-        if result is None:
-            return "Web agent did not produce a result after retries."
+        # Run with overall timeout
+        result = await asyncio.wait_for(
+            agent.run(max_steps=max_steps),
+            timeout=TASK_TIMEOUT_SEC,
+        )
 
         # Extract the final result — browser-use API has evolved, so be flexible
         summary = None
@@ -664,25 +346,11 @@ async def _run_agent(
 
         # Last resort
         if not summary:
-            # If the result string contains the 429 error, surface it clearly
-            try:
-                result_str = str(result)
-                if "429" in result_str or "RESOURCE_EXHAUSTED" in result_str:
-                    summary = (
-                        "Web agent hit the Gemini free-tier rate limit and could "
-                        "not complete the task. This is a daily quota issue — "
-                        "waiting won't help. Try again tomorrow, switch to a paid "
-                        "Gemini plan, or use OpenRouter via the web_agent_fallback_model "
-                        "config option. Original error: " + result_str[:500]
-                    )
-                else:
-                    steps_done = step_counter[0]
-                    summary = (
-                        f"Web agent completed after {steps_done} step(s). "
-                        "No explicit final result was returned."
-                    )
-            except Exception:
-                summary = "Web agent completed with no final result."
+            steps_done = step_counter[0]
+            summary = (
+                f"Web agent completed after {steps_done} step(s). "
+                "No explicit final result was returned."
+            )
 
         # Check for errors
         errors = []
@@ -699,44 +367,19 @@ async def _run_agent(
         return summary.strip() or "Task completed."
 
     except asyncio.TimeoutError:
-        # On timeout, force-close the browser regardless of keep_browser_open
-        # (a hung task shouldn't leave a zombie browser running)
-        try:
-            await _force_close_browser()
-        except Exception:
-            pass
-        if speak:
-            speak("Web agent timed out, sir.")
         return (
             f"Web agent timed out after {TASK_TIMEOUT_SEC}s "
             f"(completed {step_counter[0]} steps)."
         )
     except Exception as e:
         traceback.print_exc()
-        # On error, also close the browser
-        try:
-            await _force_close_browser()
-        except Exception:
-            pass
-        if speak:
-            speak("Web agent encountered an error, sir.")
         return f"Web agent failed: {e}"
     finally:
-        # If the task succeeded and keep_browser_open is True, do NOT close
-        # the browser — let the user inspect the final page manually.
-        # The asyncio task will terminate normally; the browser process
-        # keeps running until the user closes the window.
-        #
-        # Note: browser-use's internal close calls have been monkey-patched
-        # to no-ops, so even if it tries to close the browser when the agent
-        # finishes, nothing will happen. The browser stays open.
-        if not keep_browser_open:
-            try:
-                await _force_close_browser()
-            except Exception:
-                pass
-        else:
-            print("[web_agent] 🌐 Browser left open for inspection (close manually when done)")
+        # Always close the browser
+        try:
+            await browser.close()
+        except Exception:
+            pass
         if speak:
             speak("Web agent finished, sir.")
 
@@ -753,13 +396,10 @@ def web_agent(
     """Main entry point for the web_agent tool.
 
     Parameters (in `parameters` dict):
-        task:               Natural language description of what to accomplish on the web.
-        max_steps:          Optional limit on agent iterations (default: from config or 30).
-        headless:           Optional bool — run browser without UI (default: false).
-        use_vision:         Optional bool — use vision-capable LLM (default: true).
-        keep_browser_open:  Optional bool — leave the browser open after the task
-                            completes so the user can inspect the result
-                            (default: true).
+        task:       Natural language description of what to accomplish on the web.
+        max_steps:  Optional limit on agent iterations (default: from config or 30).
+        headless:   Optional bool — run browser without UI (default: false).
+        use_vision: Optional bool — use vision-capable LLM (default: true).
 
     Returns:
         A summary of what the agent accomplished.
@@ -789,17 +429,11 @@ def web_agent(
     else:
         use_vision = str(vision_param).lower() in ("true", "1", "yes")
 
-    keep_open_param = params.get("keep_browser_open")
-    if keep_open_param is None:
-        keep_browser_open = _get_keep_browser_open()
-    else:
-        keep_browser_open = str(keep_open_param).lower() in ("true", "1", "yes")
-
     if player:
         player.write_log(f"[web_agent] starting: {task[:80]}")
 
     print(f"[web_agent] 🌐 Task: {task[:120]}")
-    print(f"[web_agent]    max_steps={max_steps} headless={headless} vision={use_vision} keep_open={keep_browser_open}")
+    print(f"[web_agent]    max_steps={max_steps} headless={headless} vision={use_vision}")
 
     # Progress callback — write to UI log
     def _progress(step: int, total: int):
@@ -815,7 +449,6 @@ def web_agent(
             max_steps=max_steps,
             headless=headless,
             use_vision=use_vision,
-            keep_browser_open=keep_browser_open,
             speak=speak,
             progress_callback=_progress,
         ))
@@ -833,7 +466,6 @@ def web_agent(
                         max_steps=max_steps,
                         headless=headless,
                         use_vision=use_vision,
-                        keep_browser_open=keep_browser_open,
                         speak=speak,
                         progress_callback=_progress,
                     ))

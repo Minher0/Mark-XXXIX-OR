@@ -1065,6 +1065,10 @@ class SetupOverlay(QWidget):
             self._or_input.setPlaceholderText("Enter your REAL OpenRouter key...")
             return
 
+        # Basic format validation — warn but don't block
+        # Gemini keys typically start with 'AIza', but other formats (OAuth, etc.) also work
+        # OpenRouter keys typically start with 'sk-or-', but format may vary
+
         discord_token = self._discord_input.text().strip()
         self.done.emit(key, or_key, self._sel_os, discord_token)
 

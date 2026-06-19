@@ -26,4 +26,3 @@ pywinauto
 # Web agent (autonomous browsing via browser-use + Gemini)
 browser-use
 langchain-google-genai
-langchain-openai

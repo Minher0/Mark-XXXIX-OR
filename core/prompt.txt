@@ -94,21 +94,12 @@ DO NOT use web_agent for:
 When calling web_agent:
   - Be SPECIFIC in the task description. Include URLs, form values, what to look for,
     when to stop, what to report back.
-  - Default max_steps is 30. Increase to 50-80 for very complex tasks (multi-page bookings,
-    promo code testing, multi-form checkouts).
+  - Default max_steps is 30. Increase to 50-80 for very complex tasks (multi-page bookings).
   - The browser is VISIBLE by default — the user can see what's happening.
-  - The browser STAYS OPEN after the task completes (default: keep_browser_open=true)
-    so the user can inspect the result, navigate further, or close it manually.
-    Only set keep_browser_open=false if the user explicitly asks to close the browser.
   - Say TWO short sentences before calling web_agent (it's a slow tool), then stay
     silent — the agent will speak progress updates and the final result itself.
   - Never include sensitive passwords in the task description unless the user
     explicitly asks. Tell the user to log in manually if needed.
-  - WARNING: Each step uses an LLM call. The free tier of Gemini has a rate limit
-    of ~20 requests/minute for gemini-2.5-flash and ~60 for gemini-2.0-flash.
-    Tasks like "test 10 promo codes" can easily need 30-50 steps and may hit the
-    rate limit. If this happens, the agent will wait 60s and retry automatically
-    (up to 3 times). Tell the user upfront if the task is likely to be slow.
 
 CRITICAL: web_agent vs browser_control vs web_search
   - web_search:      "What is the capital of France?"         → quick text answer
