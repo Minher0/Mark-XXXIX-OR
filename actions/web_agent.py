@@ -300,7 +300,50 @@ async def _run_agent(
     # BrowserSession to be no-ops when keep_browser_open=True. We keep a
     # reference to the original close method so we can force-close on
     # timeout/error.
+    #
+    # COMPATIBILITY NOTE: browser-use uses Pydantic v2 models with
+    # validate_assignment=True, which means setting an attribute via
+    # `obj.attr = value` triggers validation and rejects unknown attributes
+    # (like 'close'). We bypass this by using object.__setattr__().
     _original_close_methods = []  # list of (obj, name, original_method)
+
+    def _patch_method(obj, name, new_method):
+        """Set an attribute on a (possibly Pydantic) object, bypassing validation.
+
+        Tries three strategies in order:
+          1. setattr() — works for non-Pydantic objects
+          2. object.__setattr__() — bypasses Pydantic's __setattr__ override
+          3. Class-level patch — sets the method on the class itself
+             (affects all instances, but we accept this trade-off)
+
+        Returns the original method (so we can restore it later) or None on
+        failure.
+        """
+        original = getattr(obj, name, None)
+
+        # Strategy 1: regular setattr (works for non-Pydantic)
+        try:
+            setattr(obj, name, new_method)
+            return original
+        except Exception:
+            pass
+
+        # Strategy 2: object.__setattr__ (bypasses Pydantic validation)
+        try:
+            object.__setattr__(obj, name, new_method)
+            return original
+        except (AttributeError, TypeError):
+            pass
+
+        # Strategy 3: class-level patch
+        try:
+            cls = type(obj)
+            setattr(cls, name, new_method)
+            # Note: this affects ALL instances, but for browser-use we only
+            # run one agent at a time per process, so it's acceptable.
+            return original
+        except (AttributeError, TypeError):
+            return None
 
     if keep_browser_open:
         async def _noop_close(*args, **kwargs):
@@ -308,43 +351,41 @@ async def _run_agent(
             pass
 
         # Patch browser.close
-        try:
-            _original_close_methods.append(("browser", "close", browser.close))
-            browser.close = _noop_close
+        orig = _patch_method(browser, "close", _noop_close)
+        if orig is not None:
+            _original_close_methods.append(("browser", "close", orig))
             print("[web_agent] 🔒 Patched browser.close → no-op")
-        except (AttributeError, TypeError) as e:
-            print(f"[web_agent] ⚠️ Could not patch browser.close: {e}")
+        else:
+            print("[web_agent] ⚠️ Could not patch browser.close")
 
-        # Patch session.close (browser-use v0.13+ uses BrowserSession internally)
-        # Try multiple attribute names since the API has changed across versions
+        # Patch session.close and session.reset (browser-use v0.13+ uses
+        # BrowserSession internally). Try multiple attribute names since the
+        # API has changed across versions.
         for sess_attr in ("_session", "session", "_browser_session",
                           "browser_session", "_manager"):
             sess = getattr(browser, sess_attr, None)
             if sess is None:
                 continue
-            try:
-                if hasattr(sess, "close"):
-                    _original_close_methods.append(
-                        (sess_attr, "close", sess.close)
-                    )
-                    sess.close = _noop_close
-                    print(f"[web_agent] 🔒 Patched {sess_attr}.close → no-op")
-            except (AttributeError, TypeError):
-                continue
 
-            # Also try to patch reset() to always pass keep_alive=True.
-            # This is the method that actually triggers close() internally.
+            # Patch close()
+            if hasattr(sess, "close"):
+                orig_close = _patch_method(sess, "close", _noop_close)
+                if orig_close is not None:
+                    _original_close_methods.append((sess_attr, "close", orig_close))
+                    print(f"[web_agent] 🔒 Patched {sess_attr}.close → no-op")
+
+            # Patch reset() — this is the method that triggers close() when
+            # the agent finishes. We force keep_alive=True so it doesn't close.
             if hasattr(sess, "reset"):
-                try:
-                    original_reset = sess.reset
-                    async def _safe_reset(*args, _orig=original_reset, **kwargs):
-                        # Force keep_alive=True so reset doesn't close the browser
-                        kwargs["keep_alive"] = True
-                        return await _orig(*args, **kwargs)
-                    sess.reset = _safe_reset
+                original_reset = sess.reset
+
+                async def _safe_reset(*args, _orig=original_reset, **kwargs):
+                    # Force keep_alive=True so reset doesn't close the browser
+                    kwargs["keep_alive"] = True
+                    return await _orig(*args, **kwargs)
+
+                if _patch_method(sess, "reset", _safe_reset) is not None:
                     print(f"[web_agent] 🔒 Patched {sess_attr}.reset → keep_alive=True")
-                except (AttributeError, TypeError):
-                    pass
             break  # only patch the first session found
 
     async def _force_close_browser():
