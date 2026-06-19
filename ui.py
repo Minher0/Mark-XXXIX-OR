@@ -1500,7 +1500,10 @@ class MainWindow(QMainWindow):
         self._wake_word = checked
         jarvis = getattr(self, '_jarvis', None)
         if not jarvis:
-            print("[UI] ⚠️ Jarvis not ready yet — wake word will activate on next connect")
+            # Jarvis not ready yet — store the flag, it will be applied
+            # when JarvisLive starts
+            print("[UI] ⚠️ Jarvis not ready — wake word will activate on startup")
+            self._log.append_log("SYS: Wake word enabled. Will activate when Jarvis connects.")
             return
         if checked:
             self._log.append_log("SYS: Wake word enabled. Initialising...")

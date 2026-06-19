@@ -721,6 +721,11 @@ class JarvisLive:
         self.ui.on_text_command = self._on_text_command
         self.ui._jarvis = self  # give UI a reference for reconnect triggers
 
+        # If wake word was enabled before Jarvis was ready, start it now
+        if getattr(self.ui, '_wake_word', False):
+            print("[JARVIS] 🔇 Wake word was pre-enabled — starting detector...")
+            self.start_wake_detector()
+
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
             return
@@ -1440,6 +1445,8 @@ def main():
     def runner():
         ui.wait_for_api_key()
         jarvis = JarvisLive(ui)
+        ui._jarvis = jarvis  # NOW the UI can trigger wake word
+        print("[JARVIS] ✅ Jarvis ready — UI controls now active")
         try:
             asyncio.run(jarvis.run())
         except KeyboardInterrupt:
