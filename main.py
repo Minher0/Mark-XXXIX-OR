@@ -739,42 +739,51 @@ class JarvisLive:
     def start_wake_detector(self):
         """Start the local wake word detector (when wake word mode is enabled).
 
-        If Vosk is available (with model), uses local detection + mic gating
-        (zero API quota when idle).
-        If Vosk is NOT available, falls back to filter mode: mic stays open
-        to Gemini but output is suppressed unless "Jarvis" is in the
-        transcription (uses API quota but still works).
+        Runs in a background thread to avoid blocking the UI (Vosk model
+        download can take 30+ seconds).
         """
         if self._wake_detector is not None:
             return  # already running
+        print("[JARVIS] 🔇 Wake word: initialising detector (background)...")
+        threading.Thread(
+            target=self._init_wake_detector_async,
+            daemon=True,
+            name="wake-word-init"
+        ).start()
+
+    def _init_wake_detector_async(self):
+        """Initialise the wake word detector in a background thread."""
         try:
             from wake_word import WakeWordDetector
             detector = WakeWordDetector(
                 on_detected=self._on_wake_word_detected
             )
-            # Check if we got a real recognition engine (not energy fallback)
             detector._init_engine()
-            if detector._engine_type in ("vosk", "sr"):
+            engine_type = detector._engine_type
+
+            if engine_type in ("vosk", "sr"):
                 # Real engine available — use local detection (zero quota)
                 self._wake_detector = detector
                 detector.start()
                 self._is_wake_active = False  # mic gated until "Jarvis" heard
-                print(f"[JARVIS] 🔇 Wake word: local {detector._engine_type} engine active, "
+                print(f"[JARVIS] 🔇 Wake word: local {engine_type} engine active, "
                       f"mic gated (0 API calls when idle)")
                 self.ui.write_log("SYS: Wake word active (local). Say 'Jarvis' to talk.")
             else:
                 # No real engine — use filter mode (suppress_output)
                 print("[JARVIS] ⚠️ No local wake word engine — using filter mode")
                 print("[JARVIS] ⚠️ Mic stays open to Gemini, output suppressed unless 'Jarvis' heard")
-                self._wake_detector = None  # don't start the energy detector
+                self._wake_detector = None
                 self._is_wake_active = True  # keep mic open, rely on suppress_output
                 self.ui.write_log("SYS: Wake word filter mode. Say 'Jarvis' to get a response.")
         except Exception as e:
-            print(f"[JARVIS] ⚠️ Could not start wake word detector: {e}")
-            print("[JARVIS] ⚠️ Using filter mode (suppress output unless 'Jarvis' heard)")
+            print(f"[JARVIS] ⚠️ Wake word init failed: {e}")
+            import traceback
+            traceback.print_exc()
+            # Fall back to filter mode
             self._wake_detector = None
-            self._is_wake_active = True  # keep mic open, rely on suppress_output
-            self.ui.write_log(f"SYS: Wake word filter mode. Say 'Jarvis' to talk.")
+            self._is_wake_active = True
+            self.ui.write_log(f"SYS: Wake word filter mode (init error). Say 'Jarvis' to talk.")
 
     def stop_wake_detector(self):
         """Stop the local wake word detector (when wake word mode is disabled)."""

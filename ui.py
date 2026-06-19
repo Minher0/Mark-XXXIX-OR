@@ -1496,24 +1496,21 @@ class MainWindow(QMainWindow):
             self._log.append_log("SYS: Microphone active.")
 
     def _toggle_wake_word(self, checked: bool):
-        """Toggle wake word mode.
-
-        When ON: a local wake word detector listens for 'Jarvis'. The mic
-        stream to Gemini is cut — no API quota used while idle. When the
-        detector hears 'Jarvis', the mic opens to Gemini for 30 seconds.
-        When OFF (default): Jarvis always listens, as before.
-        """
+        """Toggle wake word mode."""
         self._wake_word = checked
         jarvis = getattr(self, '_jarvis', None)
-        if jarvis:
-            if checked:
-                self._log.append_log("SYS: Wake word enabled. Say 'Jarvis' to talk.")
-                jarvis.start_wake_detector()
-            else:
-                self._log.append_log("SYS: Wake word disabled. Always listening.")
-                jarvis.stop_wake_detector()
-                # Reconnect to reset the system prompt
-                jarvis._needs_reconnect = True
+        if not jarvis:
+            print("[UI] ⚠️ Jarvis not ready yet — wake word will activate on next connect")
+            return
+        if checked:
+            self._log.append_log("SYS: Wake word enabled. Initialising...")
+            print("[UI] Wake word checkbox checked — starting detector...")
+            jarvis.start_wake_detector()
+        else:
+            self._log.append_log("SYS: Wake word disabled. Always listening.")
+            print("[UI] Wake word checkbox unchecked — stopping detector...")
+            jarvis.stop_wake_detector()
+            jarvis._needs_reconnect = True
 
     def _force_reconnect(self):
         """Force Jarvis to reconnect (picks up new system prompt settings)."""
