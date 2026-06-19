@@ -869,7 +869,7 @@ def _is_placeholder(value: str) -> bool:
 
 
 class SetupOverlay(QWidget):
-    done = pyqtSignal(str, str, str, str)
+    done = pyqtSignal(str, str, str, str, list)  # key, or_key, os, discord_token, extra_gemini_keys
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -931,6 +931,46 @@ class SetupOverlay(QWidget):
                 self._key_input.setText(val)
         except Exception:
             pass
+        layout.addSpacing(4)
+
+        # ── Additional Gemini API keys (quota pooling) ──
+        self._extra_gemini_keys = []  # list of QLineEdit widgets
+
+        extra_keys_row = QHBoxLayout()
+        extra_keys_row.setSpacing(6)
+        lbl_extra = _lbl("+ EXTRA GEMINI KEYS (pool quota)", 7,
+                         color=C.TEXT_DIM, align=Qt.AlignmentFlag.AlignLeft)
+        add_key_btn = QPushButton("＋ Add")
+        add_key_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        add_key_btn.setFixedHeight(24)
+        add_key_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_key_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {C.GREEN};
+                border: 1px solid {C.GREEN_D}; border-radius: 3px;
+                padding: 2px 8px;
+            }}
+            QPushButton:hover {{ background: #001a0d; border: 1px solid {C.GREEN}; }}
+        """)
+        add_key_btn.clicked.connect(lambda: self._add_extra_gemini_key())
+        extra_keys_row.addWidget(lbl_extra)
+        extra_keys_row.addWidget(add_key_btn)
+        extra_keys_row.addStretch()
+        layout.addLayout(extra_keys_row)
+
+        self._extra_keys_container = QVBoxLayout()
+        self._extra_keys_container.setSpacing(4)
+        layout.addLayout(self._extra_keys_container)
+
+        # Pre-fill existing extra keys from config
+        try:
+            _existing = json.loads(API_FILE.read_text(encoding="utf-8"))
+            for k in _existing.get("gemini_api_keys", []):
+                if k and not _is_placeholder(k):
+                    self._add_extra_gemini_key(k)
+        except Exception:
+            pass
+
         layout.addSpacing(8)
 
         layout.addWidget(_lbl("OPENROUTER API KEY", 8, color=C.TEXT_DIM,
@@ -1045,6 +1085,54 @@ class SetupOverlay(QWidget):
                     QPushButton:hover {{ color: {C.TEXT}; border: 1px solid {C.BORDER_B}; }}
                 """)
 
+    def _add_extra_gemini_key(self, prefill: str = ""):
+        """Add a new extra Gemini API key input row with a remove button."""
+        row_widget = QWidget()
+        row_layout = QHBoxLayout(row_widget)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(4)
+
+        key_input = QLineEdit()
+        key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        key_input.setPlaceholderText(f"Additional Gemini key #{len(self._extra_gemini_keys) + 2}...")
+        key_input.setFont(QFont("Courier New", 9))
+        key_input.setFixedHeight(28)
+        key_input.setStyleSheet(f"""
+            QLineEdit {{
+                background: #000d12; color: {C.TEXT};
+                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 2px 6px;
+            }}
+            QLineEdit:focus {{ border: 1px solid {C.GREEN}; }}
+        """)
+        if prefill:
+            key_input.setText(prefill)
+        row_layout.addWidget(key_input)
+
+        remove_btn = QPushButton("－")
+        remove_btn.setFixedSize(28, 28)
+        remove_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        remove_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {C.RED};
+                border: 1px solid #330011; border-radius: 3px;
+                font-weight: bold; font-size: 14px;
+            }}
+            QPushButton:hover {{ background: #1a0008; border: 1px solid {C.RED}; }}
+        """)
+
+        def _remove():
+            self._extra_keys_container.removeWidget(row_widget)
+            row_widget.deleteLater()
+            self._extra_gemini_keys = [
+                (w, r) for w, r in self._extra_gemini_keys if w is not key_input
+            ]
+
+        remove_btn.clicked.connect(_remove)
+        row_layout.addWidget(remove_btn)
+
+        self._extra_keys_container.addWidget(row_widget)
+        self._extra_gemini_keys.append((key_input, row_widget))
+
     def _submit(self):
         key = self._key_input.text().strip()
         or_key = self._or_input.text().strip()
@@ -1065,12 +1153,15 @@ class SetupOverlay(QWidget):
             self._or_input.setPlaceholderText("Enter your REAL OpenRouter key...")
             return
 
-        # Basic format validation — warn but don't block
-        # Gemini keys typically start with 'AIza', but other formats (OAuth, etc.) also work
-        # OpenRouter keys typically start with 'sk-or-', but format may vary
+        # Collect extra Gemini keys (filter empty and placeholders)
+        extra_keys = []
+        for key_input, _ in self._extra_gemini_keys:
+            val = key_input.text().strip()
+            if val and not _is_placeholder(val):
+                extra_keys.append(val)
 
         discord_token = self._discord_input.text().strip()
-        self.done.emit(key, or_key, self._sel_os, discord_token)
+        self.done.emit(key, or_key, self._sel_os, discord_token, extra_keys)
 
 
 class MainWindow(QMainWindow):
@@ -1526,10 +1617,11 @@ class MainWindow(QMainWindow):
         ov.show()
         self._overlay = ov
 
-    def _on_setup_done(self, key: str, or_key: str, os_name: str, discord_token: str = ""):
+    def _on_setup_done(self, key: str, or_key: str, os_name: str, discord_token: str = "", extra_gemini_keys: list = None):
         os.makedirs(CONFIG_DIR, exist_ok=True)
         config = {
             "gemini_api_key":    key,
+            "gemini_api_keys":   extra_gemini_keys or [],
             "openrouter_api_key": or_key,
             "os_system":         os_name,
         }
