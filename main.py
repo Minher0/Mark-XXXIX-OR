@@ -714,7 +714,9 @@ class JarvisLive:
         self._loop          = None
         self._is_speaking   = False
         self._speaking_lock = threading.Lock()
+        self._needs_reconnect = False
         self.ui.on_text_command = self._on_text_command
+        self.ui._jarvis = self  # give UI a reference for reconnect triggers
 
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
@@ -770,6 +772,25 @@ class JarvisLive:
         if mem_str:
             parts.append(mem_str)
         parts.append(sys_prompt)
+
+        # Wake word mode: tell Gemini to only respond when called by name
+        if getattr(self.ui, '_wake_word', False):
+            parts.append(
+                "\n\nWAKE WORD MODE — ACTIVE\n"
+                "You are in wake word mode. The user is having background conversations "
+                "and you are listening in. CRITICAL RULES:\n"
+                "1. ONLY respond if the user's message STARTS with 'Jarvis', "
+                "'Hey Jarvis', 'Jarvis,', 'OK Jarvis', or just 'Jarvis' as the first word.\n"
+                "2. If the user's message does NOT start with your name, you must stay "
+                "COMPLETELY SILENT — do not say anything, do not use any tools, do not "
+                "acknowledge the message in any way. Just produce no audio output.\n"
+                "3. When the user DOES say 'Jarvis', respond normally to their request.\n"
+                "4. Ignore everything else: other people talking, the user thinking out loud, "
+                "background noise, TV, music lyrics, phone conversations, etc.\n"
+                "5. Even if someone asks a direct question that's not addressed to you "
+                "(doesn't start with 'Jarvis'), DO NOT respond.\n"
+                "This is non-negotiable. Staying silent when not addressed is your #1 priority."
+            )
 
         return types.LiveConnectConfig(
             response_modalities=["AUDIO"],
@@ -1016,6 +1037,12 @@ class JarvisLive:
 
         try:
             while True:
+                # Check if UI requested a reconnect (e.g. wake word toggle)
+                if self._needs_reconnect:
+                    self._needs_reconnect = False
+                    print("[JARVIS] 🔄 Reconnect requested by UI (settings changed)")
+                    return  # exit → TaskGroup ends → session closes → run() reconnects
+
                 async for response in self.session.receive():
 
                     if response.data:
