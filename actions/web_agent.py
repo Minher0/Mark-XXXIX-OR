@@ -290,6 +290,81 @@ async def _run_agent(
     except Exception as e:
         return f"Could not initialise browser: {e}"
 
+    # ── Critical: prevent browser-use from closing the browser ──
+    # When the agent finishes (calls the 'done' action), browser-use internally
+    # triggers a BrowserStopEvent → session.reset(force=True) → session.close()
+    # This happens BEFORE our finally block runs, so the browser is already
+    # closed by the time we try to keep it open.
+    #
+    # Solution: monkey-patch the close() method on the Browser and its
+    # BrowserSession to be no-ops when keep_browser_open=True. We keep a
+    # reference to the original close method so we can force-close on
+    # timeout/error.
+    _original_close_methods = []  # list of (obj, name, original_method)
+
+    if keep_browser_open:
+        async def _noop_close(*args, **kwargs):
+            # Silently swallow close calls from browser-use internals
+            pass
+
+        # Patch browser.close
+        try:
+            _original_close_methods.append(("browser", "close", browser.close))
+            browser.close = _noop_close
+            print("[web_agent] 🔒 Patched browser.close → no-op")
+        except (AttributeError, TypeError) as e:
+            print(f"[web_agent] ⚠️ Could not patch browser.close: {e}")
+
+        # Patch session.close (browser-use v0.13+ uses BrowserSession internally)
+        # Try multiple attribute names since the API has changed across versions
+        for sess_attr in ("_session", "session", "_browser_session",
+                          "browser_session", "_manager"):
+            sess = getattr(browser, sess_attr, None)
+            if sess is None:
+                continue
+            try:
+                if hasattr(sess, "close"):
+                    _original_close_methods.append(
+                        (sess_attr, "close", sess.close)
+                    )
+                    sess.close = _noop_close
+                    print(f"[web_agent] 🔒 Patched {sess_attr}.close → no-op")
+            except (AttributeError, TypeError):
+                continue
+
+            # Also try to patch reset() to always pass keep_alive=True.
+            # This is the method that actually triggers close() internally.
+            if hasattr(sess, "reset"):
+                try:
+                    original_reset = sess.reset
+                    async def _safe_reset(*args, _orig=original_reset, **kwargs):
+                        # Force keep_alive=True so reset doesn't close the browser
+                        kwargs["keep_alive"] = True
+                        return await _orig(*args, **kwargs)
+                    sess.reset = _safe_reset
+                    print(f"[web_agent] 🔒 Patched {sess_attr}.reset → keep_alive=True")
+                except (AttributeError, TypeError):
+                    pass
+            break  # only patch the first session found
+
+    async def _force_close_browser():
+        """Call the original close methods to actually close the browser.
+        Used on timeout/error when we need to clean up."""
+        for obj_name, method_name, original_method in _original_close_methods:
+            try:
+                # Find the current object reference
+                if obj_name == "browser":
+                    obj = browser
+                else:
+                    obj = getattr(browser, obj_name, None)
+                if obj is None:
+                    continue
+                result = original_method()
+                if hasattr(result, "__await__"):
+                    await result
+            except Exception:
+                pass
+
     if speak:
         speak(f"Starting web agent, sir. Task: {task[:80]}")
 
@@ -396,7 +471,7 @@ async def _run_agent(
         # On timeout, force-close the browser regardless of keep_browser_open
         # (a hung task shouldn't leave a zombie browser running)
         try:
-            await browser.close()
+            await _force_close_browser()
         except Exception:
             pass
         if speak:
@@ -409,7 +484,7 @@ async def _run_agent(
         traceback.print_exc()
         # On error, also close the browser
         try:
-            await browser.close()
+            await _force_close_browser()
         except Exception:
             pass
         if speak:
@@ -420,9 +495,13 @@ async def _run_agent(
         # the browser — let the user inspect the final page manually.
         # The asyncio task will terminate normally; the browser process
         # keeps running until the user closes the window.
+        #
+        # Note: browser-use's internal close calls have been monkey-patched
+        # to no-ops, so even if it tries to close the browser when the agent
+        # finishes, nothing will happen. The browser stays open.
         if not keep_browser_open:
             try:
-                await browser.close()
+                await _force_close_browser()
             except Exception:
                 pass
         else:
