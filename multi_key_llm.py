@@ -43,6 +43,7 @@ def _make_multi_key_class():
     langchain-google-genai is not installed.
     """
     from langchain_google_genai import ChatGoogleGenerativeAI
+    from pydantic import PrivateAttr
 
     class MultiKeyGeminiLLM(ChatGoogleGenerativeAI):
         """ChatGoogleGenerativeAI subclass that rotates API keys on 429.
@@ -51,36 +52,36 @@ def _make_multi_key_class():
         checks pass. Only overrides _generate and _agenerate to intercept
         429 errors and rotate to the next key before retrying.
 
-        Key rotation strategy:
-          1. On 429, mark the current key as "cooling down" for 60 seconds
-          2. Find the next key that is NOT cooling down
-          3. Swap self.google_api_key to that key
-          4. Retry the call
-          5. If ALL keys are cooling down, use the one with the earliest
-             cooldown expiry
+        Uses Pydantic PrivateAttr for internal state (_keys, _idx, _cooldowns)
+        because ChatGoogleGenerativeAI is a Pydantic v2 model with
+        validate_assignment=True — plain self._keys = ... would be rejected
+        as an unknown field.
         """
 
         # Explicit provider attribute for browser-use compatibility.
-        # Some browser-use versions check llm.provider to know how to
-        # format messages. ChatGoogleGenerativeAI may or may not have it
-        # depending on the langchain-google-genai version, so we set it
-        # explicitly here to be safe.
         provider: str = "google"
+
+        # Private attributes (not validated by Pydantic)
+        _keys: list = PrivateAttr(default_factory=list)
+        _idx: int = PrivateAttr(default=0)
+        _cooldowns: dict = PrivateAttr(default_factory=dict)
 
         def __init__(self, api_keys, model, **kwargs):
             if not api_keys:
                 raise ValueError("MultiKeyGeminiLLM requires at least one API key")
 
-            self._keys = list(api_keys)
-            self._idx = 0
-            self._cooldowns = {}  # key_index -> cooldown_until_timestamp
-
-            # Initialize the parent class with the first key
+            # Initialize the parent class FIRST (Pydantic model init)
             super().__init__(
                 model=model,
-                google_api_key=self._keys[0],
+                google_api_key=api_keys[0],
                 **kwargs,
             )
+
+            # Then set our private attrs (PrivateAttr allows this)
+            self._keys = list(api_keys)
+            self._idx = 0
+            self._cooldowns = {}
+
             print(f"[multi_key_llm] 🔑 Initialized with {len(self._keys)} API key(s)")
 
         def _is_rate_limit_error(self, error) -> bool:
@@ -117,7 +118,7 @@ def _make_multi_key_class():
                     # Force re-creation of the underlying genai Client
                     if hasattr(self, "_client"):
                         try:
-                            delattr(self, "_client")
+                            object.__delattr__(self, "_client")
                         except Exception:
                             pass
                     print(
@@ -140,7 +141,7 @@ def _make_multi_key_class():
             self.google_api_key = self._keys[next_idx]
             if hasattr(self, "_client"):
                 try:
-                    delattr(self, "_client")
+                    object.__delattr__(self, "_client")
                 except Exception:
                     pass
             return False
