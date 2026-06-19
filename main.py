@@ -1306,6 +1306,11 @@ class JarvisLive:
                     self.ui.write_log("SYS: JARVIS online.")
                     reconnect_delay = 3  # Reset on successful connection
 
+                    # Start wake word detector if enabled (handles pre-check case)
+                    if getattr(self.ui, '_wake_word', False) and self._wake_detector is None:
+                        print("[JARVIS] 🔇 Wake word enabled — starting detector...")
+                        self.start_wake_detector()
+
                     tg.create_task(self._send_realtime())
                     tg.create_task(self._listen_audio())
                     tg.create_task(self._receive_audio())
