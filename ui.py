@@ -1143,20 +1143,80 @@ class MainWindow(QMainWindow):
         sc_full = QShortcut(QKeySequence("F11"), self)
         sc_full.activated.connect(self._toggle_fullscreen)
 
-        # F4 push-to-talk via keyPressEvent/keyReleaseEvent (foreground only)
-        # Simple, stable, no extra dependencies, no admin rights needed.
+        # F4 push-to-talk — global hotkey via ctypes (no extra deps, no admin)
+        self._setup_global_f4_ctypes()
+
+    def _setup_global_f4_ctypes(self):
+        """Register F4 as a global hotkey using Windows RegisterHotKey API.
+
+        Uses ctypes (built-in, no pip install needed). Works in background.
+        No admin rights required (RegisterHotKey is per-thread, not system-wide).
+        """
+        try:
+            import ctypes
+            import ctypes.wintypes
+
+            user32 = ctypes.windll.user32
+            # VK_F4 = 0x73
+            # MOD_NOREPEAT = 0x4000 (don't repeat while held)
+            VK_F4 = 0x73
+            MOD_NOREPEAT = 0x4000
+            HOTKEY_ID = 0xB004
+
+            # Register the hotkey
+            result = user32.RegisterHotKey(None, HOTKEY_ID, MOD_NOREPEAT, VK_F4)
+            if result:
+                print("[UI] ✅ Global F4 hotkey registered via RegisterHotKey (works in background)")
+
+                # Start a thread to listen for the WM_HOTKEY message
+                import threading
+
+                def _hotkey_listener():
+                    msg = ctypes.wintypes.MSG()
+                    while user32.GetMessageA(ctypes.byref(msg), None, 0, 0) > 0:
+                        if msg.message == 0x0312:  # WM_HOTKEY
+                            if msg.wParam == HOTKEY_ID:
+                                # F4 pressed — invoke on Qt thread
+                                QTimer.singleShot(0, self._handle_f4_press)
+
+                t = threading.Thread(target=_hotkey_listener, daemon=True, name="F4-Hotkey")
+                t.start()
+
+                # Register F4 release detection via GetAsyncKeyState polling
+                def _f4_release_poller():
+                    import time
+                    was_pressed = False
+                    while True:
+                        time.sleep(0.02)
+                        state = user32.GetAsyncKeyState(VK_F4)
+                        is_pressed = (state & 0x8000) != 0
+                        if was_pressed and not is_pressed:
+                            # F4 was released — invoke on Qt thread
+                            QTimer.singleShot(0, self._handle_f4_release)
+                        was_pressed = is_pressed
+
+                t2 = threading.Thread(target=_f4_release_poller, daemon=True, name="F4-Release")
+                t2.start()
+
+                self._f4_hotkey_registered = True
+            else:
+                print("[UI] ⚠️ RegisterHotKey failed — F4 only works when Jarvis is focused")
+                self._f4_hotkey_registered = False
+        except Exception as e:
+            print(f"[UI] ⚠️ Could not register global F4: {e}")
+            self._f4_hotkey_registered = False
 
     def keyPressEvent(self, event):
-        """F4 press: PTT mode = unmute, normal = toggle mute."""
-        if event.key() == Qt.Key.Key_F4:
+        """F4 press: only handle if global hotkey is NOT registered."""
+        if event.key() == Qt.Key.Key_F4 and not getattr(self, '_f4_hotkey_registered', False):
             self._handle_f4_press()
             event.accept()
         else:
             super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event):
-        """F4 release: PTT mode = schedule mute after 2s delay."""
-        if event.key() == Qt.Key.Key_F4:
+        """F4 release: only handle if global hotkey is NOT registered."""
+        if event.key() == Qt.Key.Key_F4 and not getattr(self, '_f4_hotkey_registered', False):
             self._handle_f4_release()
             event.accept()
         else:
