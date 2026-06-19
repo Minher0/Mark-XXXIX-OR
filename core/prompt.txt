@@ -96,6 +96,9 @@ When calling web_agent:
     when to stop, what to report back.
   - Default max_steps is 30. Increase to 50-80 for very complex tasks (multi-page bookings).
   - The browser is VISIBLE by default — the user can see what's happening.
+  - The browser STAYS OPEN after the task completes (default: keep_browser_open=true)
+    so the user can inspect the result, navigate further, or close it manually.
+    Only set keep_browser_open=false if the user explicitly asks to close the browser.
   - Say TWO short sentences before calling web_agent (it's a slow tool), then stay
     silent — the agent will speak progress updates and the final result itself.
   - Never include sensitive passwords in the task description unless the user

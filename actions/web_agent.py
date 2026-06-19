@@ -46,6 +46,7 @@ DEFAULT_MODEL     = "gemini-2.5-flash"
 DEFAULT_MAX_STEPS = 30
 DEFAULT_HEADLESS  = False    # user can see what JARVIS is doing
 DEFAULT_VISION    = True     # Gemini 2.5 Flash supports vision
+DEFAULT_KEEP_OPEN = True     # keep browser open after task so user can inspect
 MAX_STEPS_CAP     = 100      # safety — prevent runaway agents
 TASK_TIMEOUT_SEC  = 600      # 10 minutes max per task
 
@@ -83,6 +84,11 @@ def _get_use_vision() -> bool:
     return str(val).lower() in ("true", "1", "yes")
 
 
+def _get_keep_browser_open() -> bool:
+    val = _load_config().get("web_agent_keep_browser_open", "true")
+    return str(val).lower() in ("true", "1", "yes")
+
+
 # ─── Async agent runner ────────────────────────────────────
 
 async def _run_agent(
@@ -90,10 +96,17 @@ async def _run_agent(
     max_steps: int,
     headless: bool,
     use_vision: bool,
+    keep_browser_open: bool = True,
     speak: Optional[Callable] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> str:
     """Run the browser-use agent asynchronously.
+
+    Args:
+        keep_browser_open: if True (default), the browser stays open after the
+            task completes so the user can inspect the result. The agent's
+            asyncio task still terminates — the browser just remains visible
+            until the user closes it manually.
 
     Returns the agent's final result as a string.
     """
@@ -247,12 +260,25 @@ async def _run_agent(
     # Set up the browser
     try:
         if BrowserConfig is not None:
-            browser_config = BrowserConfig(
-                headless=headless,
+            # Build config kwargs — try to set keep_alive if the BrowserConfig
+            # of this browser-use version supports it.
+            cfg_kwargs = {
+                "headless": headless,
                 # Use a fresh profile so we don't interfere with the user's
                 # main browser session (cookies, logins, etc.)
-                disable_security=False,
-            )
+                "disable_security": False,
+            }
+            # Try to add keep_alive — not all browser-use versions support it
+            # at the BrowserConfig level (older versions only have it on Agent)
+            try:
+                # Test if the parameter exists
+                test_cfg = BrowserConfig(headless=headless, keep_alive=True)
+                cfg_kwargs["keep_alive"] = keep_browser_open
+            except (TypeError, Exception):
+                # keep_alive not a valid param — skip it (will be handled below)
+                pass
+
+            browser_config = BrowserConfig(**cfg_kwargs)
             browser = Browser(config=browser_config)
         else:
             # Older/newer API without BrowserConfig — pass headless as kwarg
@@ -367,19 +393,40 @@ async def _run_agent(
         return summary.strip() or "Task completed."
 
     except asyncio.TimeoutError:
+        # On timeout, force-close the browser regardless of keep_browser_open
+        # (a hung task shouldn't leave a zombie browser running)
+        try:
+            await browser.close()
+        except Exception:
+            pass
+        if speak:
+            speak("Web agent timed out, sir.")
         return (
             f"Web agent timed out after {TASK_TIMEOUT_SEC}s "
             f"(completed {step_counter[0]} steps)."
         )
     except Exception as e:
         traceback.print_exc()
-        return f"Web agent failed: {e}"
-    finally:
-        # Always close the browser
+        # On error, also close the browser
         try:
             await browser.close()
         except Exception:
             pass
+        if speak:
+            speak("Web agent encountered an error, sir.")
+        return f"Web agent failed: {e}"
+    finally:
+        # If the task succeeded and keep_browser_open is True, do NOT close
+        # the browser — let the user inspect the final page manually.
+        # The asyncio task will terminate normally; the browser process
+        # keeps running until the user closes the window.
+        if not keep_browser_open:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        else:
+            print("[web_agent] 🌐 Browser left open for inspection (close manually when done)")
         if speak:
             speak("Web agent finished, sir.")
 
@@ -396,10 +443,13 @@ def web_agent(
     """Main entry point for the web_agent tool.
 
     Parameters (in `parameters` dict):
-        task:       Natural language description of what to accomplish on the web.
-        max_steps:  Optional limit on agent iterations (default: from config or 30).
-        headless:   Optional bool — run browser without UI (default: false).
-        use_vision: Optional bool — use vision-capable LLM (default: true).
+        task:               Natural language description of what to accomplish on the web.
+        max_steps:          Optional limit on agent iterations (default: from config or 30).
+        headless:           Optional bool — run browser without UI (default: false).
+        use_vision:         Optional bool — use vision-capable LLM (default: true).
+        keep_browser_open:  Optional bool — leave the browser open after the task
+                            completes so the user can inspect the result
+                            (default: true).
 
     Returns:
         A summary of what the agent accomplished.
@@ -429,11 +479,17 @@ def web_agent(
     else:
         use_vision = str(vision_param).lower() in ("true", "1", "yes")
 
+    keep_open_param = params.get("keep_browser_open")
+    if keep_open_param is None:
+        keep_browser_open = _get_keep_browser_open()
+    else:
+        keep_browser_open = str(keep_open_param).lower() in ("true", "1", "yes")
+
     if player:
         player.write_log(f"[web_agent] starting: {task[:80]}")
 
     print(f"[web_agent] 🌐 Task: {task[:120]}")
-    print(f"[web_agent]    max_steps={max_steps} headless={headless} vision={use_vision}")
+    print(f"[web_agent]    max_steps={max_steps} headless={headless} vision={use_vision} keep_open={keep_browser_open}")
 
     # Progress callback — write to UI log
     def _progress(step: int, total: int):
@@ -449,6 +505,7 @@ def web_agent(
             max_steps=max_steps,
             headless=headless,
             use_vision=use_vision,
+            keep_browser_open=keep_browser_open,
             speak=speak,
             progress_callback=_progress,
         ))
@@ -466,6 +523,7 @@ def web_agent(
                         max_steps=max_steps,
                         headless=headless,
                         use_vision=use_vision,
+                        keep_browser_open=keep_browser_open,
                         speak=speak,
                         progress_callback=_progress,
                     ))

@@ -8,5 +8,6 @@
     "web_agent_max_steps": 30,
     "web_agent_headless": false,
     "web_agent_use_vision": true,
+    "web_agent_keep_browser_open": true,
     "os_system": ""
 }

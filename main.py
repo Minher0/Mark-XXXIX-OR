@@ -455,10 +455,11 @@ TOOL_DECLARATIONS = [
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "task":       {"type": "STRING",  "description": "Natural language description of what to accomplish on the web. Be specific: include URLs, credentials (if safe), form values, etc."},
-                "max_steps":  {"type": "INTEGER", "description": "Maximum number of agent iterations (default: 30, max: 100). Increase for very complex tasks like multi-page bookings."},
-                "headless":   {"type": "BOOLEAN", "description": "Run browser without showing the UI (default: false). Set to true only if the user explicitly asks for it."},
-                "use_vision": {"type": "BOOLEAN", "description": "Use vision-capable LLM (screenshots). Default: true. Disable only if the model doesn't support vision."}
+                "task":               {"type": "STRING",  "description": "Natural language description of what to accomplish on the web. Be specific: include URLs, credentials (if safe), form values, etc."},
+                "max_steps":          {"type": "INTEGER", "description": "Maximum number of agent iterations (default: 30, max: 100). Increase for very complex tasks like multi-page bookings."},
+                "headless":           {"type": "BOOLEAN", "description": "Run browser without showing the UI (default: false). Set to true only if the user explicitly asks for it."},
+                "use_vision":         {"type": "BOOLEAN", "description": "Use vision-capable LLM (screenshots). Default: true. Disable only if the model doesn't support vision."},
+                "keep_browser_open":  {"type": "BOOLEAN", "description": "Leave the browser window open after the task completes so the user can inspect the result (default: true). Set to false to auto-close the browser when the agent finishes."}
             },
             "required": ["task"]
         }
