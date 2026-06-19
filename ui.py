@@ -1139,10 +1139,42 @@ class MainWindow(QMainWindow):
         if not self._ready:
             self._show_setup()
 
-        sc_mute = QShortcut(QKeySequence("F4"), self)
-        sc_mute.activated.connect(self._toggle_mute)
+        # F11 fullscreen shortcut (F4 is handled via keyPressEvent/keyReleaseEvent)
         sc_full = QShortcut(QKeySequence("F11"), self)
         sc_full.activated.connect(self._toggle_fullscreen)
+
+    def keyPressEvent(self, event):
+        """Handle F4 press: in PTT mode = unmute, in normal mode = toggle."""
+        if event.key() == Qt.Key.Key_F4:
+            if self._push_to_talk:
+                # PTT mode: F4 press = unmute (start talking)
+                if self._muted:
+                    self._muted = False
+                    self.hud.muted = False
+                    self._style_mute_btn()
+                    self._apply_state("LISTENING")
+                    self._mute_btn.setText("🎙  LISTENING… (release F4 to mute)")
+            else:
+                # Normal mode: F4 = toggle mute
+                self._toggle_mute()
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        """Handle F4 release: in PTT mode = mute back."""
+        if event.key() == Qt.Key.Key_F4:
+            if self._push_to_talk:
+                # PTT mode: F4 release = mute (stop talking)
+                if not self._muted:
+                    self._muted = True
+                    self.hud.muted = True
+                    self._style_mute_btn()
+                    self._apply_state("MUTED")
+                    self._mute_btn.setText("🔇  HOLD F4 TO SPEAK")
+            event.accept()
+        else:
+            super().keyReleaseEvent(event)
 
     def _toggle_fullscreen(self):
         if self.isFullScreen():
