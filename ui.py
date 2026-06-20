@@ -1092,11 +1092,19 @@ class MainWindow(QMainWindow):
         self.on_text_command  = None
         self._muted           = False
         self._push_to_talk    = False  # if True, mic muted until hotkey held
-        self._ptt_key         = "F4"   # configurable hotkey (e.g. "F4", "Ctrl+Space")
-        self._ptt_vk          = 0x73   # VK code for the key
-        self._ptt_mods        = []     # list of modifier VK codes (Ctrl=0x11, Alt=0x12, Shift=0x10, Win=0x5B)
         self._capturing_key   = False
         self._current_file: str | None = None
+
+        # Load saved hotkey from config, or default to F4
+        try:
+            _cfg = json.loads(API_FILE.read_text(encoding="utf-8"))
+            self._ptt_key  = _cfg.get("ptt_hotkey", "F4")
+            self._ptt_vk   = _cfg.get("ptt_hotkey_vk", 0x73)
+            self._ptt_mods = _cfg.get("ptt_hotkey_mods", [])
+        except Exception:
+            self._ptt_key  = "F4"
+            self._ptt_vk   = 0x73
+            self._ptt_mods = []
 
         central = QWidget()
         central.setStyleSheet(f"background: {C.BG};")
@@ -1375,6 +1383,20 @@ class MainWindow(QMainWindow):
         self._ptt_vk = vk
         self._ptt_mods = mods_vk
         self._capturing_key = False
+
+        # Persist to config/api_keys.json
+        try:
+            _cfg = json.loads(API_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            _cfg = {}
+        _cfg["ptt_hotkey"] = self._ptt_key
+        _cfg["ptt_hotkey_vk"] = self._ptt_vk
+        _cfg["ptt_hotkey_mods"] = self._ptt_mods
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            API_FILE.write_text(json.dumps(_cfg, indent=4), encoding="utf-8")
+        except Exception:
+            pass
 
         self._ptt_key_btn.setText(f"Key: {self._ptt_key}")
         self._ptt_key_btn.setStyleSheet(f"""
@@ -1718,7 +1740,6 @@ class MainWindow(QMainWindow):
         ptt_row.addWidget(self._ptt_checkbox)
 
         # Key config button — shows current key, click to change
-        self._ptt_key = "F4"  # default
         self._ptt_key_btn = QPushButton(f"Key: {self._ptt_key}")
         self._ptt_key_btn.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
         self._ptt_key_btn.setFixedHeight(22)
