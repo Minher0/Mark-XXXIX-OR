@@ -1232,12 +1232,19 @@ class MainWindow(QMainWindow):
 
         # Qt key code → Windows VK code mapping
         QT_TO_VK = {
+            # Function keys
             Qt.Key.Key_F1: 0x70,  Qt.Key.Key_F2: 0x71,  Qt.Key.Key_F3: 0x72,
             Qt.Key.Key_F4: 0x73,  Qt.Key.Key_F5: 0x74,  Qt.Key.Key_F6: 0x75,
             Qt.Key.Key_F7: 0x76,  Qt.Key.Key_F8: 0x77,  Qt.Key.Key_F9: 0x78,
             Qt.Key.Key_F10: 0x79, Qt.Key.Key_F11: 0x7A, Qt.Key.Key_F12: 0x7B,
+            Qt.Key.Key_F13: 0x7C, Qt.Key.Key_F14: 0x7D, Qt.Key.Key_F15: 0x7E,
+            Qt.Key.Key_F16: 0x7F, Qt.Key.Key_F17: 0x80, Qt.Key.Key_F18: 0x81,
+            Qt.Key.Key_F19: 0x82, Qt.Key.Key_F20: 0x83, Qt.Key.Key_F21: 0x84,
+            Qt.Key.Key_F22: 0x85, Qt.Key.Key_F23: 0x86, Qt.Key.Key_F24: 0x87,
+            # Special keys
             Qt.Key.Key_Space: 0x20,
-            Qt.Key.Key_Return: 0x0D, Qt.Key.Key_Enter: 0x0D,
+            Qt.Key.Key_Return: 0x0D,
+            Qt.Key.Key_Enter: 0x0D,  # numpad Enter also maps to 0x0D
             Qt.Key.Key_Tab: 0x09,
             Qt.Key.Key_Escape: 0x1B,
             Qt.Key.Key_Insert: 0x2D, Qt.Key.Key_Delete: 0x2E,
@@ -1247,14 +1254,39 @@ class MainWindow(QMainWindow):
             Qt.Key.Key_Right: 0x27, Qt.Key.Key_Down: 0x28,
             Qt.Key.Key_CapsLock: 0x14, Qt.Key.Key_NumLock: 0x90,
             Qt.Key.Key_ScrollLock: 0x91,
+            Qt.Key.Key_Pause: 0x13, Qt.Key.Key_Print: 0x2A,
+            # Numpad digits (VK_NUMPAD0 = 0x60 to VK_NUMPAD9 = 0x69)
+            Qt.Key.Key_0 | Qt.KeyboardModifier.KeypadModifier: 0x60,
         }
 
         # Add letter keys A-Z (Qt.Key_A = 0x41, VK_A = 0x41)
         for i in range(26):
             QT_TO_VK[Qt.Key(Qt.Key.Key_A.value + i)] = 0x41 + i
-        # Add number keys 0-9
+        # Add number keys 0-9 (top row)
         for i in range(10):
             QT_TO_VK[Qt.Key(Qt.Key.Key_0.value + i)] = 0x30 + i
+
+        # Add numpad keys 0-9 — Qt uses Key_0..Key_9 with KeypadModifier
+        # but event.key() strips the modifier, so we need to detect numpad
+        # via event.modifiers() & KeypadModifier
+        # We handle this below with a special check
+
+        # Numpad VK codes: VK_NUMPAD0=0x60 .. VK_NUMPAD9=0x69
+        NUMPAD_VK = {
+            Qt.Key.Key_0: 0x60, Qt.Key.Key_1: 0x61, Qt.Key.Key_2: 0x62,
+            Qt.Key.Key_3: 0x63, Qt.Key.Key_4: 0x64, Qt.Key.Key_5: 0x65,
+            Qt.Key.Key_6: 0x66, Qt.Key.Key_7: 0x67, Qt.Key.Key_8: 0x68,
+            Qt.Key.Key_9: 0x69,
+        }
+
+        # Numpad operators
+        NUMPAD_OPS = {
+            Qt.Key.Key_Plus: (0x6B, "Numpad+"),
+            Qt.Key.Key_Minus: (0x6D, "Numpad-"),
+            Qt.Key.Key_Asterisk: (0x6A, "Numpad*"),
+            Qt.Key.Key_Slash: (0x6F, "Numpad/"),
+            Qt.Key.Key_Period: (0x6E, "Numpad."),
+        }
 
         key = event.key()
         modifiers = event.modifiers()
@@ -1292,21 +1324,46 @@ class MainWindow(QMainWindow):
             parts.append("Shift")
             mods_vk.append(0x10)
 
-        # Get the key name
-        key_name = QKeySequence(key).toString()
-        if not key_name:
-            # Fallback for special keys
-            key_names = {
-                Qt.Key.Key_Space: "Space", Qt.Key.Key_Return: "Enter",
-                Qt.Key.Key_Tab: "Tab", Qt.Key.Key_Insert: "Insert",
-                Qt.Key.Key_Delete: "Delete", Qt.Key.Key_Home: "Home",
-                Qt.Key.Key_End: "End", Qt.Key.Key_PageUp: "PgUp",
-                Qt.Key.Key_PageDown: "PgDn",
-            }
-            key_name = key_names.get(key, f"Key{key}")
+        # Check if this is a numpad key (Qt sets KeypadModifier)
+        is_numpad = bool(modifiers & Qt.KeyboardModifier.KeypadModifier)
+
+        # Determine VK code and key name
+        vk = None
+        key_name = None
+
+        if is_numpad:
+            # Numpad digit keys
+            if key in NUMPAD_VK:
+                vk = NUMPAD_VK[key]
+                key_name = f"Numpad{chr(ord('0') + key - Qt.Key.Key_0)}"
+            # Numpad operators
+            elif key in NUMPAD_OPS:
+                vk, key_name = NUMPAD_OPS[key]
+            # Numpad Enter
+            elif key == Qt.Key.Key_Enter:
+                vk = 0x0D
+                key_name = "Numpad Enter"
+            else:
+                # Other numpad keys — fall through to normal mapping
+                pass
+
+        if vk is None:
+            # Try normal mapping
+            vk = QT_TO_VK.get(key, None)
+            key_name = QKeySequence(key).toString()
+            if not key_name:
+                key_names = {
+                    Qt.Key.Key_Space: "Space", Qt.Key.Key_Return: "Enter",
+                    Qt.Key.Key_Tab: "Tab", Qt.Key.Key_Insert: "Insert",
+                    Qt.Key.Key_Delete: "Delete", Qt.Key.Key_Home: "Home",
+                    Qt.Key.Key_End: "End", Qt.Key.Key_PageUp: "PgUp",
+                    Qt.Key.Key_PageDown: "PgDn",
+                    Qt.Key.Key_Plus: "+", Qt.Key.Key_Minus: "-",
+                    Qt.Key.Key_Asterisk: "*", Qt.Key.Key_Slash: "/",
+                }
+                key_name = key_names.get(key, f"Key{key}")
 
         parts.append(key_name)
-        vk = QT_TO_VK.get(key, None)
 
         if vk is None:
             # Unknown key — can't poll it
