@@ -1091,7 +1091,11 @@ class MainWindow(QMainWindow):
 
         self.on_text_command  = None
         self._muted           = False
-        self._push_to_talk    = False  # if True, mic muted until F4 held
+        self._push_to_talk    = False  # if True, mic muted until hotkey held
+        self._ptt_key         = "F4"   # configurable hotkey (e.g. "F4", "Ctrl+Space")
+        self._ptt_vk          = 0x73   # VK code for the key
+        self._ptt_mods        = []     # list of modifier VK codes (Ctrl=0x11, Alt=0x12, Shift=0x10, Win=0x5B)
+        self._capturing_key   = False
         self._current_file: str | None = None
 
         central = QWidget()
@@ -1147,10 +1151,10 @@ class MainWindow(QMainWindow):
         self._setup_global_f4_ctypes()
 
     def _setup_global_f4_ctypes(self):
-        """Detect F4 press/release globally via GetAsyncKeyState polling.
+        """Detect hotkey press/release globally via GetAsyncKeyState polling.
 
-        No RegisterHotKey needed — just poll every 20ms. Simple, stable,
-        works in background, no admin rights, no extra dependencies.
+        Supports configurable key + modifier combinations.
+        Polls every 20ms. Simple, stable, works in background.
         """
         try:
             import ctypes
@@ -1158,40 +1162,185 @@ class MainWindow(QMainWindow):
             import time
 
             user32 = ctypes.windll.user32
-            VK_F4 = 0x73
 
-            def _f4_poller():
+            def _hotkey_poller():
                 was_pressed = False
                 while True:
                     time.sleep(0.02)  # 50fps polling
-                    state = user32.GetAsyncKeyState(VK_F4)
-                    is_pressed = (state & 0x8000) != 0
+
+                    # Check if all modifiers are held
+                    mods_ok = True
+                    for mod_vk in self._ptt_mods:
+                        if not (user32.GetAsyncKeyState(mod_vk) & 0x8000):
+                            mods_ok = False
+                            break
+
+                    if not mods_ok:
+                        is_pressed = False
+                    else:
+                        # Check if the main key is held
+                        is_pressed = (user32.GetAsyncKeyState(self._ptt_vk) & 0x8000) != 0
 
                     if is_pressed and not was_pressed:
-                        # F4 just pressed
                         QTimer.singleShot(0, self._handle_f4_press)
                     elif not is_pressed and was_pressed:
-                        # F4 just released
                         QTimer.singleShot(0, self._handle_f4_release)
 
                     was_pressed = is_pressed
 
-            t = threading.Thread(target=_f4_poller, daemon=True, name="F4-Poll")
+            t = threading.Thread(target=_hotkey_poller, daemon=True, name="Hotkey-Poll")
             t.start()
             self._f4_hotkey_registered = True
-            print("[UI] ✅ F4 hotkey active via GetAsyncKeyState polling (works in background)")
+            print(f"[UI] ✅ Hotkey '{self._ptt_key}' active via polling (works in background)")
 
         except Exception as e:
-            print(f"[UI] ⚠️ F4 polling failed: {e} — F4 only works when Jarvis is focused")
+            print(f"[UI] ⚠️ Hotkey polling failed: {e} — hotkey only works when Jarvis is focused")
             self._f4_hotkey_registered = False
 
+    def _start_key_capture(self):
+        """Start capturing the next key press for the hotkey config."""
+        self._capturing_key = True
+        self._ptt_key_btn.setText("Press a key…")
+        self._ptt_key_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {C.ACC2}; color: {C.BG};
+                border: 1px solid {C.ACC2}; border-radius: 3px;
+                padding: 0 6px;
+            }}
+        """)
+        self.setFocus()
+
     def keyPressEvent(self, event):
-        """F4 press: only handle if global hotkey is NOT registered."""
-        if event.key() == Qt.Key.Key_F4 and not getattr(self, '_f4_hotkey_registered', False):
-            self._handle_f4_press()
+        """Handle key press: capture for hotkey config OR handle F4."""
+        if self._capturing_key:
+            self._capture_key(event)
             event.accept()
-        else:
-            super().keyPressEvent(event)
+            return
+
+        # Fallback: F4 handling when global hotkey is not registered
+        if not getattr(self, '_f4_hotkey_registered', False):
+            if event.key() == Qt.Key.Key_F4:
+                self._handle_f4_press()
+                event.accept()
+                return
+
+        super().keyPressEvent(event)
+
+    def _capture_key(self, event):
+        """Capture the pressed key combination and update the hotkey."""
+        import ctypes
+
+        # Qt key code → Windows VK code mapping
+        QT_TO_VK = {
+            Qt.Key.Key_F1: 0x70,  Qt.Key.Key_F2: 0x71,  Qt.Key.Key_F3: 0x72,
+            Qt.Key.Key_F4: 0x73,  Qt.Key.Key_F5: 0x74,  Qt.Key.Key_F6: 0x75,
+            Qt.Key.Key_F7: 0x76,  Qt.Key.Key_F8: 0x77,  Qt.Key.Key_F9: 0x78,
+            Qt.Key.Key_F10: 0x79, Qt.Key.Key_F11: 0x7A, Qt.Key.Key_F12: 0x7B,
+            Qt.Key.Key_Space: 0x20,
+            Qt.Key.Key_Return: 0x0D, Qt.Key.Key_Enter: 0x0D,
+            Qt.Key.Key_Tab: 0x09,
+            Qt.Key.Key_Escape: 0x1B,
+            Qt.Key.Key_Insert: 0x2D, Qt.Key.Key_Delete: 0x2E,
+            Qt.Key.Key_Home: 0x24, Qt.Key.Key_End: 0x23,
+            Qt.Key.Key_PageUp: 0x21, Qt.Key.Key_PageDown: 0x22,
+            Qt.Key.Key_Left: 0x25, Qt.Key.Key_Up: 0x26,
+            Qt.Key.Key_Right: 0x27, Qt.Key.Key_Down: 0x28,
+            Qt.Key.Key_CapsLock: 0x14, Qt.Key.Key_NumLock: 0x90,
+            Qt.Key.Key_ScrollLock: 0x91,
+        }
+
+        # Add letter keys A-Z (Qt.Key_A = 0x41, VK_A = 0x41)
+        for i in range(26):
+            QT_TO_VK[Qt.Key(Qt.Key.Key_A.value + i)] = 0x41 + i
+        # Add number keys 0-9
+        for i in range(10):
+            QT_TO_VK[Qt.Key(Qt.Key.Key_0.value + i)] = 0x30 + i
+
+        key = event.key()
+        modifiers = event.modifiers()
+
+        # Don't capture modifier-only presses
+        if key in (Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt,
+                   Qt.Key.Key_Meta, Qt.Key.Key_AltGr):
+            return  # wait for a real key
+
+        # Escape cancels the capture
+        if key == Qt.Key.Key_Escape:
+            self._capturing_key = False
+            self._ptt_key_btn.setText(f"Key: {self._ptt_key}")
+            self._ptt_key_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: transparent; color: {C.ACC2};
+                    border: 1px solid {C.BORDER}; border-radius: 3px;
+                    padding: 0 6px;
+                }}
+                QPushButton:hover {{ border: 1px solid {C.ACC2}; }}
+            """)
+            return
+
+        # Build the key name and VK code
+        parts = []
+        mods_vk = []
+
+        if modifiers & Qt.KeyboardModifier.ControlModifier:
+            parts.append("Ctrl")
+            mods_vk.append(0x11)
+        if modifiers & Qt.KeyboardModifier.AltModifier:
+            parts.append("Alt")
+            mods_vk.append(0x12)
+        if modifiers & Qt.KeyboardModifier.ShiftModifier:
+            parts.append("Shift")
+            mods_vk.append(0x10)
+
+        # Get the key name
+        key_name = QKeySequence(key).toString()
+        if not key_name:
+            # Fallback for special keys
+            key_names = {
+                Qt.Key.Key_Space: "Space", Qt.Key.Key_Return: "Enter",
+                Qt.Key.Key_Tab: "Tab", Qt.Key.Key_Insert: "Insert",
+                Qt.Key.Key_Delete: "Delete", Qt.Key.Key_Home: "Home",
+                Qt.Key.Key_End: "End", Qt.Key.Key_PageUp: "PgUp",
+                Qt.Key.Key_PageDown: "PgDn",
+            }
+            key_name = key_names.get(key, f"Key{key}")
+
+        parts.append(key_name)
+        vk = QT_TO_VK.get(key, None)
+
+        if vk is None:
+            # Unknown key — can't poll it
+            self._ptt_key_btn.setText("Unsupported key")
+            return
+
+        # Save the new hotkey
+        self._ptt_key = "+".join(parts)
+        self._ptt_vk = vk
+        self._ptt_mods = mods_vk
+        self._capturing_key = False
+
+        self._ptt_key_btn.setText(f"Key: {self._ptt_key}")
+        self._ptt_key_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {C.ACC2};
+                border: 1px solid {C.BORDER}; border-radius: 3px;
+                padding: 0 6px;
+            }}
+            QPushButton:hover {{ border: 1px solid {C.ACC2}; }}
+        """)
+
+        # Update button texts
+        self._update_ptt_button_text()
+        print(f"[UI] ✅ Hotkey set to: {self._ptt_key}")
+        self._log.append_log(f"SYS: Hotkey set to {self._ptt_key}")
+
+    def _update_ptt_button_text(self):
+        """Update mute button text to show current hotkey."""
+        if self._push_to_talk:
+            if self._muted:
+                self._mute_btn.setText(f"🔇  HOLD {self._ptt_key} TO SPEAK")
+            else:
+                self._mute_btn.setText(f"🎙  LISTENING… (release {self._ptt_key})")
 
     def keyReleaseEvent(self, event):
         """F4 release: only handle if global hotkey is NOT registered."""
@@ -1202,19 +1351,19 @@ class MainWindow(QMainWindow):
             super().keyReleaseEvent(event)
 
     def _handle_f4_press(self):
-        """Handle F4 press on the Qt thread."""
+        """Handle hotkey press on the Qt thread."""
         if self._push_to_talk:
             if self._muted:
                 self._muted = False
                 self.hud.muted = False
                 self._style_mute_btn()
                 self._apply_state("LISTENING")
-                self._mute_btn.setText("🎙  LISTENING… (release F4 to mute)")
+                self._mute_btn.setText(f"🎙  LISTENING… (release {self._ptt_key})")
         else:
             self._toggle_mute()
 
     def _handle_f4_release(self):
-        """Handle F4 release on the Qt thread."""
+        """Handle hotkey release on the Qt thread."""
         if self._push_to_talk:
             self._ptt_want_mute = True
             self._mute_btn.setText("🎙  Listening for response…")
@@ -1243,14 +1392,14 @@ class MainWindow(QMainWindow):
         return False
 
     def _do_ptt_mute(self):
-        """Actually mute the mic (called after F4 release, possibly delayed)."""
+        """Actually mute the mic (called after hotkey release, possibly delayed)."""
         self._ptt_want_mute = False
         if not self._muted:
             self._muted = True
             self.hud.muted = True
             self._style_mute_btn()
             self._apply_state("MUTED")
-            self._mute_btn.setText("🔇  HOLD F4 TO SPEAK")
+            self._update_ptt_button_text()
 
     def _toggle_fullscreen(self):
         if self.isFullScreen():
@@ -1485,15 +1634,18 @@ class MainWindow(QMainWindow):
         self._style_mute_btn()
         lay.addWidget(self._mute_btn)
 
-        # Push-to-talk checkbox (unchecked by default = always listening)
-        self._ptt_checkbox = QCheckBox("🔇  PUSH-TO-TALK (hold F4 to speak)")
+        # Push-to-talk checkbox + key config button
+        ptt_row = QHBoxLayout()
+        ptt_row.setSpacing(4)
+
+        self._ptt_checkbox = QCheckBox("🔇  PUSH-TO-TALK")
         self._ptt_checkbox.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
         self._ptt_checkbox.setChecked(False)
         self._ptt_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
         self._ptt_checkbox.setStyleSheet(f"""
             QCheckBox {{
                 color: {C.TEXT_DIM}; background: transparent;
-                padding: 4px 2px; spacing: 6px;
+                spacing: 6px;
             }}
             QCheckBox::indicator {{
                 width: 14px; height: 14px;
@@ -1506,7 +1658,31 @@ class MainWindow(QMainWindow):
             QCheckBox:hover {{ color: {C.TEXT}; }}
         """)
         self._ptt_checkbox.toggled.connect(self._toggle_push_to_talk)
-        lay.addWidget(self._ptt_checkbox)
+        ptt_row.addWidget(self._ptt_checkbox)
+
+        # Key config button — shows current key, click to change
+        self._ptt_key = "F4"  # default
+        self._ptt_key_btn = QPushButton(f"Key: {self._ptt_key}")
+        self._ptt_key_btn.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        self._ptt_key_btn.setFixedHeight(22)
+        self._ptt_key_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._ptt_key_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {C.ACC2};
+                border: 1px solid {C.BORDER}; border-radius: 3px;
+                padding: 0 6px;
+            }}
+            QPushButton:hover {{ border: 1px solid {C.ACC2}; }}
+        """)
+        self._ptt_key_btn.clicked.connect(self._start_key_capture)
+        ptt_row.addWidget(self._ptt_key_btn)
+        ptt_row.addStretch()
+
+        ptt_container = QWidget()
+        ptt_container.setLayout(ptt_row)
+        lay.addWidget(ptt_container)
+
+        self._capturing_key = False
 
         fs_btn = QPushButton("⛶  FULLSCREEN  [F11]")
         fs_btn.setFixedHeight(26)
@@ -1568,7 +1744,7 @@ class MainWindow(QMainWindow):
             l.setStyleSheet(f"color: {color}; background: transparent;")
             return l
 
-        lay.addWidget(_fl("[F4] Mute / Push-to-talk  ·  [F11] Fullscreen"))
+        lay.addWidget(_fl("[Configurable] Push-to-talk / Mute  ·  [F11] Fullscreen"))
         lay.addStretch()
         lay.addWidget(_fl("FatihMakes Industries  ·  MARK XXXIX  ·  CLASSIFIED"))
         lay.addStretch()
@@ -1606,20 +1782,16 @@ class MainWindow(QMainWindow):
             self._log.append_log("SYS: Microphone active.")
 
     def _toggle_push_to_talk(self, checked: bool):
-        """Toggle push-to-talk mode.
-
-        When ON: mic is muted by default. Hold F4 to talk, release to mute.
-        When OFF (default): Jarvis always listens.
-        """
+        """Toggle push-to-talk mode."""
         self._push_to_talk = checked
         if checked:
             self._muted = True
             self.hud.muted = True
             self._style_mute_btn()
             self._apply_state("MUTED")
-            self._mute_btn.setText("🔇  HOLD F4 TO SPEAK")
-            self._log.append_log("SYS: Push-to-talk enabled. Hold F4 to speak.")
-            print("[UI] Push-to-talk enabled — mic muted, hold F4 to talk")
+            self._update_ptt_button_text()
+            self._log.append_log(f"SYS: Push-to-talk enabled. Hold {self._ptt_key} to speak.")
+            print(f"[UI] Push-to-talk enabled — mic muted, hold {self._ptt_key} to talk")
         else:
             self._muted = False
             self.hud.muted = False
